@@ -16,10 +16,10 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 STATE_FILE = "vault_state.json"
 TRADING_FEE_PCT = 0.001  # 0.1% per swap
 
-DEFAULT_COINS = {
-    "QNTUSDT": {
-        "symbol": "QNT",
-        "anchor_usd": 180.00,
+def make_coin_template(symbol, anchor_usd):
+    return {
+        "symbol": symbol,
+        "anchor_usd": float(anchor_usd),
         "vault_profit_usd": 0.00,
         "in_position": False,
         "token_qty": 0.0,
@@ -29,41 +29,19 @@ DEFAULT_COINS = {
         "local_low": 0.0,
         "ratchet_active": False,
         "ratchet_stop_price": 0.0,
-        "mode": "STANDBY",
-        "trades_count": 0
-    },
-    "CELOUSDT": {
-        "symbol": "CELO",
-        "anchor_usd": 100.00,
-        "vault_profit_usd": 0.00,
-        "in_position": False,
-        "token_qty": 0.0,
-        "entry_price": 0.0,
-        "current_price": 0.0,
-        "peak_price": 0.0,
-        "local_low": 0.0,
-        "ratchet_active": False,
-        "ratchet_stop_price": 0.0,
-        "mode": "STANDBY",
-        "trades_count": 0
-    },
-    "KSMUSDT": {
-        "symbol": "KSM",
-        "anchor_usd": 100.00,
-        "vault_profit_usd": 0.00,
-        "in_position": False,
-        "token_qty": 0.0,
-        "entry_price": 0.0,
-        "current_price": 0.0,
-        "peak_price": 0.0,
-        "local_low": 0.0,
-        "ratchet_active": False,
-        "ratchet_stop_price": 0.0,
+        "last_sell_price": 0.0,
+        "dip_buy_stop": 0.0,
         "mode": "STANDBY",
         "trades_count": 0
     }
+
+DEFAULT_COINS = {
+    "QNTUSDT": make_coin_template("QNT", 180.00),
+    "CELOUSDT": make_coin_template("CELO", 100.00),
+    "KSMUSDT": make_coin_template("KSM", 100.00)
 }
 
+# Profit Ratchet & Recovery Thresholds
 WAKE_UP_PROFIT_PCT = 0.008     # +0.80% wakes up Micro-Ratchet
 MICRO_TRAIL_PCT = 0.0025       # 0.25% tight trail on small bumps
 WIDE_BREAKOUT_PCT = 0.030      # +3.0% switches to wider breakout trail
@@ -71,10 +49,16 @@ WIDE_TRAIL_PCT = 0.0080        # 0.80% trail for big rallies
 CRASH_FLOOR_TRIGGER = -0.080   # -8.0% drop activates Kusama Reverse Skimming
 RELIEF_BOUNCE_PCT = 0.050      # +5.0% bounce from local low skims 25% stack
 
+# Trailing Dip Re-Buy Thresholds (Never buy back at the top)
+DIP_PULLBACK_TARGET = -0.0040  # Wait for -0.40% pullback after a sale to arm Dip Buy
+DIP_REBOUND_TRAIL = 0.0025     # +0.25% bounce off the dip bottom triggers re-buy
+RUNAWAY_REBUY_PCT = 0.0100     # +1.00% breakout above sell price re-enters so we don't miss rockets
+
 bot_state = {"coins": DEFAULT_COINS, "logs": []}
 state_lock = threading.Lock()
 engine_initialized = False
 last_tick_time = 0.0
+last_db_save_time = 0.0
 
 
 def add_log(msg):
@@ -85,6 +69,13 @@ def add_log(msg):
     bot_state["logs"] = bot_state["logs"][:50]
 
 
+def ensure_coin_fields():
+    """Ensures older saved coins in Neon get new v1.2 fields seamlessly."""
+    for pair, c in bot_state.get("coins", {}).items():
+        c.setdefault("last_sell_price", 0.0)
+        c.setdefault("dip_buy_stop", 0.0)
+
+
 def init_and_load_state():
     global bot_state, engine_initialized
     if engine_initialized:
@@ -93,7 +84,7 @@ def init_and_load_state():
 
     if DATABASE_URL:
         try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=8)
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             cur = conn.cursor()
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS vault_store (
@@ -107,6 +98,7 @@ def init_and_load_state():
                 loaded = json.loads(row[0])
                 if "coins" in loaded:
                     bot_state = loaded
+                    ensure_coin_fields()
                 add_log("Connected to Neon PostgreSQL: Loaded saved Vault state.")
             else:
                 cur.execute(
@@ -127,17 +119,21 @@ def init_and_load_state():
                 loaded = json.load(f)
                 if "coins" in loaded:
                     bot_state = loaded
-            add_log("Loaded local state file.")
+                    ensure_coin_fields()
         except Exception:
             pass
-    else:
-        add_log("VaultSkim Cloud Engine initialized.")
 
 
-def save_state():
+def save_state(force=False):
+    global last_db_save_time
+    now = time.time()
+    if not force and (now - last_db_save_time < 60.0):
+        return
+    last_db_save_time = now
+
     if DATABASE_URL:
         try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             cur = conn.cursor()
             cur.execute(
                 "UPDATE vault_store SET state_json = %s WHERE id = 1;",
@@ -161,23 +157,19 @@ def save_state():
 # 2. US-SAFE MULTI-SOURCE LIVE PRICE FEED
 # ==========================================
 def fetch_live_prices():
-    """Fetches live prices using Gate.io & Binance US (works on Render US servers)."""
     prices = {}
-    # Primary Feed: Gate.io Global Spot Tickers (Not geo-blocked in US)
     try:
         resp = requests.get("https://api.gateio.ws/api/v4/spot/tickers", timeout=5)
         if resp.status_code == 200:
             for item in resp.json():
                 cp = item.get("currency_pair", "")
                 if cp.endswith("_USDT") and item.get("last"):
-                    clean_pair = cp.replace("_", "")
-                    prices[clean_pair] = float(item["last"])
+                    prices[cp.replace("_", "")] = float(item["last"])
             if prices:
                 return prices
     except Exception:
         pass
 
-    # Backup Feed: Binance US API
     try:
         resp = requests.get("https://api.binance.us/api/v3/ticker/price", timeout=5)
         if resp.status_code == 200:
@@ -193,28 +185,59 @@ def fetch_live_prices():
 
 
 # ==========================================
-# 3. CORE PROFIT-SKIMMING ENGINE
+# 3. CORE PROFIT-SKIMMING & DIP RE-BUY ENGINE
 # ==========================================
+def deploy_anchor_buy(coin, live_price, reason="Initial Entry"):
+    fee = coin["anchor_usd"] * TRADING_FEE_PCT
+    net_invest = coin["anchor_usd"] - fee
+    coin["token_qty"] = net_invest / live_price
+    coin["entry_price"] = live_price
+    coin["peak_price"] = live_price
+    coin["local_low"] = live_price
+    coin["in_position"] = True
+    coin["ratchet_active"] = False
+    coin["ratchet_stop_price"] = 0.0
+    coin["dip_buy_stop"] = 0.0
+    coin["mode"] = "HOLDING_ANCHOR"
+    add_log(f"BUY {coin['symbol']} ({reason}): Deployed ${coin['anchor_usd']:.2f} Anchor @ ${live_price:.4f}")
+    save_state(force=True)
+
+
 def process_coin(pair, coin, live_price):
     if live_price <= 0:
         return
     coin["current_price"] = live_price
 
-    # STEP A: Deploy Working Anchor
+    # CASE 1: Not in position -> Either Standby Initial Buy OR Trailing Dip Re-Buy
     if not coin["in_position"] or coin["entry_price"] <= 0:
-        fee = coin["anchor_usd"] * TRADING_FEE_PCT
-        net_invest = coin["anchor_usd"] - fee
-        coin["token_qty"] = net_invest / live_price
-        coin["entry_price"] = live_price
-        coin["peak_price"] = live_price
-        coin["local_low"] = live_price
-        coin["in_position"] = True
-        coin["ratchet_active"] = False
-        coin["ratchet_stop_price"] = 0.0
-        coin["mode"] = "HOLDING_ANCHOR"
-        add_log(f"BUY {coin['symbol']}: Deployed ${coin['anchor_usd']:.2f} Anchor @ ${live_price:.4f}")
-        return
+        if coin.get("mode") == "TRAILING_DIP_BUY" and coin.get("last_sell_price", 0) > 0:
+            sell_px = coin["last_sell_price"]
+            if live_price < coin["local_low"] or coin["local_low"] <= 0:
+                coin["local_low"] = live_price
 
+            change_from_sell = (live_price - sell_px) / sell_px
+
+            # Arm Trailing Dip Buy once price cools off by -0.40% below sell price
+            if change_from_sell <= DIP_PULLBACK_TARGET:
+                new_buy_stop = coin["local_low"] * (1.0 + DIP_REBOUND_TRAIL)
+                if coin["dip_buy_stop"] <= 0 or new_buy_stop < coin["dip_buy_stop"]:
+                    coin["dip_buy_stop"] = new_buy_stop
+
+                # Trigger buy when price rebounds +0.25% off the dip bottom
+                if live_price >= coin["dip_buy_stop"]:
+                    deploy_anchor_buy(coin, live_price, reason="Dip Rebound Caught")
+                    return
+
+            # Runaway Breakout Reset: If price climbs +1.0% above sell price, re-enter so we don't miss a rally
+            elif change_from_sell >= RUNAWAY_REBUY_PCT:
+                deploy_anchor_buy(coin, live_price, reason="Breakout Continuation")
+                return
+            return
+        else:
+            deploy_anchor_buy(coin, live_price, reason="Anchor Deployed")
+            return
+
+    # CASE 2: Actively Holding Position -> Track Peaks & Lows
     if live_price > coin["peak_price"]:
         coin["peak_price"] = live_price
     if live_price < coin["local_low"] or coin["local_low"] <= 0:
@@ -222,7 +245,7 @@ def process_coin(pair, coin, live_price):
 
     change_from_entry = (live_price - coin["entry_price"]) / coin["entry_price"]
 
-    # STEP B: Wake Up Dynamic Micro-Ratchet
+    # STEP A: Wake Up Dynamic Micro-Ratchet
     if change_from_entry >= WAKE_UP_PROFIT_PCT:
         was_active = coin["ratchet_active"]
         coin["ratchet_active"] = True
@@ -233,8 +256,9 @@ def process_coin(pair, coin, live_price):
             coin["ratchet_stop_price"] = new_stop
         if not was_active:
             add_log(f"RATCHET ARMED {coin['symbol']} @ ${live_price:.4f} (Stop Net: ${coin['ratchet_stop_price']:.4f})")
+            save_state(force=True)
 
-    # STEP C: Snap Shut & Sweep Profit to Vault
+    # STEP B: Snap Shut & Sweep Profit to Vault -> Enter Trailing Dip Re-Buy Mode
     if coin["ratchet_active"] and live_price <= coin["ratchet_stop_price"]:
         gross_value = coin["token_qty"] * live_price
         sell_fee = gross_value * TRADING_FEE_PCT
@@ -246,17 +270,19 @@ def process_coin(pair, coin, live_price):
             coin["trades_count"] += 1
             add_log(
                 f"VAULT SKIM {coin['symbol']} @ ${live_price:.4f}! "
-                f"Swept +${skimmed_profit:.2f} into Vault | Re-arming ${coin['anchor_usd']:.2f} Anchor"
+                f"Locked +${skimmed_profit:.2f} in Vault | Watching for dip to re-buy..."
             )
             coin["in_position"] = False
             coin["ratchet_active"] = False
             coin["ratchet_stop_price"] = 0.0
-            coin["mode"] = "RE-ENTERING"
-            # Immediately re-deploy Anchor at current price
-            process_coin(pair, coin, live_price)
+            coin["last_sell_price"] = live_price
+            coin["local_low"] = live_price
+            coin["dip_buy_stop"] = 0.0
+            coin["mode"] = "TRAILING_DIP_BUY"
+            save_state(force=True)
         return
 
-    # STEP D: Kusama Crash Recovery (-8% Drop -> 25% Reverse Skim on Relief Bounces)
+    # STEP C: Kusama Crash Recovery (-8% Drop -> 25% Reverse Skim on Relief Bounces)
     if change_from_entry <= CRASH_FLOOR_TRIGGER:
         coin["mode"] = "CRASH_RECOVERY"
         bounce_from_bottom = (live_price - coin["local_low"]) / coin["local_low"]
@@ -270,10 +296,10 @@ def process_coin(pair, coin, live_price):
                 f"REVERSE SKIM {coin['symbol']}: +${recovery_skim:.2f} banked on bounce! "
                 f"Break-even lowered to ${coin['entry_price']:.4f}"
             )
+            save_state(force=True)
 
 
 def run_engine_tick():
-    """Executes one complete market check cycle safely."""
     global last_tick_time
     now = time.time()
     if now - last_tick_time < 3.0:
@@ -287,7 +313,7 @@ def run_engine_tick():
             for pair, coin in list(bot_state["coins"].items()):
                 if pair in prices:
                     process_coin(pair, coin, prices[pair])
-            save_state()
+            save_state(force=False)
 
 
 def bot_background_loop():
@@ -310,19 +336,27 @@ DASHBOARD_HTML = """
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>VaultSkim — Two-Bucket Profit Engine</title>
+  <title>VaultSkim v1.2 — Two-Bucket Profit Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans">
   <div class="max-w-6xl mx-auto">
     <div class="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-800 pb-4 mb-6 gap-4">
       <div>
-        <h1 class="text-2xl font-bold text-emerald-400">VaultSkim Command Center</h1>
-        <p class="text-sm text-slate-400">Neon PostgreSQL + Render Cloud + Dynamic Micro-Ratchet</p>
+        <h1 class="text-2xl font-bold text-emerald-400">VaultSkim Command Center <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2 py-0.5 rounded ml-2">v1.2</span></h1>
+        <p class="text-sm text-slate-400">Constant Anchor + Dynamic Micro-Ratchet + Trailing Dip Re-Buy</p>
       </div>
-      <div class="bg-emerald-950/60 border border-emerald-500/40 px-5 py-3 rounded-xl text-right">
-        <div class="text-xs uppercase tracking-wider text-emerald-300">Total Untouchable Vault Profit</div>
-        <div id="total-vault" class="text-3xl font-extrabold text-emerald-400">$0.00</div>
+      <div class="flex flex-wrap items-center gap-3">
+        <button onclick="syncLivePrices(false)" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition">
+          🔄 Sync Entries to Live Price
+        </button>
+        <button onclick="syncLivePrices(true)" class="bg-rose-950/60 hover:bg-rose-900/70 border border-rose-700/50 text-rose-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition">
+          🧹 Reset Test Vault ($0.00)
+        </button>
+        <div class="bg-emerald-950/60 border border-emerald-500/40 px-5 py-2.5 rounded-xl text-right">
+          <div class="text-xs uppercase tracking-wider text-emerald-300">Total Untouchable Vault Profit</div>
+          <div id="total-vault" class="text-3xl font-extrabold text-emerald-400">$0.00</div>
+        </div>
       </div>
     </div>
 
@@ -363,6 +397,15 @@ DASHBOARD_HTML = """
       refresh();
     }
 
+    async function syncLivePrices(clearVault) {
+      await fetch('/api/reset_live', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({clear_vault: clearVault})
+      });
+      refresh();
+    }
+
     async function refresh() {
       const res = await fetch('/api/state');
       const data = await res.json();
@@ -372,8 +415,16 @@ DASHBOARD_HTML = """
       for (const [pair, c] of Object.entries(data.coins)) {
         totalVault += c.vault_profit_usd;
         const liveVal = c.in_position && c.current_price > 0 ? (c.token_qty * c.current_price) : c.anchor_usd;
-        const pnlPct = c.entry_price > 0 ? (((c.current_price - c.entry_price) / c.entry_price) * 100).toFixed(2) : "0.00";
+        const refPrice = c.in_position ? c.entry_price : c.last_sell_price;
+        const pnlPct = refPrice > 0 ? (((c.current_price - refPrice) / refPrice) * 100).toFixed(2) : "0.00";
         const pnlColor = pnlPct >= 0 ? 'text-emerald-400' : 'text-amber-400';
+
+        let netLabel = 'Ratchet Sell Net:';
+        let netValue = c.ratchet_active ? '$' + c.ratchet_stop_price.toFixed(4) : 'Waiting (+0.8%)';
+        if (!c.in_position && c.mode === 'TRAILING_DIP_BUY') {
+          netLabel = 'Trailing Dip Re-Buy:';
+          netValue = c.dip_buy_stop > 0 ? 'Buy Stop @ $' + c.dip_buy_stop.toFixed(4) : 'Waiting -0.4% Dip (from $' + c.last_sell_price.toFixed(4) + ')';
+        }
 
         cardsHtml += `
           <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg flex flex-col justify-between">
@@ -384,10 +435,10 @@ DASHBOARD_HTML = """
               </div>
               <div class="text-2xl font-mono font-bold mb-4">$${c.current_price.toFixed(4)} <span class="text-sm ${pnlColor}">(${pnlPct}%)</span></div>
               <div class="space-y-2 text-sm border-t border-slate-800 pt-3">
-                <div class="flex justify-between"><span class="text-slate-400">Bucket A (Anchor):</span><span class="font-semibold">$${c.anchor_usd.toFixed(2)}</span></div>
+                <div class="flex justify-between"><span class="text-slate-400">Bucket A (Anchor):</span><span class="font-semibold">$${c.anchor_usd.toFixed(2)} ${c.in_position ? '(In Token)' : '(In Cash)'}</span></div>
                 <div class="flex justify-between"><span class="text-slate-400">Live Position Value:</span><span>$${liveVal.toFixed(2)}</span></div>
                 <div class="flex justify-between"><span class="text-slate-400">Entry / Peak:</span><span>$${c.entry_price.toFixed(4)} / $${c.peak_price.toFixed(4)}</span></div>
-                <div class="flex justify-between"><span class="text-slate-400">Ratchet Sell Net:</span><span class="text-amber-300">${c.ratchet_active ? '$' + c.ratchet_stop_price.toFixed(4) : 'Waiting (+0.8%)'}</span></div>
+                <div class="flex justify-between"><span class="text-slate-400">${netLabel}</span><span class="text-amber-300">${netValue}</span></div>
                 <div class="flex justify-between border-t border-slate-800 pt-2 mt-2">
                   <span class="text-emerald-400 font-semibold">Bucket B (Vaulted):</span>
                   <span class="text-emerald-400 font-bold">+$${c.vault_profit_usd.toFixed(2)} (${c.trades_count} skims)</span>
@@ -429,36 +480,52 @@ def add_coin():
     if sym:
         pair = f"{sym}USDT"
         with state_lock:
-            bot_state["coins"][pair] = {
-                "symbol": sym,
-                "anchor_usd": anchor,
-                "vault_profit_usd": 0.0,
-                "in_position": False,
-                "token_qty": 0.0,
-                "entry_price": 0.0,
-                "current_price": 0.0,
-                "peak_price": 0.0,
-                "local_low": 0.0,
-                "ratchet_active": False,
-                "ratchet_stop_price": 0.0,
-                "mode": "STANDBY",
-                "trades_count": 0
-            }
+            bot_state["coins"][pair] = make_coin_template(sym, anchor)
             add_log(f"ADDED NEW SKIMMER: {sym}/USDT with ${anchor:.2f} Anchor.")
-            save_state()
+            save_state(force=True)
     return jsonify({"ok": True})
 
 @app.route("/api/simulate_spike/<pair>", methods=["POST"])
 def simulate_spike(pair):
-    """Simulates a +2% spike and minor pullback to test the Ratchet & Vault Skim live."""
+    """Tests a +2.2% spike & skim, then cleanly restores live market entry so cards don't show fake dips."""
+    prices = fetch_live_prices()
     with state_lock:
         coin = bot_state["coins"].get(pair)
-        if coin and coin["entry_price"] > 0:
-            spike_price = coin["entry_price"] * 1.022  # +2.2% spike arms ratchet
-            process_coin(pair, coin, spike_price)
-            pullback_price = spike_price * 0.996       # Pullback triggers ratchet skim
-            process_coin(pair, coin, pullback_price)
-            save_state()
+        if coin:
+            real_price = prices.get(pair, coin["current_price"])
+            if not coin["in_position"] and real_price > 0:
+                deploy_anchor_buy(coin, real_price, reason="Pre-Test Entry")
+
+            if coin["entry_price"] > 0:
+                spike_price = coin["entry_price"] * 1.022
+                process_coin(pair, coin, spike_price)
+                pullback_price = spike_price * 0.996
+                process_coin(pair, coin, pullback_price)
+
+                # Re-sync Last Sell reference to current real price so Trailing Dip Buy starts cleanly
+                if real_price > 0:
+                    coin["last_sell_price"] = real_price
+                    coin["local_low"] = real_price
+                    coin["current_price"] = real_price
+                save_state(force=True)
+    return jsonify({"ok": True})
+
+@app.route("/api/reset_live", methods=["POST"])
+def reset_live():
+    """Resets all coin entries to 100% real live market prices (and optionally clears test Vault)."""
+    data = request.json or {}
+    clear_vault = bool(data.get("clear_vault", False))
+    prices = fetch_live_prices()
+    with state_lock:
+        for pair, coin in bot_state["coins"].items():
+            live_px = prices.get(pair, coin["current_price"])
+            if clear_vault:
+                coin["vault_profit_usd"] = 0.0
+                coin["trades_count"] = 0
+            if live_px > 0:
+                deploy_anchor_buy(coin, live_px, reason="Synced to Live Market")
+        add_log("SYNCED TO LIVE MARKET: All anchors re-aligned to real-time prices." + (" (Test Vault cleared to $0.00)" if clear_vault else ""))
+        save_state(force=True)
     return jsonify({"ok": True})
 
 @app.route("/health")
