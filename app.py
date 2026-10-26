@@ -54,7 +54,8 @@ RUNAWAY_REBUY_PCT = 0.0100     # +1.00% breakout above sell price re-enters
 
 bot_state = {"coins": DEFAULT_COINS, "logs": []}
 state_lock = threading.Lock()
-db_dirty = False  # Signals background thread to save to Neon without blocking UI
+worker_started = False
+db_dirty = False
 
 
 def add_log(msg):
@@ -72,128 +73,58 @@ def ensure_coin_fields():
 
 
 # ==========================================
-# 2. BACKGROUND-ONLY NEON DATABASE SYNC
+# 2. TARGETED FAST PRICE FEED (<150ms)
 # ==========================================
-def init_db_in_background():
-    global bot_state
-    if DATABASE_URL:
-        try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=8)
-            cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS vault_store (
-                    id INT PRIMARY KEY,
-                    state_json TEXT NOT NULL
-                );
-            """)
-            cur.execute("SELECT state_json FROM vault_store WHERE id = 1;")
-            row = cur.fetchone()
-            if row:
-                loaded = json.loads(row[0])
-                if "coins" in loaded:
-                    with state_lock:
-                        bot_state = loaded
-                        ensure_coin_fields()
-                add_log("Neon PostgreSQL connected: Restored saved Vault state.")
-            else:
-                with state_lock:
-                    snapshot = json.dumps(bot_state)
-                cur.execute("INSERT INTO vault_store (id, state_json) VALUES (1, %s);", (snapshot,))
-                conn.commit()
-                add_log("Neon PostgreSQL connected: Created fresh Vault table.")
-            cur.close()
-            conn.close()
-            return
-        except Exception as e:
-            add_log(f"Neon startup notice: {e}")
+def fetch_live_prices(symbols_list=None):
+    """Fetches live prices for active symbols using targeted Gate.io & CryptoCompare calls."""
+    if not symbols_list:
+        with state_lock:
+            symbols_list = [c["symbol"] for c in bot_state["coins"].values()]
 
-    if os.path.exists(STATE_FILE):
+    prices = {}
+
+    # 1. Targeted Gate.io per-coin query (Proven to work on Render US servers, ~150 bytes each)
+    for sym in symbols_list:
+        pair_key = f"{sym}USDT"
         try:
-            with open(STATE_FILE, "r") as f:
-                loaded = json.load(f)
-                if "coins" in loaded:
-                    with state_lock:
-                        bot_state = loaded
-                        ensure_coin_fields()
+            g_url = f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={sym}_USDT"
+            r = requests.get(g_url, timeout=2.5)
+            if r.status_code == 200:
+                arr = r.json()
+                if isinstance(arr, list) and len(arr) > 0 and arr[0].get("last"):
+                    prices[pair_key] = float(arr[0]["last"])
         except Exception:
             pass
 
-
-def save_state_to_db():
-    """Runs strictly outside state_lock in the background thread so UI never freezes."""
-    global db_dirty
-    with state_lock:
-        snapshot = json.dumps(bot_state)
-        db_dirty = False
-
-    if DATABASE_URL:
+    # 2. Backup Batch Fetch via CryptoCompare for any missing symbol
+    missing = [s for s in symbols_list if f"{s}USDT" not in prices]
+    if missing:
         try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
-            cur = conn.cursor()
-            cur.execute("UPDATE vault_store SET state_json = %s WHERE id = 1;", (snapshot,))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return
-        except Exception as e:
-            print(f"Neon background save notice: {e}", flush=True)
-
-    try:
-        with open(STATE_FILE, "w") as f:
-            f.write(snapshot)
-    except Exception:
-        pass
-
-
-# ==========================================
-# 3. ULTRA-FAST TARGETED PRICE FEED (<100ms)
-# ==========================================
-def fetch_live_prices(symbols_list):
-    """Fetches ONLY the active coins (~80 bytes) instead of downloading 5MB of tickers."""
-    prices = {}
-    if not symbols_list:
-        return prices
-
-    # 1. Fast Batch Fetch via CryptoCompare (Works worldwide & on US Render servers)
-    try:
-        fsyms = ",".join(symbols_list)
-        url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={fsyms}&tsyms=USDT,USD"
-        resp = requests.get(url, timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            for sym in symbols_list:
-                if sym in data:
-                    val = data[sym].get("USDT") or data[sym].get("USD")
-                    if val:
-                        prices[f"{sym}USDT"] = float(val)
-    except Exception:
-        pass
-
-    # 2. Per-Coin Fallback via Gate.io for any missing symbol
-    for sym in symbols_list:
-        pair_key = f"{sym}USDT"
-        if pair_key not in prices:
-            try:
-                g_url = f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={sym}_USDT"
-                r = requests.get(g_url, timeout=3)
-                if r.status_code == 200 and isinstance(r.json(), list) and len(r.json()) > 0:
-                    last_px = r.json()[0].get("last")
-                    if last_px:
-                        prices[pair_key] = float(last_px)
-            except Exception:
-                pass
+            fsyms = ",".join(missing)
+            url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={fsyms}&tsyms=USDT,USD"
+            resp = requests.get(url, timeout=2.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                for sym in missing:
+                    if sym in data:
+                        val = data[sym].get("USDT") or data[sym].get("USD")
+                        if val:
+                            prices[f"{sym}USDT"] = float(val)
+        except Exception:
+            pass
 
     return prices
 
 
 # ==========================================
-# 4. CORE PROFIT-SKIMMING & DIP RE-BUY ENGINE
+# 3. CORE PROFIT-SKIMMING & DIP RE-BUY ENGINE
 # ==========================================
 def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     global db_dirty
     fee = coin["anchor_usd"] * TRADING_FEE_PCT
     net_invest = coin["anchor_usd"] - fee
     coin["token_qty"] = net_invest / live_price
+    coin["current_price"] = live_price
     coin["entry_price"] = live_price
     coin["peak_price"] = live_price
     coin["local_low"] = live_price
@@ -299,18 +230,70 @@ def process_coin(pair, coin, live_price):
             db_dirty = True
 
 
-def bot_background_loop():
-    init_db_in_background()
-    add_log("VaultSkim v1.3 Non-Blocking Engine started.")
-    last_periodic_save = time.time()
+# ==========================================
+# 4. BACKGROUND THREADS (PRICES FIRST, THEN DB)
+# ==========================================
+def init_db_async():
+    global bot_state
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=6, options="-c statement_timeout=5000")
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS vault_store (id INT PRIMARY KEY, state_json TEXT NOT NULL);")
+        cur.execute("SELECT state_json FROM vault_store WHERE id = 1;")
+        row = cur.fetchone()
+        if row:
+            loaded = json.loads(row[0])
+            if "coins" in loaded:
+                with state_lock:
+                    for pair, saved_c in loaded["coins"].items():
+                        if pair in bot_state["coins"]:
+                            bot_state["coins"][pair]["vault_profit_usd"] = saved_c.get("vault_profit_usd", 0.0)
+                            bot_state["coins"][pair]["trades_count"] = saved_c.get("trades_count", 0)
+                        else:
+                            bot_state["coins"][pair] = saved_c
+                    ensure_coin_fields()
+            add_log("Neon PostgreSQL synced: Restored Vault profit balances.")
+        else:
+            with state_lock:
+                snapshot = json.dumps(bot_state)
+            cur.execute("INSERT INTO vault_store (id, state_json) VALUES (1, %s);", (snapshot,))
+            conn.commit()
+            add_log("Neon PostgreSQL connected: Initialized Vault table.")
+        cur.close()
+        conn.close()
+    except Exception as e:
+        add_log(f"Neon DB background notice: {e}")
+
+
+def save_state_to_db():
+    global db_dirty
+    with state_lock:
+        snapshot = json.dumps(bot_state)
+        db_dirty = False
+
+    if DATABASE_URL:
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=5, options="-c statement_timeout=5000")
+            cur = conn.cursor()
+            cur.execute("UPDATE vault_store SET state_json = %s WHERE id = 1;", (snapshot,))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+
+def price_engine_loop():
+    add_log("VaultSkim v1.4 Engine live. Fetching real-time prices...")
+    # Start Neon sync in its own non-blocking sub-thread so prices fetch immediately!
+    threading.Thread(target=init_db_async, daemon=True).start()
+    last_save = time.time()
 
     while True:
         try:
-            with state_lock:
-                symbols = [c["symbol"] for c in bot_state["coins"].values()]
-
-            prices = fetch_live_prices(symbols)
-
+            prices = fetch_live_prices()
             if prices:
                 with state_lock:
                     for pair, coin in list(bot_state["coins"].items()):
@@ -318,41 +301,47 @@ def bot_background_loop():
                             process_coin(pair, coin, prices[pair])
 
             now = time.time()
-            if db_dirty or (now - last_periodic_save > 45):
+            if db_dirty or (now - last_save > 45):
                 save_state_to_db()
-                last_periodic_save = now
+                last_save = now
         except Exception as e:
-            print(f"Background loop warning: {e}", flush=True)
+            print(f"Engine loop error: {e}", flush=True)
 
         time.sleep(4)
 
 
-threading.Thread(target=bot_background_loop, daemon=True).start()
+@app.before_request
+def ensure_worker_threads():
+    """Guarantees the Gunicorn worker process starts the background loop on first request."""
+    global worker_started
+    if not worker_started:
+        worker_started = True
+        threading.Thread(target=price_engine_loop, daemon=True).start()
 
 
 # ==========================================
-# 5. INSTANT WEB DASHBOARD & ROUTES
+# 5. DASHBOARD UI WITH VISUAL BUTTON FEEDBACK
 # ==========================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>VaultSkim v1.3 — Two-Bucket Profit Engine</title>
+  <title>VaultSkim v1.4 — Two-Bucket Profit Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans">
   <div class="max-w-6xl mx-auto">
     <div class="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-800 pb-4 mb-6 gap-4">
       <div>
-        <h1 class="text-2xl font-bold text-emerald-400">VaultSkim Command Center <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2 py-0.5 rounded ml-2">v1.3 Instant</span></h1>
+        <h1 class="text-2xl font-bold text-emerald-400">VaultSkim Command Center <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2 py-0.5 rounded ml-2">v1.4 Live</span></h1>
         <p class="text-sm text-slate-400">Constant Anchor + Dynamic Micro-Ratchet + Trailing Dip Re-Buy</p>
       </div>
       <div class="flex flex-wrap items-center gap-3">
-        <button onclick="syncLivePrices(false)" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition">
+        <button id="btn-sync" onclick="syncLivePrices(false)" class="bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700 text-slate-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer">
           🔄 Sync Entries to Live Price
         </button>
-        <button onclick="syncLivePrices(true)" class="bg-rose-950/60 hover:bg-rose-900/70 border border-rose-700/50 text-rose-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition">
+        <button id="btn-reset" onclick="syncLivePrices(true)" class="bg-rose-950/60 hover:bg-rose-900/70 active:scale-95 border border-rose-700/50 text-rose-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer">
           🧹 Reset Test Vault ($0.00)
         </button>
         <div class="bg-emerald-950/60 border border-emerald-500/40 px-5 py-2.5 rounded-xl text-right">
@@ -367,7 +356,7 @@ DASHBOARD_HTML = """
       <div class="flex flex-wrap gap-2">
         <input id="new-symbol" type="text" placeholder="Symbol (e.g. SOL, PEPE, DOGE)" class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white uppercase">
         <input id="new-anchor" type="number" placeholder="Anchor USD (e.g. 50)" value="50" class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white w-36">
-        <button onclick="addCoin()" class="bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold px-4 py-1.5 rounded-lg transition">+ Launch Skimmer</button>
+        <button id="btn-add" onclick="addCoin()" class="bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white text-sm font-semibold px-4 py-1.5 rounded-lg transition cursor-pointer">+ Launch Skimmer</button>
       </div>
     </div>
 
@@ -384,26 +373,40 @@ DASHBOARD_HTML = """
       const sym = document.getElementById('new-symbol').value.trim().toUpperCase();
       const anc = parseFloat(document.getElementById('new-anchor').value) || 50;
       if (!sym) return;
+      const btn = document.getElementById('btn-add');
+      btn.innerText = '⏳ Launching...';
       await fetch('/api/add_coin', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({symbol: sym, anchor_usd: anc})
       });
       document.getElementById('new-symbol').value = '';
+      btn.innerText = '✅ Added!';
+      setTimeout(() => { btn.innerText = '+ Launch Skimmer'; }, 1200);
       refresh();
     }
 
-    async function simulateSpike(pair) {
+    async function simulateSpike(pair, btnEl) {
+      if (btnEl) btnEl.innerText = '⚡ Spiking +2.2%...';
       await fetch('/api/simulate_spike/' + pair, {method: 'POST'});
+      if (btnEl) {
+        btnEl.innerText = '✅ Skimmed to Vault!';
+        setTimeout(() => { btnEl.innerText = '⚡ Test Spike (+2% & Skim)'; }, 1200);
+      }
       refresh();
     }
 
     async function syncLivePrices(clearVault) {
+      const btn = document.getElementById(clearVault ? 'btn-reset' : 'btn-sync');
+      const originalText = btn.innerText;
+      btn.innerText = clearVault ? '⏳ Resetting...' : '⏳ Syncing Live Prices...';
       await fetch('/api/reset_live', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({clear_vault: clearVault})
       });
+      btn.innerText = '✅ Done!';
+      setTimeout(() => { btn.innerText = originalText; }, 1200);
       refresh();
     }
 
@@ -447,7 +450,7 @@ DASHBOARD_HTML = """
                   </div>
                 </div>
               </div>
-              <button onclick="simulateSpike('${pair}')" class="mt-4 w-full bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-semibold py-2 rounded-lg border border-slate-700 transition">
+              <button onclick="simulateSpike('${pair}', this)" class="mt-4 w-full bg-slate-800 hover:bg-slate-700 active:scale-95 text-amber-300 text-xs font-semibold py-2 rounded-lg border border-slate-700 transition cursor-pointer">
                 ⚡ Test Spike (+2% & Skim)
               </button>
             </div>`;
@@ -471,7 +474,6 @@ def index():
 
 @app.route("/api/state")
 def api_state():
-    """Instant RAM read (<2ms) — never blocks on network or database."""
     with state_lock:
         return jsonify(bot_state)
 
@@ -483,9 +485,13 @@ def add_coin():
     anchor = float(data.get("anchor_usd", 50.0))
     if sym:
         pair = f"{sym}USDT"
+        prices = fetch_live_prices([sym])
         with state_lock:
             bot_state["coins"][pair] = make_coin_template(sym, anchor)
-            add_log(f"ADDED NEW SKIMMER: {sym}/USDT with ${anchor:.2f} Anchor.")
+            if pair in prices and prices[pair] > 0:
+                deploy_anchor_buy(bot_state["coins"][pair], prices[pair], reason="New Skimmer Added")
+            else:
+                add_log(f"ADDED NEW SKIMMER: {sym}/USDT with ${anchor:.2f} Anchor.")
             db_dirty = True
     return jsonify({"ok": True})
 
@@ -494,38 +500,53 @@ def simulate_spike(pair):
     global db_dirty
     with state_lock:
         coin = bot_state["coins"].get(pair)
-        if coin:
-            real_price = coin["current_price"]
-            if not coin["in_position"] and real_price > 0:
-                deploy_anchor_buy(coin, real_price, reason="Pre-Test Entry")
+        sym = coin["symbol"] if coin else None
 
-            if coin["entry_price"] > 0:
-                spike_price = coin["entry_price"] * 1.022
-                process_coin(pair, coin, spike_price)
-                pullback_price = spike_price * 0.996
-                process_coin(pair, coin, pullback_price)
+    if not coin:
+        return jsonify({"ok": False})
 
-                if real_price > 0:
-                    coin["last_sell_price"] = real_price
-                    coin["local_low"] = real_price
-                    coin["current_price"] = real_price
-                db_dirty = True
+    # If price is still 0.0000, fetch live price right now so the button always works
+    if coin["current_price"] <= 0 and sym:
+        fresh = fetch_live_prices([sym])
+        if pair in fresh:
+            with state_lock:
+                coin["current_price"] = fresh[pair]
+
+    with state_lock:
+        real_price = coin["current_price"]
+        if not coin["in_position"] and real_price > 0:
+            deploy_anchor_buy(coin, real_price, reason="Pre-Test Entry")
+
+        if coin["entry_price"] > 0:
+            spike_price = coin["entry_price"] * 1.022
+            process_coin(pair, coin, spike_price)
+            pullback_price = spike_price * 0.996
+            process_coin(pair, coin, pullback_price)
+
+            if real_price > 0:
+                coin["last_sell_price"] = real_price
+                coin["local_low"] = real_price
+                coin["current_price"] = real_price
+            db_dirty = True
     return jsonify({"ok": True})
 
 @app.route("/api/reset_live", methods=["POST"])
-def reset_live(): 
+def reset_live():
+    """Fetches fresh live prices immediately and syncs all anchors."""
     global db_dirty
     data = request.json or {}
     clear_vault = bool(data.get("clear_vault", False))
+    prices = fetch_live_prices()
+
     with state_lock:
         for pair, coin in bot_state["coins"].items():
-            live_px = coin["current_price"]
+            live_px = prices.get(pair) or coin["current_price"]
             if clear_vault:
                 coin["vault_profit_usd"] = 0.0
                 coin["trades_count"] = 0
             if live_px > 0:
                 deploy_anchor_buy(coin, live_px, reason="Synced to Live Market")
-        add_log("SYNCED TO LIVE MARKET: All anchors re-aligned." + (" (Vault reset to $0.00)" if clear_vault else ""))
+        add_log("SYNCED TO LIVE MARKET: All anchors deployed at live prices." + (" (Vault reset to $0.00)" if clear_vault else ""))
         db_dirty = True
     return jsonify({"ok": True})
 
