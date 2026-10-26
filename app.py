@@ -274,14 +274,14 @@ def process_coin(pair, coin, live_price):
 
 
 # ==========================================
-# 4. BACKGROUND THREADS (PRICES FIRST, THEN DB)
+# 4. BACKGROUND THREADS (NEON POOLER COMPATIBLE)
 # ==========================================
 def init_db_async():
     global bot_state
     if not DATABASE_URL:
         return
     try:
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=6, options="-c statement_timeout=5000")
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
         cur = conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS vault_store (id INT PRIMARY KEY, state_json TEXT NOT NULL);")
         cur.execute("SELECT state_json FROM vault_store WHERE id = 1;")
@@ -319,14 +319,14 @@ def save_state_to_db():
 
     if DATABASE_URL:
         try:
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=5, options="-c statement_timeout=5000")
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
             cur = conn.cursor()
             cur.execute("UPDATE vault_store SET state_json = %s WHERE id = 1;", (snapshot,))
             conn.commit()
             cur.close()
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Neon save error: {e}", flush=True)
 
 
 def price_engine_loop():
