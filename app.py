@@ -10,18 +10,21 @@ from flask import Flask, jsonify, request, render_template_string
 app = Flask(__name__)
 
 # ==========================================
-# 1. CONFIGURATION & MEMORY STATE
+# 1. CONFIGURATION & DAY 2 STATE STRUCTURE
 # ==========================================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 STATE_FILE = "vault_state.json"
 TRADING_FEE_PCT = 0.001  # 0.1% per swap
 
-def make_coin_template(symbol, anchor_usd):
+def make_coin_template(symbol, anchor_usd, strategy="HYBRID_50_50"):
     return {
         "symbol": symbol,
         "anchor_usd": float(anchor_usd),
         "vault_profit_usd": 0.00,
+        "strategy": strategy,       # "FULL_100" or "HYBRID_50_50"
         "in_position": False,
+        "moonbag_active": False,    # True when Stage 1 (50%) sold and riding Stage 2 Moonbag
+        "active_anchor_usd": float(anchor_usd),
         "token_qty": 0.0,
         "entry_price": 0.0,
         "current_price": 0.0,
@@ -36,18 +39,21 @@ def make_coin_template(symbol, anchor_usd):
     }
 
 DEFAULT_COINS = {
-    "QNTUSDT": make_coin_template("QNT", 180.00),
-    "CELOUSDT": make_coin_template("CELO", 100.00),
-    "KSMUSDT": make_coin_template("KSM", 100.00)
+    "QNTUSDT": make_coin_template("QNT", 180.00, strategy="HYBRID_50_50"),
+    "CELOUSDT": make_coin_template("CELO", 100.00, strategy="FULL_100"),
+    "KSMUSDT": make_coin_template("KSM", 100.00, strategy="HYBRID_50_50")
 }
 
-WAKE_UP_PROFIT_PCT = 0.008     # +0.80% wakes up Micro-Ratchet
-MICRO_TRAIL_PCT = 0.0025       # 0.25% tight trail on small bumps
-WIDE_BREAKOUT_PCT = 0.030      # +3.0% switches to wider breakout trail
-WIDE_TRAIL_PCT = 0.0080        # 0.80% trail for big rallies
+# Universal Percentage Thresholds
+WAKE_UP_PROFIT_PCT = 0.008     # +0.80% wakes up Stage 1 Micro-Ratchet
+MICRO_TRAIL_PCT = 0.0025       # 0.25% tight trail for Stage 1
+MOONBAG_TRAIL_PCT = 0.0120     # 1.20% wider trail so Stage 2 Moonbag rides big rallies ($212+ QNT)
+WIDE_BREAKOUT_PCT = 0.030      # +3.0% switches Full Mode to wider trail
+WIDE_TRAIL_PCT = 0.0080        # 0.80% trail for big rallies in Full Mode
 CRASH_FLOOR_TRIGGER = -0.080   # -8.0% drop activates Kusama Reverse Skimming
 RELIEF_BOUNCE_PCT = 0.050      # +5.0% bounce from local low skims 25% stack
 
+# Trailing Dip Re-Buy Thresholds
 DIP_PULLBACK_TARGET = -0.0040  # Wait for -0.40% pullback after a sale to arm Dip Buy
 DIP_REBOUND_TRAIL = 0.0025     # +0.25% bounce off the dip bottom triggers re-buy
 RUNAWAY_REBUY_PCT = 0.0100     # +1.00% breakout above sell price re-enters
@@ -67,23 +73,24 @@ def add_log(msg):
 
 
 def ensure_coin_fields():
+    """Upgrades existing coins from Neon DB with Day 2 fields automatically."""
     for pair, c in bot_state.get("coins", {}).items():
         c.setdefault("last_sell_price", 0.0)
         c.setdefault("dip_buy_stop", 0.0)
+        c.setdefault("strategy", "HYBRID_50_50" if c.get("symbol") in ["QNT", "KSM"] else "FULL_100")
+        c.setdefault("moonbag_active", False)
+        c.setdefault("active_anchor_usd", c.get("anchor_usd", 100.0))
 
 
 # ==========================================
 # 2. TARGETED FAST PRICE FEED (<150ms)
 # ==========================================
 def fetch_live_prices(symbols_list=None):
-    """Fetches live prices for active symbols using targeted Gate.io & CryptoCompare calls."""
     if not symbols_list:
         with state_lock:
             symbols_list = [c["symbol"] for c in bot_state["coins"].values()]
 
     prices = {}
-
-    # 1. Targeted Gate.io per-coin query (Proven to work on Render US servers, ~150 bytes each)
     for sym in symbols_list:
         pair_key = f"{sym}USDT"
         try:
@@ -96,7 +103,6 @@ def fetch_live_prices(symbols_list=None):
         except Exception:
             pass
 
-    # 2. Backup Batch Fetch via CryptoCompare for any missing symbol
     missing = [s for s in symbols_list if f"{s}USDT" not in prices]
     if missing:
         try:
@@ -117,18 +123,20 @@ def fetch_live_prices(symbols_list=None):
 
 
 # ==========================================
-# 3. CORE PROFIT-SKIMMING & DIP RE-BUY ENGINE
+# 3. DAY 2 ENGINE: 50/50 HYBRID + DIP RE-BUY
 # ==========================================
 def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     global db_dirty
     fee = coin["anchor_usd"] * TRADING_FEE_PCT
     net_invest = coin["anchor_usd"] - fee
     coin["token_qty"] = net_invest / live_price
+    coin["active_anchor_usd"] = coin["anchor_usd"]
     coin["current_price"] = live_price
     coin["entry_price"] = live_price
     coin["peak_price"] = live_price
     coin["local_low"] = live_price
     coin["in_position"] = True
+    coin["moonbag_active"] = False
     coin["ratchet_active"] = False
     coin["ratchet_stop_price"] = 0.0
     coin["dip_buy_stop"] = 0.0
@@ -176,8 +184,13 @@ def process_coin(pair, coin, live_price):
 
     change_from_entry = (live_price - coin["entry_price"]) / coin["entry_price"]
 
-    # STEP A: Wake Up Dynamic Micro-Ratchet
-    if change_from_entry >= WAKE_UP_PROFIT_PCT:
+    # STEP A: Update Ratchet Stop Price
+    if coin.get("moonbag_active"):
+        # Stage 2 Moonbag uses wider 1.20% trail to ride big breakouts without selling early
+        new_stop = coin["peak_price"] * (1.0 - MOONBAG_TRAIL_PCT)
+        if new_stop > coin["ratchet_stop_price"]:
+            coin["ratchet_stop_price"] = new_stop
+    elif change_from_entry >= WAKE_UP_PROFIT_PCT:
         was_active = coin["ratchet_active"]
         coin["ratchet_active"] = True
         coin["mode"] = "RATCHET_LOCKED"
@@ -189,21 +202,51 @@ def process_coin(pair, coin, live_price):
             add_log(f"RATCHET ARMED {coin['symbol']} @ ${live_price:.4f} (Stop Net: ${coin['ratchet_stop_price']:.4f})")
             db_dirty = True
 
-    # STEP B: Snap Shut & Sweep Profit to Vault -> Enter Trailing Dip Re-Buy Mode
+    # STEP B: Execute Skim When Price Touches Ratchet Stop Net
     if coin["ratchet_active"] and live_price <= coin["ratchet_stop_price"]:
+        # Check if 50/50 Hybrid Mode should do Stage 1 (Sell 50%, Keep 50% Moonbag)
+        if coin.get("strategy") == "HYBRID_50_50" and not coin.get("moonbag_active"):
+            sell_qty = coin["token_qty"] * 0.5
+            half_anchor = coin["anchor_usd"] * 0.5
+            gross_val = sell_qty * live_price
+            sell_fee = gross_val * TRADING_FEE_PCT
+            net_payout = gross_val - sell_fee
+            skimmed_profit = net_payout - half_anchor
+
+            if skimmed_profit > 0:
+                coin["vault_profit_usd"] += skimmed_profit
+                coin["trades_count"] += 1
+                coin["token_qty"] -= sell_qty
+                coin["active_anchor_usd"] = half_anchor
+                coin["moonbag_active"] = True
+                coin["mode"] = "MOONBAG_RIDING"
+                # Set wider 1.20% Moonbag stop underneath live price so remaining 50% can ride the rocket
+                coin["ratchet_stop_price"] = live_price * (1.0 - MOONBAG_TRAIL_PCT)
+                add_log(
+                    f"STAGE 1 HYBRID SKIM {coin['symbol']} @ ${live_price:.4f}: "
+                    f"Sold 50% & locked +${skimmed_profit:.2f} in Vault! Riding 50% Moonbag (Stop: ${coin['ratchet_stop_price']:.4f})"
+                )
+                db_dirty = True
+            return
+
+        # Otherwise: Final Sale (Either 100% Full Mode OR Stage 2 Moonbag Exit)
+        active_cost = coin.get("active_anchor_usd", coin["anchor_usd"])
         gross_value = coin["token_qty"] * live_price
         sell_fee = gross_value * TRADING_FEE_PCT
         net_payout = gross_value - sell_fee
-        skimmed_profit = net_payout - coin["anchor_usd"]
+        skimmed_profit = net_payout - active_cost
 
         if skimmed_profit > 0:
             coin["vault_profit_usd"] += skimmed_profit
             coin["trades_count"] += 1
+            exit_label = "STAGE 2 MOONBAG EXIT" if coin.get("moonbag_active") else "VAULT SKIM"
             add_log(
-                f"VAULT SKIM {coin['symbol']} @ ${live_price:.4f}! "
-                f"Locked +${skimmed_profit:.2f} in Vault | Watching for dip to re-buy..."
+                f"{exit_label} {coin['symbol']} @ ${live_price:.4f}! "
+                f"Locked +${skimmed_profit:.2f} in Vault | Full ${coin['anchor_usd']:.2f} Anchor waiting for dip..."
             )
             coin["in_position"] = False
+            coin["moonbag_active"] = False
+            coin["active_anchor_usd"] = coin["anchor_usd"]
             coin["ratchet_active"] = False
             coin["ratchet_stop_price"] = 0.0
             coin["last_sell_price"] = live_price
@@ -251,6 +294,7 @@ def init_db_async():
                         if pair in bot_state["coins"]:
                             bot_state["coins"][pair]["vault_profit_usd"] = saved_c.get("vault_profit_usd", 0.0)
                             bot_state["coins"][pair]["trades_count"] = saved_c.get("trades_count", 0)
+                            bot_state["coins"][pair]["strategy"] = saved_c.get("strategy", bot_state["coins"][pair]["strategy"])
                         else:
                             bot_state["coins"][pair] = saved_c
                     ensure_coin_fields()
@@ -286,8 +330,7 @@ def save_state_to_db():
 
 
 def price_engine_loop():
-    add_log("VaultSkim v1.4 Engine live. Fetching real-time prices...")
-    # Start Neon sync in its own non-blocking sub-thread so prices fetch immediately!
+    add_log("VaultSkim v2.0 (Day 2: 50/50 Hybrid Moonbag) Engine live.")
     threading.Thread(target=init_db_async, daemon=True).start()
     last_save = time.time()
 
@@ -312,7 +355,6 @@ def price_engine_loop():
 
 @app.before_request
 def ensure_worker_threads():
-    """Guarantees the Gunicorn worker process starts the background loop on first request."""
     global worker_started
     if not worker_started:
         worker_started = True
@@ -320,22 +362,25 @@ def ensure_worker_threads():
 
 
 # ==========================================
-# 5. DASHBOARD UI WITH VISUAL BUTTON FEEDBACK
+# 5. DAY 2 DASHBOARD UI & CONTROLS
 # ==========================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>VaultSkim v1.4 — Two-Bucket Profit Engine</title>
+  <title>VaultSkim v2.0 — Day 2 Hybrid Moonbag Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans">
   <div class="max-w-6xl mx-auto">
     <div class="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-800 pb-4 mb-6 gap-4">
       <div>
-        <h1 class="text-2xl font-bold text-emerald-400">VaultSkim Command Center <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2 py-0.5 rounded ml-2">v1.4 Live</span></h1>
-        <p class="text-sm text-slate-400">Constant Anchor + Dynamic Micro-Ratchet + Trailing Dip Re-Buy</p>
+        <h1 class="text-2xl font-bold text-emerald-400">
+          VaultSkim Command Center
+          <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded ml-2">v2.0 · Day 2 Hybrid</span>
+        </h1>
+        <p class="text-sm text-slate-400">50/50 Hybrid Moonbag + Dynamic Micro-Ratchet + Card Controls</p>
       </div>
       <div class="flex flex-wrap items-center gap-3">
         <button id="btn-sync" onclick="syncLivePrices(false)" class="bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700 text-slate-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer">
@@ -386,12 +431,36 @@ DASHBOARD_HTML = """
       refresh();
     }
 
+    async function toggleStrategy(pair) {
+      await fetch('/api/toggle_strategy/' + pair, {method: 'POST'});
+      refresh();
+    }
+
+    async function editAnchor(pair, currentAnchor) {
+      const input = prompt('Enter new Bucket A Working Anchor (USD):', currentAnchor);
+      if (input === null) return;
+      const val = parseFloat(input);
+      if (isNaN(val) || val <= 0) return;
+      await fetch('/api/edit_anchor/' + pair, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({anchor_usd: val})
+      });
+      refresh();
+    }
+
+    async function deleteCoin(pair, sym) {
+      if (!confirm('Remove ' + sym + '/USDT card from dashboard?')) return;
+      await fetch('/api/delete_coin/' + pair, {method: 'POST'});
+      refresh();
+    }
+
     async function simulateSpike(pair, btnEl) {
-      if (btnEl) btnEl.innerText = '⚡ Spiking +2.2%...';
+      if (btnEl) btnEl.innerText = '⚡ Spiking...';
       await fetch('/api/simulate_spike/' + pair, {method: 'POST'});
       if (btnEl) {
-        btnEl.innerText = '✅ Skimmed to Vault!';
-        setTimeout(() => { btnEl.innerText = '⚡ Test Spike (+2% & Skim)'; }, 1200);
+        btnEl.innerText = '✅ Skimmed!';
+        setTimeout(() => { refresh(); }, 800);
       }
       refresh();
     }
@@ -419,29 +488,63 @@ DASHBOARD_HTML = """
 
         for (const [pair, c] of Object.entries(data.coins)) {
           totalVault += c.vault_profit_usd;
-          const liveVal = c.in_position && c.current_price > 0 ? (c.token_qty * c.current_price) : c.anchor_usd;
+          const activeCost = c.moonbag_active ? (c.anchor_usd * 0.5) : c.anchor_usd;
+          const liveVal = c.in_position && c.current_price > 0 ? (c.token_qty * c.current_price) : activeCost;
           const refPrice = c.in_position ? c.entry_price : c.last_sell_price;
           const pnlPct = refPrice > 0 ? (((c.current_price - refPrice) / refPrice) * 100).toFixed(2) : "0.00";
           const pnlColor = pnlPct >= 0 ? 'text-emerald-400' : 'text-amber-400';
 
+          const isHybrid = c.strategy === 'HYBRID_50_50';
+          const stratBadge = isHybrid
+            ? '🚀 Strategy: 50/50 Hybrid Moonbag'
+            : '🎯 Strategy: 100% Full Skim';
+          const stratStyle = isHybrid
+            ? 'bg-indigo-950/80 border-indigo-500/40 text-indigo-300 hover:bg-indigo-900/80'
+            : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700';
+
+          let bucketStatus = c.in_position ? '(In Token)' : '(In Cash)';
+          if (c.moonbag_active) bucketStatus = '(50% Moonbag Active)';
+
           let netLabel = 'Ratchet Sell Net:';
           let netValue = c.ratchet_active ? '$' + c.ratchet_stop_price.toFixed(4) : 'Waiting (+0.8%)';
-          if (!c.in_position && c.mode === 'TRAILING_DIP_BUY') {
+          if (c.moonbag_active) {
+            netLabel = 'Moonbag Trail (1.2%):';
+            netValue = 'Stop @ $' + c.ratchet_stop_price.toFixed(4);
+          } else if (!c.in_position && c.mode === 'TRAILING_DIP_BUY') {
             netLabel = 'Trailing Dip Re-Buy:';
             netValue = c.dip_buy_stop > 0 ? 'Buy Stop @ $' + c.dip_buy_stop.toFixed(4) : 'Waiting -0.4% Dip (from $' + c.last_sell_price.toFixed(4) + ')';
           }
 
+          const simBtnText = c.moonbag_active
+            ? '🚀 Test Moonbag Rally (+5% & Exit)'
+            : '⚡ Test Spike (+2% & Skim)';
+
           cardsHtml += `
             <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg flex flex-col justify-between">
               <div>
-                <div class="flex justify-between items-center mb-3">
+                <div class="flex justify-between items-center mb-2">
                   <span class="text-xl font-bold">${c.symbol}/USDT</span>
-                  <span class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-emerald-300 font-medium">${c.mode}</span>
+                  <div class="flex items-center gap-2">
+                    <span class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-emerald-300 font-medium">${c.mode}</span>
+                    <button onclick="deleteCoin('${pair}', '${c.symbol}')" title="Remove Card" class="text-slate-500 hover:text-rose-400 text-sm font-bold px-1.5 py-0.5 rounded cursor-pointer">✕</button>
+                  </div>
                 </div>
+
+                <button onclick="toggleStrategy('${pair}')" class="w-full text-left text-xs font-semibold px-3 py-1.5 rounded-lg border mb-3 transition cursor-pointer flex justify-between items-center ${stratStyle}">
+                  <span>${stratBadge}</span>
+                  <span class="underline opacity-75">Switch</span>
+                </button>
+
                 <div class="text-2xl font-mono font-bold mb-4">$${c.current_price.toFixed(4)} <span class="text-sm ${pnlColor}">(${pnlPct}%)</span></div>
                 <div class="space-y-2 text-sm border-t border-slate-800 pt-3">
-                  <div class="flex justify-between"><span class="text-slate-400">Bucket A (Anchor):</span><span class="font-semibold">$${c.anchor_usd.toFixed(2)} ${c.in_position ? '(In Token)' : '(In Cash)'}</span></div>
-                  <div class="flex justify-between"><span class="text-slate-400">Live Position Value:</span><span>$${liveVal.toFixed(2)}</span></div>
+                  <div class="flex justify-between items-center">
+                    <span class="text-slate-400">Bucket A (Anchor):</span>
+                    <span class="font-semibold flex items-center gap-1.5">
+                      $${c.anchor_usd.toFixed(2)} <span class="text-xs text-slate-400">${bucketStatus}</span>
+                      <button onclick="editAnchor('${pair}', ${c.anchor_usd})" class="text-xs bg-slate-800 hover:bg-slate-700 text-emerald-300 px-1.5 py-0.5 rounded border border-slate-700 cursor-pointer">✏️ Edit</button>
+                    </span>
+                  </div>
+                  <div class="flex justify-between"><span class="text-slate-400">Active Position Value:</span><span>$${liveVal.toFixed(2)}</span></div>
                   <div class="flex justify-between"><span class="text-slate-400">Entry / Peak:</span><span>$${c.entry_price.toFixed(4)} / $${c.peak_price.toFixed(4)}</span></div>
                   <div class="flex justify-between"><span class="text-slate-400">${netLabel}</span><span class="text-amber-300">${netValue}</span></div>
                   <div class="flex justify-between border-t border-slate-800 pt-2 mt-2">
@@ -451,7 +554,7 @@ DASHBOARD_HTML = """
                 </div>
               </div>
               <button onclick="simulateSpike('${pair}', this)" class="mt-4 w-full bg-slate-800 hover:bg-slate-700 active:scale-95 text-amber-300 text-xs font-semibold py-2 rounded-lg border border-slate-700 transition cursor-pointer">
-                ⚡ Test Spike (+2% & Skim)
+                ${simBtnText}
               </button>
             </div>`;
         }
@@ -487,7 +590,7 @@ def add_coin():
         pair = f"{sym}USDT"
         prices = fetch_live_prices([sym])
         with state_lock:
-            bot_state["coins"][pair] = make_coin_template(sym, anchor)
+            bot_state["coins"][pair] = make_coin_template(sym, anchor, strategy="HYBRID_50_50")
             if pair in prices and prices[pair] > 0:
                 deploy_anchor_buy(bot_state["coins"][pair], prices[pair], reason="New Skimmer Added")
             else:
@@ -495,8 +598,50 @@ def add_coin():
             db_dirty = True
     return jsonify({"ok": True})
 
+@app.route("/api/toggle_strategy/<pair>", methods=["POST"])
+def toggle_strategy(pair):
+    global db_dirty
+    with state_lock:
+        coin = bot_state["coins"].get(pair)
+        if coin:
+            new_strat = "FULL_100" if coin.get("strategy") == "HYBRID_50_50" else "HYBRID_50_50"
+            coin["strategy"] = new_strat
+            label = "50/50 Hybrid Moonbag" if new_strat == "HYBRID_50_50" else "100% Full Skim"
+            add_log(f"STRATEGY SWITCHED ({coin['symbol']}): Now using {label}.")
+            db_dirty = True
+    return jsonify({"ok": True})
+
+@app.route("/api/edit_anchor/<pair>", methods=["POST"])
+def edit_anchor(pair):
+    global db_dirty
+    data = request.json or {}
+    new_anc = float(data.get("anchor_usd", 0))
+    if new_anc > 0:
+        with state_lock:
+            coin = bot_state["coins"].get(pair)
+            if coin:
+                coin["anchor_usd"] = new_anc
+                if coin["in_position"] and coin["current_price"] > 0:
+                    deploy_anchor_buy(coin, coin["current_price"], reason="Anchor Resized")
+                else:
+                    add_log(f"ANCHOR UPDATED ({coin['symbol']}): Bucket A set to ${new_anc:.2f}.")
+                db_dirty = True
+    return jsonify({"ok": True})
+
+@app.route("/api/delete_coin/<pair>", methods=["POST"])
+def delete_coin(pair):
+    global db_dirty
+    with state_lock:
+        if pair in bot_state["coins"]:
+            sym = bot_state["coins"][pair]["symbol"]
+            del bot_state["coins"][pair]
+            add_log(f"REMOVED SKIMMER: {sym}/USDT card deleted.")
+            db_dirty = True
+    return jsonify({"ok": True})
+
 @app.route("/api/simulate_spike/<pair>", methods=["POST"])
 def simulate_spike(pair):
+    """Tests both Stage 1 (50% Skim) and Stage 2 (Moonbag Rally Exit) in Hybrid Mode."""
     global db_dirty
     with state_lock:
         coin = bot_state["coins"].get(pair)
@@ -505,7 +650,6 @@ def simulate_spike(pair):
     if not coin:
         return jsonify({"ok": False})
 
-    # If price is still 0.0000, fetch live price right now so the button always works
     if coin["current_price"] <= 0 and sym:
         fresh = fetch_live_prices([sym])
         if pair in fresh:
@@ -518,21 +662,29 @@ def simulate_spike(pair):
             deploy_anchor_buy(coin, real_price, reason="Pre-Test Entry")
 
         if coin["entry_price"] > 0:
-            spike_price = coin["entry_price"] * 1.022
-            process_coin(pair, coin, spike_price)
-            pullback_price = spike_price * 0.996
-            process_coin(pair, coin, pullback_price)
+            if coin.get("moonbag_active"):
+                # Stage 2 Test: Simulate a +5% Moonbag rally and pullback
+                rally_peak = coin["entry_price"] * 1.055
+                process_coin(pair, coin, rally_peak)
+                pullback = rally_peak * 0.985
+                process_coin(pair, coin, pullback)
+            else:
+                # Stage 1 Test: Simulate a +2.2% spike and pullback
+                spike_price = coin["entry_price"] * 1.022
+                process_coin(pair, coin, spike_price)
+                pullback_price = spike_price * 0.996
+                process_coin(pair, coin, pullback_price)
 
             if real_price > 0:
-                coin["last_sell_price"] = real_price
-                coin["local_low"] = real_price
                 coin["current_price"] = real_price
+                if not coin["in_position"]:
+                    coin["last_sell_price"] = real_price
+                    coin["local_low"] = real_price
             db_dirty = True
     return jsonify({"ok": True})
 
 @app.route("/api/reset_live", methods=["POST"])
 def reset_live():
-    """Fetches fresh live prices immediately and syncs all anchors."""
     global db_dirty
     data = request.json or {}
     clear_vault = bool(data.get("clear_vault", False))
