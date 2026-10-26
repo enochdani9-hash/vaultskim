@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request, render_template_string
 app = Flask(__name__)
 
 # ==========================================
-# 1. CONFIGURATION & v2.1 SLIDING FLOOR STATE
+# 1. CONFIGURATION & v2.3 STATE STRUCTURE
 # ==========================================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 STATE_FILE = "vault_state.json"
@@ -29,10 +29,11 @@ def make_coin_template(symbol, anchor_usd, strategy="HYBRID_50_50"):
         "entry_price": 0.0,
         "current_price": 0.0,
         "peak_price": 0.0,
-        "local_low": 0.0,           # Tracks the lowest dip so the +0.8% bar slides down automatically
+        "local_low": 0.0,           # Sliding low while holding token
         "ratchet_active": False,
         "ratchet_stop_price": 0.0,
         "last_sell_price": 0.0,
+        "post_sell_peak": 0.0,      # Tracks highest price reached after selling so -0.4% dip slides UP!
         "dip_buy_stop": 0.0,
         "mode": "STANDBY",
         "trades_count": 0
@@ -44,17 +45,16 @@ DEFAULT_COINS = {
     "KSMUSDT": make_coin_template("KSM", 100.00, strategy="HYBRID_50_50")
 }
 
-# Sliding Floor & Ratchet Thresholds
-WAKE_UP_PROFIT_PCT = 0.008     # +0.80% above Local Low (or Entry) wakes up the Ratchet!
+# Sliding Floor & Ratchet Thresholds (When Holding Token)
+WAKE_UP_PROFIT_PCT = 0.0078    # +0.80% (with 4-decimal tick tolerance) above Sliding Low wakes up Ratchet
 MICRO_TRAIL_PCT = 0.0020       # 0.20% tight trail behind peak once armed
 MOONBAG_TRAIL_PCT = 0.0120     # 1.20% wider trail for Stage 2 Moonbag rallies
 WIDE_BREAKOUT_PCT = 0.030      # +3.0% switches Full Mode to wider trail
 WIDE_TRAIL_PCT = 0.0080        # 0.80% trail for big rallies in Full Mode
 
-# Trailing Dip Re-Buy Thresholds
-DIP_PULLBACK_TARGET = -0.0040  # Wait for -0.40% pullback after a sale to arm Dip Buy
-DIP_REBOUND_TRAIL = 0.0025     # +0.25% bounce off the dip bottom triggers re-buy
-RUNAWAY_REBUY_PCT = 0.0100     # +1.00% breakout above sell price re-enters
+# Instant Two-Door Re-Buy Thresholds (When In Cash — Never Sit Idle!)
+DIP_PULLBACK_TARGET = -0.0038  # Door 1: Instant re-buy at -0.4% dip (includes 0.00383 tick tolerance for CELO $0.0783 -> $0.0780!)
+STEP_UP_REBUY_PCT = 0.0050     # Door 2: +0.50% rise above sell price without dipping auto-buys so bot NEVER sits idle!
 
 bot_state = {"coins": DEFAULT_COINS, "logs": []}
 state_lock = threading.Lock()
@@ -73,6 +73,9 @@ def add_log(msg):
 def ensure_coin_fields():
     for pair, c in bot_state.get("coins", {}).items():
         c.setdefault("last_sell_price", 0.0)
+        c.setdefault("post_sell_peak", c.get("last_sell_price", 0.0))
+        if c["post_sell_peak"] <= 0 and c["last_sell_price"] > 0:
+            c["post_sell_peak"] = c["last_sell_price"]
         c.setdefault("dip_buy_stop", 0.0)
         c.setdefault("strategy", "HYBRID_50_50" if c.get("symbol") in ["QNT", "KSM"] else "FULL_100")
         c.setdefault("moonbag_active", False)
@@ -122,7 +125,7 @@ def fetch_live_prices(symbols_list=None):
 
 
 # ==========================================
-# 3. v2.1 ENGINE: SLIDING +0.8% BAR + HYBRID
+# 3. v2.3 ENGINE: INSTANT -0.4% DIP RE-BUY
 # ==========================================
 def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     global db_dirty
@@ -150,45 +153,57 @@ def process_coin(pair, coin, live_price):
         return
     coin["current_price"] = live_price
 
-    # CASE 1: Not in position -> Standby Initial Buy OR Trailing Dip Re-Buy
+    # =========================================================================
+    # CASE 1: IN CASH -> INSTANT SLIDING -0.4% DIP BUY OR +0.5% STEP-UP BUY
+    # =========================================================================
     if not coin["in_position"] or coin["entry_price"] <= 0:
         if coin.get("mode") == "TRAILING_DIP_BUY" and coin.get("last_sell_price", 0) > 0:
             sell_px = coin["last_sell_price"]
+            if coin.get("post_sell_peak", 0) <= 0:
+                coin["post_sell_peak"] = sell_px
+
+            # Slide the Post-Sell Peak UP whenever price reaches a new high after selling!
+            if live_price > coin["post_sell_peak"]:
+                coin["post_sell_peak"] = live_price
+                coin["local_low"] = live_price
+
             if live_price < coin["local_low"] or coin["local_low"] <= 0:
                 coin["local_low"] = live_price
 
-            change_from_sell = (live_price - sell_px) / sell_px
+            peak_ref = coin["post_sell_peak"]
+            dip_from_sliding_peak = (live_price - peak_ref) / peak_ref
+            gain_above_sell = (live_price - sell_px) / sell_px
 
-            if change_from_sell <= DIP_PULLBACK_TARGET:
-                new_buy_stop = coin["local_low"] * (1.0 + DIP_REBOUND_TRAIL)
-                if coin["dip_buy_stop"] <= 0 or new_buy_stop < coin["dip_buy_stop"]:
-                    coin["dip_buy_stop"] = new_buy_stop
-
-                if live_price >= coin["dip_buy_stop"]:
-                    deploy_anchor_buy(coin, live_price, reason="Dip Rebound Caught")
-                    return
-            elif change_from_sell >= RUNAWAY_REBUY_PCT:
-                deploy_anchor_buy(coin, live_price, reason="Breakout Continuation")
+            # DOOR 1: Instant Buy the moment price dips -0.4% (with -0.38% tick tolerance so CELO $0.0783 -> $0.0780 buys immediately!)
+            if dip_from_sliding_peak <= DIP_PULLBACK_TARGET:
+                deploy_anchor_buy(coin, live_price, reason=f"-0.4% Dip Re-Buy from ${peak_ref:.4f} Peak")
                 return
+
+            # DOOR 2: If price climbs +0.50% above sell price without dipping, auto-buy so bot NEVER sits idle!
+            elif gain_above_sell >= STEP_UP_REBUY_PCT:
+                deploy_anchor_buy(coin, live_price, reason="Step-Up Trend Re-Buy (+0.5% No-Idle)")
+                return
+
             return
         else:
             deploy_anchor_buy(coin, live_price, reason="Initial Entry")
             return
 
-    # CASE 2: Holding Position -> Track Peak & Sliding Local Low
+    # =========================================================================
+    # CASE 2: HOLDING TOKEN -> SLIDING +0.8% LOW BAR & 50/50 HYBRID RATCHET
+    # =========================================================================
     if live_price > coin["peak_price"]:
         coin["peak_price"] = live_price
 
-    # If price drops lower before Ratchet is armed, slide the Local Low (and +0.8% target bar) down!
     if not coin["ratchet_active"]:
         if live_price < coin["local_low"] or coin["local_low"] <= 0:
             coin["local_low"] = live_price
-            coin["peak_price"] = live_price  # Reset local peak so we measure fresh bounce from the low
+            coin["peak_price"] = live_price
 
     base_floor = coin["local_low"] if coin["local_low"] > 0 else coin["entry_price"]
     bounce_from_low = (live_price - base_floor) / base_floor
 
-    # STEP A: Wake Up Ratchet as soon as price rises +0.8% from the SLIDING LOCAL LOW!
+    # STEP A: Wake Up Ratchet as soon as price rises +0.8% from the SLIDING LOCAL LOW
     if coin.get("moonbag_active"):
         new_stop = coin["peak_price"] * (1.0 - MOONBAG_TRAIL_PCT)
         if new_stop > coin["ratchet_stop_price"]:
@@ -210,13 +225,11 @@ def process_coin(pair, coin, live_price):
 
     # STEP B: Execute Profit Skim When Price Touches Ratchet Stop Net
     if coin["ratchet_active"] and live_price <= coin["ratchet_stop_price"]:
-        # Check if we are above original entry price OR harvesting a sub-entry dip bounce
         is_above_entry = live_price > (coin["entry_price"] * 1.0022)
 
-        # SUB-ENTRY SLIDING FLOOR SKIM (When coin dipped e.g. $202.98 -> $200.00 and bounced +0.8% to $201.60)
+        # SUB-ENTRY SLIDING FLOOR SKIM
         if not is_above_entry and not coin.get("moonbag_active"):
             net_bounce_pct = max(0.002, bounce_from_low - (2 * TRADING_FEE_PCT))
-            # Skim the +0.8% bounce on 50% active slice and drag Entry Price bar down!
             skimmed_profit = (coin["anchor_usd"] * 0.50) * net_bounce_pct
             coin["vault_profit_usd"] += skimmed_profit
             coin["trades_count"] += 1
@@ -269,7 +282,7 @@ def process_coin(pair, coin, live_price):
         exit_label = "STAGE 2 MOONBAG EXIT" if coin.get("moonbag_active") else "VAULT SKIM"
         add_log(
             f"{exit_label} {coin['symbol']} @ ${live_price:.4f}! "
-            f"Locked +${skimmed_profit:.2f} in Vault | Full ${coin['anchor_usd']:.2f} Anchor waiting for dip..."
+            f"Locked +${skimmed_profit:.2f} in Vault | Watching Instant -0.4% Dip OR +0.5% Step-Up..."
         )
         coin["in_position"] = False
         coin["moonbag_active"] = False
@@ -277,6 +290,7 @@ def process_coin(pair, coin, live_price):
         coin["ratchet_active"] = False
         coin["ratchet_stop_price"] = 0.0
         coin["last_sell_price"] = live_price
+        coin["post_sell_peak"] = live_price
         coin["local_low"] = live_price
         coin["dip_buy_stop"] = 0.0
         coin["mode"] = "TRAILING_DIP_BUY"
@@ -341,7 +355,7 @@ def save_state_to_db():
 
 
 def price_engine_loop():
-    add_log("VaultSkim v2.1 (Sliding +0.8% Floor Bar + Hybrid Moonbag) live.")
+    add_log("VaultSkim v2.3 (Instant -0.4% Sliding Dip Buy + +0.5% Step-Up) live.")
     threading.Thread(target=init_db_async, daemon=True).start()
     last_save = time.time()
 
@@ -373,14 +387,14 @@ def ensure_worker_threads():
 
 
 # ==========================================
-# 5. v2.1 DASHBOARD UI WITH LIVE SLIDING BAR
+# 5. v2.3 DASHBOARD UI (INSTANT 2-DOOR RE-BUY)
 # ==========================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>VaultSkim v2.1 — Sliding Floor & Hybrid Engine</title>
+  <title>VaultSkim v2.3 — Instant Dip Re-Buy Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans">
@@ -389,13 +403,13 @@ DASHBOARD_HTML = """
       <div>
         <h1 class="text-2xl font-bold text-emerald-400">
           VaultSkim Command Center
-          <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded ml-2">v2.1 · Sliding Floor Bar</span>
+          <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded ml-2">v2.3 · Instant Re-Buy</span>
         </h1>
-        <p class="text-sm text-slate-400">Sliding +0.8% Dip Bar + 50/50 Hybrid Moonbag + Card Controls</p>
+        <p class="text-sm text-slate-400">Sliding +0.8% Low Bar + Instant -0.4% Peak Dip Re-Buy + +0.5% Step-Up</p>
       </div>
       <div class="flex flex-wrap items-center gap-3">
         <button id="btn-sync" onclick="syncLivePrices(false)" class="bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700 text-slate-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer">
-          🔄 Sync Entries to Live Price
+          🔄 Sync All to Live Token Position
         </button>
         <button id="btn-reset" onclick="syncLivePrices(true)" class="bg-rose-950/60 hover:bg-rose-900/70 active:scale-95 border border-rose-700/50 text-rose-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer">
           🧹 Reset Test Vault ($0.00)
@@ -502,7 +516,8 @@ DASHBOARD_HTML = """
           const activeCost = c.moonbag_active ? (c.anchor_usd * 0.5) : c.anchor_usd;
           const liveVal = c.in_position && c.current_price > 0 ? (c.token_qty * c.current_price) : activeCost;
           const baseLow = c.local_low > 0 ? c.local_low : c.entry_price;
-          const refPrice = c.in_position ? baseLow : c.last_sell_price;
+          const postPeak = c.post_sell_peak > 0 ? c.post_sell_peak : c.last_sell_price;
+          const refPrice = c.in_position ? baseLow : postPeak;
           const pnlPct = refPrice > 0 ? (((c.current_price - refPrice) / refPrice) * 100).toFixed(2) : "0.00";
           const pnlColor = pnlPct >= 0 ? 'text-emerald-400' : 'text-amber-400';
 
@@ -518,6 +533,9 @@ DASHBOARD_HTML = """
           if (c.moonbag_active) bucketStatus = '(50% Moonbag Active)';
 
           const slidingTarget = baseLow * 1.008;
+          let row3Label = 'Entry / Sliding Low:';
+          let row3Value = `$${c.entry_price.toFixed(4)} / <span class="text-sky-300 font-mono">$${baseLow.toFixed(4)}</span>`;
+
           let netLabel = 'Sliding +0.8% Bar:';
           let netValue = c.ratchet_active
             ? 'LOCKED Stop @ $' + c.ratchet_stop_price.toFixed(4)
@@ -527,8 +545,12 @@ DASHBOARD_HTML = """
             netLabel = 'Moonbag Trail (1.2%):';
             netValue = 'Stop @ $' + c.ratchet_stop_price.toFixed(4);
           } else if (!c.in_position && c.mode === 'TRAILING_DIP_BUY') {
-            netLabel = 'Trailing Dip Re-Buy:';
-            netValue = c.dip_buy_stop > 0 ? 'Buy Stop @ $' + c.dip_buy_stop.toFixed(4) : 'Waiting -0.4% Dip (from $' + c.last_sell_price.toFixed(4) + ')';
+            const dipTriggerPx = postPeak * (1.0 + (-0.0038));
+            const stepUpPx = c.last_sell_price * 1.005;
+            row3Label = 'Sold At / Sliding High:';
+            row3Value = `$${c.last_sell_price.toFixed(4)} / <span class="text-emerald-300 font-mono">$${postPeak.toFixed(4)}</span>`;
+            netLabel = 'Instant Re-Buy At:';
+            netValue = `Dip <= $${dipTriggerPx.toFixed(4)} (-0.4%) OR >= $${stepUpPx.toFixed(4)} (+0.5%)`;
           }
 
           const simBtnText = c.moonbag_active
@@ -551,7 +573,7 @@ DASHBOARD_HTML = """
                   <span class="underline opacity-75">Switch</span>
                 </button>
 
-                <div class="text-2xl font-mono font-bold mb-4">$${c.current_price.toFixed(4)} <span class="text-xs ${pnlColor}">(${pnlPct}% from Low)</span></div>
+                <div class="text-2xl font-mono font-bold mb-4">$${c.current_price.toFixed(4)} <span class="text-xs ${pnlColor}">(${pnlPct}% ${c.in_position ? 'from Low' : 'from Peak'})</span></div>
                 <div class="space-y-2 text-sm border-t border-slate-800 pt-3">
                   <div class="flex justify-between items-center">
                     <span class="text-slate-400">Bucket A (Anchor):</span>
@@ -561,8 +583,8 @@ DASHBOARD_HTML = """
                     </span>
                   </div>
                   <div class="flex justify-between"><span class="text-slate-400">Active Position Value:</span><span>$${liveVal.toFixed(2)}</span></div>
-                  <div class="flex justify-between"><span class="text-slate-400">Entry / Sliding Low:</span><span>$${c.entry_price.toFixed(4)} / <span class="text-sky-300 font-mono">$${baseLow.toFixed(4)}</span></span></div>
-                  <div class="flex justify-between"><span class="text-slate-400">${netLabel}</span><span class="text-amber-300 font-mono text-xs">${netValue}</span></div>
+                  <div class="flex justify-between"><span class="text-slate-400">${row3Label}</span><span>${row3Value}</span></div>
+                  <div class="flex justify-between"><span class="text-slate-400">${netLabel}</span><span class="text-amber-300 font-mono text-xs text-right">${netValue}</span></div>
                   <div class="flex justify-between border-t border-slate-800 pt-2 mt-2">
                     <span class="text-emerald-400 font-semibold">Bucket B (Vaulted):</span>
                     <span class="text-emerald-400 font-bold">+$${c.vault_profit_usd.toFixed(2)} (${c.trades_count} skims)</span>
@@ -693,6 +715,7 @@ def simulate_spike(pair):
                 coin["current_price"] = real_price
                 if not coin["in_position"]:
                     coin["last_sell_price"] = real_price
+                    coin["post_sell_peak"] = real_price
                     coin["local_low"] = real_price
             db_dirty = True
     return jsonify({"ok": True})
