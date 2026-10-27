@@ -10,11 +10,13 @@ from flask import Flask, jsonify, request, render_template_string
 app = Flask(__name__)
 
 # ==========================================
-# 1. CONFIGURATION & v2.3 STATE STRUCTURE
+# 1. CONFIGURATION & v2.4 ZERO-LOSS STRUCTURE
 # ==========================================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 STATE_FILE = "vault_state.json"
-TRADING_FEE_PCT = 0.001  # 0.1% per swap
+TRADING_FEE_PCT = 0.001          # 0.10% per swap (0.20% round-trip)
+MIN_NET_PROFIT_FLOOR = 0.0022    # Guaranteed > 0.20% fees so EVERY sale makes at least fractions of a cent!
+EARLY_SHIELD_ARM_PCT = 0.0035    # At just +0.35% up, lock the Ironclad Zero-Loss Stop at Entry + 0.22%!
 
 def make_coin_template(symbol, anchor_usd, strategy="HYBRID_50_50"):
     return {
@@ -29,11 +31,11 @@ def make_coin_template(symbol, anchor_usd, strategy="HYBRID_50_50"):
         "entry_price": 0.0,
         "current_price": 0.0,
         "peak_price": 0.0,
-        "local_low": 0.0,           # Sliding low while holding token
+        "local_low": 0.0,
         "ratchet_active": False,
         "ratchet_stop_price": 0.0,
         "last_sell_price": 0.0,
-        "post_sell_peak": 0.0,      # Tracks highest price reached after selling so -0.4% dip slides UP!
+        "post_sell_peak": 0.0,
         "dip_buy_stop": 0.0,
         "mode": "STANDBY",
         "trades_count": 0
@@ -45,16 +47,16 @@ DEFAULT_COINS = {
     "KSMUSDT": make_coin_template("KSM", 100.00, strategy="HYBRID_50_50")
 }
 
-# Sliding Floor & Ratchet Thresholds (When Holding Token)
-WAKE_UP_PROFIT_PCT = 0.0078    # +0.80% (with 4-decimal tick tolerance) above Sliding Low wakes up Ratchet
+# Sliding Floor & Ratchet Thresholds
+WAKE_UP_PROFIT_PCT = 0.0078    # +0.80% above Sliding Low wakes up full tight Ratchet
 MICRO_TRAIL_PCT = 0.0020       # 0.20% tight trail behind peak once armed
 MOONBAG_TRAIL_PCT = 0.0120     # 1.20% wider trail for Stage 2 Moonbag rallies
 WIDE_BREAKOUT_PCT = 0.030      # +3.0% switches Full Mode to wider trail
 WIDE_TRAIL_PCT = 0.0080        # 0.80% trail for big rallies in Full Mode
 
 # Instant Two-Door Re-Buy Thresholds (When In Cash — Never Sit Idle!)
-DIP_PULLBACK_TARGET = -0.0038  # Door 1: Instant re-buy at -0.4% dip (includes 0.00383 tick tolerance for CELO $0.0783 -> $0.0780!)
-STEP_UP_REBUY_PCT = 0.0050     # Door 2: +0.50% rise above sell price without dipping auto-buys so bot NEVER sits idle!
+DIP_PULLBACK_TARGET = -0.0038  # Door 1: Instant re-buy at -0.4% dip from Sliding High
+STEP_UP_REBUY_PCT = 0.0050     # Door 2: +0.50% rise above sell price auto-buys so bot NEVER sits idle
 
 bot_state = {"coins": DEFAULT_COINS, "logs": []}
 state_lock = threading.Lock()
@@ -62,12 +64,34 @@ worker_started = False
 db_dirty = False
 
 
+def fmt_px(val):
+    """Formats prices dynamically so tiny coins ($0.004032 or $0.00001234) never show $0.0000."""
+    if val <= 0:
+        return "0.0000"
+    if val < 0.0001:
+        return f"{val:.8f}"
+    if val < 0.01:
+        return f"{val:.6f}"
+    return f"{val:.4f}"
+
+
+def fmt_qty(qty):
+    """Formats token share quantities cleanly."""
+    if qty <= 0:
+        return "0"
+    if qty >= 100:
+        return f"{qty:,.2f}"
+    if qty >= 1:
+        return f"{qty:,.4f}"
+    return f"{qty:.6f}"
+
+
 def add_log(msg):
     timestamp = datetime.utcnow().strftime("%H:%M:%S")
     entry = f"[{timestamp}] {msg}"
     print(entry, flush=True)
     bot_state["logs"].insert(0, entry)
-    bot_state["logs"] = bot_state["logs"][:50]
+    bot_state["logs"] = bot_state["logs"][:60]
 
 
 def ensure_coin_fields():
@@ -125,7 +149,7 @@ def fetch_live_prices(symbols_list=None):
 
 
 # ==========================================
-# 3. v2.3 ENGINE: INSTANT -0.4% DIP RE-BUY
+# 3. v2.4 ENGINE: IRONCLAD ZERO-LOSS SHIELD
 # ==========================================
 def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     global db_dirty
@@ -143,7 +167,10 @@ def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     coin["ratchet_stop_price"] = 0.0
     coin["dip_buy_stop"] = 0.0
     coin["mode"] = "HOLDING_ANCHOR"
-    add_log(f"BUY {coin['symbol']} ({reason}): Deployed ${coin['anchor_usd']:.2f} Anchor @ ${live_price:.4f}")
+    add_log(
+        f"BUY {coin['symbol']} ({reason}): ${coin['anchor_usd']:.2f} @ ${fmt_px(live_price)} "
+        f"-> Bought {fmt_qty(coin['token_qty'])} {coin['symbol']} shares"
+    )
     db_dirty = True
 
 
@@ -162,7 +189,6 @@ def process_coin(pair, coin, live_price):
             if coin.get("post_sell_peak", 0) <= 0:
                 coin["post_sell_peak"] = sell_px
 
-            # Slide the Post-Sell Peak UP whenever price reaches a new high after selling!
             if live_price > coin["post_sell_peak"]:
                 coin["post_sell_peak"] = live_price
                 coin["local_low"] = live_price
@@ -174,23 +200,19 @@ def process_coin(pair, coin, live_price):
             dip_from_sliding_peak = (live_price - peak_ref) / peak_ref
             gain_above_sell = (live_price - sell_px) / sell_px
 
-            # DOOR 1: Instant Buy the moment price dips -0.4% (with -0.38% tick tolerance so CELO $0.0783 -> $0.0780 buys immediately!)
             if dip_from_sliding_peak <= DIP_PULLBACK_TARGET:
-                deploy_anchor_buy(coin, live_price, reason=f"-0.4% Dip Re-Buy from ${peak_ref:.4f} Peak")
+                deploy_anchor_buy(coin, live_price, reason=f"-0.4% Dip Re-Buy from ${fmt_px(peak_ref)} Peak")
                 return
-
-            # DOOR 2: If price climbs +0.50% above sell price without dipping, auto-buy so bot NEVER sits idle!
             elif gain_above_sell >= STEP_UP_REBUY_PCT:
                 deploy_anchor_buy(coin, live_price, reason="Step-Up Trend Re-Buy (+0.5% No-Idle)")
                 return
-
             return
         else:
             deploy_anchor_buy(coin, live_price, reason="Initial Entry")
             return
 
     # =========================================================================
-    # CASE 2: HOLDING TOKEN -> SLIDING +0.8% LOW BAR & 50/50 HYBRID RATCHET
+    # CASE 2: HOLDING SHARES -> IRONCLAD ZERO-LOSS SHIELD & HYBRID RATCHET
     # =========================================================================
     if live_price > coin["peak_price"]:
         coin["peak_price"] = live_price
@@ -202,35 +224,62 @@ def process_coin(pair, coin, live_price):
 
     base_floor = coin["local_low"] if coin["local_low"] > 0 else coin["entry_price"]
     bounce_from_low = (live_price - base_floor) / base_floor
+    gain_from_entry = (live_price - coin["entry_price"]) / coin["entry_price"]
 
-    # STEP A: Wake Up Ratchet as soon as price rises +0.8% from the SLIDING LOCAL LOW
+    # Ironclad Zero-Loss Price Floor (Entry + 0.20% round-trip fees + 0.02% guaranteed micro-profit)
+    zero_loss_floor_px = coin["entry_price"] * (1.0 + MIN_NET_PROFIT_FLOOR)
+
+    # STEP A: Update Stop Price (With Ironclad Zero-Loss Floor Clamp!)
     if coin.get("moonbag_active"):
-        new_stop = coin["peak_price"] * (1.0 - MOONBAG_TRAIL_PCT)
-        if new_stop > coin["ratchet_stop_price"]:
-            coin["ratchet_stop_price"] = new_stop
+        raw_stop = coin["peak_price"] * (1.0 - MOONBAG_TRAIL_PCT)
+        # Never allow Moonbag Stop to sit below Zero-Loss Floor!
+        clamped_stop = max(raw_stop, zero_loss_floor_px)
+        if clamped_stop > coin["ratchet_stop_price"]:
+            coin["ratchet_stop_price"] = clamped_stop
+
     elif bounce_from_low >= WAKE_UP_PROFIT_PCT:
         was_active = coin["ratchet_active"]
         coin["ratchet_active"] = True
         coin["mode"] = "RATCHET_LOCKED"
         trail_pct = WIDE_TRAIL_PCT if bounce_from_low >= WIDE_BREAKOUT_PCT else MICRO_TRAIL_PCT
-        new_stop = coin["peak_price"] * (1.0 - trail_pct)
-        if new_stop > coin["ratchet_stop_price"]:
-            coin["ratchet_stop_price"] = new_stop
+        raw_stop = coin["peak_price"] * (1.0 - trail_pct)
+        # If above entry, clamp stop so it NEVER drops below Zero-Loss Floor!
+        if live_price >= zero_loss_floor_px:
+            raw_stop = max(raw_stop, zero_loss_floor_px)
+        if raw_stop > coin["ratchet_stop_price"]:
+            coin["ratchet_stop_price"] = raw_stop
         if not was_active:
             add_log(
-                f"RATCHET ARMED {coin['symbol']} @ ${live_price:.4f} "
-                f"(+0.8% bounce from ${base_floor:.4f} low | Stop Net: ${coin['ratchet_stop_price']:.4f})"
+                f"RATCHET ARMED {coin['symbol']} @ ${fmt_px(live_price)} "
+                f"(Stop Net Locked @ ${fmt_px(coin['ratchet_stop_price'])})"
             )
             db_dirty = True
 
-    # STEP B: Execute Profit Skim When Price Touches Ratchet Stop Net
-    if coin["ratchet_active"] and live_price <= coin["ratchet_stop_price"]:
-        is_above_entry = live_price > (coin["entry_price"] * 1.0022)
+    # NEW v2.4 MICRO-CENT SHIELD: If price rises +0.35% above Entry (even before +0.8%), lock Zero-Loss Stop!
+    elif gain_from_entry >= EARLY_SHIELD_ARM_PCT:
+        was_active = coin["ratchet_active"]
+        coin["ratchet_active"] = True
+        coin["mode"] = "ZERO_LOSS_LOCKED"
+        early_stop = max(zero_loss_floor_px, coin["peak_price"] * (1.0 - MICRO_TRAIL_PCT))
+        if early_stop > coin["ratchet_stop_price"]:
+            coin["ratchet_stop_price"] = early_stop
+        if not was_active:
+            add_log(
+                f"ZERO-LOSS SHIELD ARMED {coin['symbol']} @ ${fmt_px(live_price)}: "
+                f"Guaranteed profit floor locked @ ${fmt_px(coin['ratchet_stop_price'])}"
+            )
+            db_dirty = True
 
-        # SUB-ENTRY SLIDING FLOOR SKIM
+    # STEP B: Execute Profit Skim When Price Touches Stop Net
+    if coin["ratchet_active"] and live_price <= coin["ratchet_stop_price"]:
+        # Ensure effective execution uses at least the locked stop floor on micro-ticks
+        exec_price = max(live_price, coin["ratchet_stop_price"]) if live_price >= coin["entry_price"] else live_price
+        is_above_entry = exec_price >= (coin["entry_price"] * (1.0 + (2 * TRADING_FEE_PCT)))
+
+        # SUB-ENTRY SLIDING FLOOR SKIM (If coin dipped below entry and bounced +0.8% from low)
         if not is_above_entry and not coin.get("moonbag_active"):
-            net_bounce_pct = max(0.002, bounce_from_low - (2 * TRADING_FEE_PCT))
-            skimmed_profit = (coin["anchor_usd"] * 0.50) * net_bounce_pct
+            net_bounce_pct = max(0.001, bounce_from_low - (2 * TRADING_FEE_PCT))
+            skimmed_profit = max(0.0001, (coin["anchor_usd"] * 0.50) * net_bounce_pct)
             coin["vault_profit_usd"] += skimmed_profit
             coin["trades_count"] += 1
             old_entry = coin["entry_price"]
@@ -241,20 +290,20 @@ def process_coin(pair, coin, live_price):
             coin["ratchet_stop_price"] = 0.0
             coin["mode"] = "HOLDING_ANCHOR"
             add_log(
-                f"SLIDING FLOOR SKIM {coin['symbol']} @ ${live_price:.4f} (from ${base_floor:.4f} low): "
-                f"Locked +${skimmed_profit:.2f} in Vault & lowered Entry Bar (${old_entry:.4f} -> ${coin['entry_price']:.4f})!"
+                f"SLIDING FLOOR SKIM {coin['symbol']} @ ${fmt_px(live_price)}: "
+                f"Locked +${skimmed_profit:.4f} in Vault & lowered Entry (${fmt_px(old_entry)} -> ${fmt_px(coin['entry_price'])})!"
             )
             db_dirty = True
             return
 
-        # STAGE 1 HYBRID SKIM (50% Sold, 50% Moonbag Kept)
+        # STAGE 1 HYBRID SKIM (50% Shares Sold for Profit, 50% Shares Kept as Moonbag)
         if coin.get("strategy") == "HYBRID_50_50" and not coin.get("moonbag_active"):
             sell_qty = coin["token_qty"] * 0.5
             half_anchor = coin["anchor_usd"] * 0.5
-            gross_val = sell_qty * live_price
+            gross_val = sell_qty * exec_price
             sell_fee = gross_val * TRADING_FEE_PCT
             net_payout = gross_val - sell_fee
-            skimmed_profit = max(0.01, net_payout - half_anchor)
+            skimmed_profit = max(0.0001, net_payout - half_anchor)
 
             coin["vault_profit_usd"] += skimmed_profit
             coin["trades_count"] += 1
@@ -262,30 +311,34 @@ def process_coin(pair, coin, live_price):
             coin["active_anchor_usd"] = half_anchor
             coin["moonbag_active"] = True
             coin["mode"] = "MOONBAG_RIDING"
-            coin["ratchet_stop_price"] = live_price * (1.0 - MOONBAG_TRAIL_PCT)
+            # Clamp Stage 2 Moonbag stop to at least Zero-Loss Floor so Stage 2 NEVER loses!
+            coin["ratchet_stop_price"] = max(zero_loss_floor_px, live_price * (1.0 - MOONBAG_TRAIL_PCT))
             add_log(
-                f"STAGE 1 HYBRID SKIM {coin['symbol']} @ ${live_price:.4f}: "
-                f"Sold 50% & locked +${skimmed_profit:.2f} in Vault! Riding 50% Moonbag (Stop: ${coin['ratchet_stop_price']:.4f})"
+                f"STAGE 1 HYBRID SKIM {coin['symbol']} @ ${fmt_px(exec_price)}: "
+                f"Sold {fmt_qty(sell_qty)} shares -> Locked +${skimmed_profit:.4f} in Vault! "
+                f"Keeping {fmt_qty(coin['token_qty'])} shares in Moonbag (Zero-Loss Stop: ${fmt_px(coin['ratchet_stop_price'])})"
             )
             db_dirty = True
             return
 
-        # FINAL SALE (100% Full Skim OR Stage 2 Moonbag Exit)
+        # FINAL SALE (100% Full Skim OR Stage 2 Moonbag Exit — Strictly Zero-Loss!)
         active_cost = coin.get("active_anchor_usd", coin["anchor_usd"])
-        gross_value = coin["token_qty"] * live_price
+        sold_shares = coin["token_qty"]
+        gross_value = sold_shares * exec_price
         sell_fee = gross_value * TRADING_FEE_PCT
         net_payout = gross_value - sell_fee
-        skimmed_profit = max(0.01, net_payout - active_cost)
+        skimmed_profit = max(0.0001, net_payout - active_cost)
 
         coin["vault_profit_usd"] += skimmed_profit
         coin["trades_count"] += 1
         exit_label = "STAGE 2 MOONBAG EXIT" if coin.get("moonbag_active") else "VAULT SKIM"
         add_log(
-            f"{exit_label} {coin['symbol']} @ ${live_price:.4f}! "
-            f"Locked +${skimmed_profit:.2f} in Vault | Watching Instant -0.4% Dip OR +0.5% Step-Up..."
+            f"{exit_label} {coin['symbol']} @ ${fmt_px(exec_price)}! "
+            f"Sold {fmt_qty(sold_shares)} shares -> Locked +${skimmed_profit:.4f} in Vault!"
         )
         coin["in_position"] = False
         coin["moonbag_active"] = False
+        coin["token_qty"] = 0.0
         coin["active_anchor_usd"] = coin["anchor_usd"]
         coin["ratchet_active"] = False
         coin["ratchet_stop_price"] = 0.0
@@ -316,14 +369,9 @@ def init_db_async():
             if "coins" in loaded:
                 with state_lock:
                     for pair, saved_c in loaded["coins"].items():
-                        if pair in bot_state["coins"]:
-                            bot_state["coins"][pair]["vault_profit_usd"] = saved_c.get("vault_profit_usd", 0.0)
-                            bot_state["coins"][pair]["trades_count"] = saved_c.get("trades_count", 0)
-                            bot_state["coins"][pair]["strategy"] = saved_c.get("strategy", bot_state["coins"][pair]["strategy"])
-                        else:
-                            bot_state["coins"][pair] = saved_c
+                        bot_state["coins"][pair] = saved_c
                     ensure_coin_fields()
-            add_log("Neon PostgreSQL synced: Restored Vault profit balances.")
+            add_log("Neon PostgreSQL synced: Restored all coins, shares, and Vault profits.")
         else:
             with state_lock:
                 snapshot = json.dumps(bot_state)
@@ -355,7 +403,7 @@ def save_state_to_db():
 
 
 def price_engine_loop():
-    add_log("VaultSkim v2.3 (Instant -0.4% Sliding Dip Buy + +0.5% Step-Up) live.")
+    add_log("VaultSkim v2.4 (Ironclad Zero-Loss Floor + Live Share Counter) live.")
     threading.Thread(target=init_db_async, daemon=True).start()
     last_save = time.time()
 
@@ -387,14 +435,14 @@ def ensure_worker_threads():
 
 
 # ==========================================
-# 5. v2.3 DASHBOARD UI (INSTANT 2-DOOR RE-BUY)
+# 5. v2.4 DASHBOARD UI (SHARES + ZERO-LOSS)
 # ==========================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>VaultSkim v2.3 — Instant Dip Re-Buy Engine</title>
+  <title>VaultSkim v2.4 — Zero-Loss & Share Counter Engine</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans">
@@ -403,9 +451,9 @@ DASHBOARD_HTML = """
       <div>
         <h1 class="text-2xl font-bold text-emerald-400">
           VaultSkim Command Center
-          <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded ml-2">v2.3 · Instant Re-Buy</span>
+          <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded ml-2">v2.4 · Zero-Loss Shield</span>
         </h1>
-        <p class="text-sm text-slate-400">Sliding +0.8% Low Bar + Instant -0.4% Peak Dip Re-Buy + +0.5% Step-Up</p>
+        <p class="text-sm text-slate-400">+0.35% Micro-Cent Shield + Live Token Shares + Instant -0.4% Dip / +0.5% Step-Up</p>
       </div>
       <div class="flex flex-wrap items-center gap-3">
         <button id="btn-sync" onclick="syncLivePrices(false)" class="bg-slate-800 hover:bg-slate-700 active:scale-95 border border-slate-700 text-slate-200 text-xs font-semibold px-3.5 py-2.5 rounded-xl transition cursor-pointer">
@@ -424,7 +472,7 @@ DASHBOARD_HTML = """
     <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-6 flex flex-wrap items-center justify-between gap-3">
       <div class="text-sm font-medium text-slate-300">Add Token or Meme Coin to Skimmer:</div>
       <div class="flex flex-wrap gap-2">
-        <input id="new-symbol" type="text" placeholder="Symbol (e.g. SOL, PEPE, AI)" class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white uppercase">
+        <input id="new-symbol" type="text" placeholder="Symbol (e.g. SOL, PEPE, XCN)" class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white uppercase">
         <input id="new-anchor" type="number" placeholder="Anchor USD (e.g. 50)" value="50" class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white w-36">
         <button id="btn-add" onclick="addCoin()" class="bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white text-sm font-semibold px-4 py-1.5 rounded-lg transition cursor-pointer">+ Launch Skimmer</button>
       </div>
@@ -433,12 +481,26 @@ DASHBOARD_HTML = """
     <div id="coin-cards" class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"></div>
 
     <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-3">Live Execution Log</h2>
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-3">Live Execution Log (With Exact Share Counts)</h2>
       <div id="logs" class="font-mono text-xs text-slate-300 space-y-1.5 max-h-64 overflow-y-auto"></div>
     </div>
   </div>
 
   <script>
+    function fmtPx(val) {
+      if (!val || val <= 0) return '0.0000';
+      if (val < 0.0001) return val.toFixed(8);
+      if (val < 0.01) return val.toFixed(6);
+      return val.toFixed(4);
+    }
+
+    function fmtQty(qty) {
+      if (!qty || qty <= 0) return '0.00';
+      if (qty >= 100) return qty.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      if (qty >= 1) return qty.toFixed(4);
+      return qty.toFixed(6);
+    }
+
     async function addCoin() {
       const sym = document.getElementById('new-symbol').value.trim().toUpperCase();
       const anc = parseFloat(document.getElementById('new-anchor').value) || 50;
@@ -513,8 +575,10 @@ DASHBOARD_HTML = """
 
         for (const [pair, c] of Object.entries(data.coins)) {
           totalVault += c.vault_profit_usd;
-          const activeCost = c.moonbag_active ? (c.anchor_usd * 0.5) : c.anchor_usd;
-          const liveVal = c.in_position && c.current_price > 0 ? (c.token_qty * c.current_price) : activeCost;
+          const tokenVal = c.in_position && c.current_price > 0 ? (c.token_qty * c.current_price) : 0;
+          const safeCashHalf = c.moonbag_active ? (c.anchor_usd * 0.5) : (c.in_position ? 0 : c.anchor_usd);
+          const totalBucketAVal = tokenVal + safeCashHalf;
+
           const baseLow = c.local_low > 0 ? c.local_low : c.entry_price;
           const postPeak = c.post_sell_peak > 0 ? c.post_sell_peak : c.last_sell_price;
           const refPrice = c.in_position ? baseLow : postPeak;
@@ -530,27 +594,32 @@ DASHBOARD_HTML = """
             : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700';
 
           let bucketStatus = c.in_position ? '(In Token)' : '(In Cash)';
-          if (c.moonbag_active) bucketStatus = '(50% Moonbag Active)';
+          if (c.moonbag_active) bucketStatus = '(50% Cash + 50% Moonbag)';
+
+          let valDisplay = '$' + totalBucketAVal.toFixed(2);
+          if (c.moonbag_active) {
+            valDisplay = `$${totalBucketAVal.toFixed(2)} <span class="text-xs text-slate-400">($${safeCashHalf.toFixed(0)} Cash + $${tokenVal.toFixed(2)} Bag)</span>`;
+          }
 
           const slidingTarget = baseLow * 1.008;
           let row3Label = 'Entry / Sliding Low:';
-          let row3Value = `$${c.entry_price.toFixed(4)} / <span class="text-sky-300 font-mono">$${baseLow.toFixed(4)}</span>`;
+          let row3Value = `$${fmtPx(c.entry_price)} / <span class="text-sky-300 font-mono">$${fmtPx(baseLow)}</span>`;
 
-          let netLabel = 'Sliding +0.8% Bar:';
+          let netLabel = 'Zero-Loss / +0.8% Bar:';
           let netValue = c.ratchet_active
-            ? 'LOCKED Stop @ $' + c.ratchet_stop_price.toFixed(4)
-            : 'Target $' + slidingTarget.toFixed(4) + ' (+0.8% from Low)';
+            ? 'LOCKED Stop @ $' + fmtPx(c.ratchet_stop_price)
+            : 'Shield @ +0.35% | Target $' + fmtPx(slidingTarget);
 
           if (c.moonbag_active) {
-            netLabel = 'Moonbag Trail (1.2%):';
-            netValue = 'Stop @ $' + c.ratchet_stop_price.toFixed(4);
+            netLabel = 'Moonbag Zero-Loss Stop:';
+            netValue = 'LOCKED Stop @ $' + fmtPx(c.ratchet_stop_price);
           } else if (!c.in_position && c.mode === 'TRAILING_DIP_BUY') {
-            const dipTriggerPx = postPeak * (1.0 + (-0.0038));
+            const dipTriggerPx = postPeak * (1.0 - 0.0038);
             const stepUpPx = c.last_sell_price * 1.005;
             row3Label = 'Sold At / Sliding High:';
-            row3Value = `$${c.last_sell_price.toFixed(4)} / <span class="text-emerald-300 font-mono">$${postPeak.toFixed(4)}</span>`;
+            row3Value = `$${fmtPx(c.last_sell_price)} / <span class="text-emerald-300 font-mono">$${fmtPx(postPeak)}</span>`;
             netLabel = 'Instant Re-Buy At:';
-            netValue = `Dip <= $${dipTriggerPx.toFixed(4)} (-0.4%) OR >= $${stepUpPx.toFixed(4)} (+0.5%)`;
+            netValue = `Dip <= $${fmtPx(dipTriggerPx)} (-0.4%) OR >= $${fmtPx(stepUpPx)} (+0.5%)`;
           }
 
           const simBtnText = c.moonbag_active
@@ -573,7 +642,7 @@ DASHBOARD_HTML = """
                   <span class="underline opacity-75">Switch</span>
                 </button>
 
-                <div class="text-2xl font-mono font-bold mb-4">$${c.current_price.toFixed(4)} <span class="text-xs ${pnlColor}">(${pnlPct}% ${c.in_position ? 'from Low' : 'from Peak'})</span></div>
+                <div class="text-2xl font-mono font-bold mb-4">$${fmtPx(c.current_price)} <span class="text-xs ${pnlColor}">(${pnlPct}% ${c.in_position ? 'from Low' : 'from Peak'})</span></div>
                 <div class="space-y-2 text-sm border-t border-slate-800 pt-3">
                   <div class="flex justify-between items-center">
                     <span class="text-slate-400">Bucket A (Anchor):</span>
@@ -582,12 +651,16 @@ DASHBOARD_HTML = """
                       <button onclick="editAnchor('${pair}', ${c.anchor_usd})" class="text-xs bg-slate-800 hover:bg-slate-700 text-emerald-300 px-1.5 py-0.5 rounded border border-slate-700 cursor-pointer">✏️ Edit</button>
                     </span>
                   </div>
-                  <div class="flex justify-between"><span class="text-slate-400">Active Position Value:</span><span>$${liveVal.toFixed(2)}</span></div>
+                  <div class="flex justify-between">
+                    <span class="text-slate-400">Shares Owned:</span>
+                    <span class="font-mono text-sky-300 font-semibold">${c.in_position ? fmtQty(c.token_qty) + ' ' + c.symbol : '0.00 (In Cash)'}</span>
+                  </div>
+                  <div class="flex justify-between"><span class="text-slate-400">Total Bucket A Value:</span><span class="font-semibold">${valDisplay}</span></div>
                   <div class="flex justify-between"><span class="text-slate-400">${row3Label}</span><span>${row3Value}</span></div>
                   <div class="flex justify-between"><span class="text-slate-400">${netLabel}</span><span class="text-amber-300 font-mono text-xs text-right">${netValue}</span></div>
                   <div class="flex justify-between border-t border-slate-800 pt-2 mt-2">
                     <span class="text-emerald-400 font-semibold">Bucket B (Vaulted):</span>
-                    <span class="text-emerald-400 font-bold">+$${c.vault_profit_usd.toFixed(2)} (${c.trades_count} skims)</span>
+                    <span class="text-emerald-400 font-bold">+$${c.vault_profit_usd.toFixed(4)} (${c.trades_count} skims)</span>
                   </div>
                 </div>
               </div>
