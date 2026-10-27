@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request, render_template_string, Response
 app = Flask(__name__)
 
 # ==========================================
-# 1. CONFIGURATION & v3.0 DAY 3 STRUCTURE
+# 1. CONFIGURATION & v4.0 DAY 4 STRUCTURE
 # ==========================================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 STATE_FILE = "vault_state.json"
@@ -24,7 +24,7 @@ def make_coin_template(symbol, anchor_usd, strategy="HYBRID_50_50", token_addres
         "symbol": symbol.upper(),
         "anchor_usd": float(anchor_usd),
         "initial_anchor_usd": float(anchor_usd),
-        "reinvested_anchor_usd": 0.00, # Tracks Escrow cents added to Bucket A so Total Profit NEVER drops!
+        "reinvested_anchor_usd": 0.00,
         "vault_profit_usd": 0.00,
         "pending_profit_usd": 0.00,
         "target_shares": 0.0,
@@ -44,7 +44,6 @@ def make_coin_template(symbol, anchor_usd, strategy="HYBRID_50_50", token_addres
         "dip_buy_stop": 0.0,
         "mode": "STANDBY",
         "trades_count": 0,
-        # Day 3 Anti-Rug & DexScreener Fields
         "token_address": token_address,
         "chain_id": chain_id,
         "liquidity_usd": 0.0,
@@ -59,18 +58,29 @@ DEFAULT_COINS = {
     "KSMUSDT": make_coin_template("KSM", 100.00, strategy="HYBRID_50_50")
 }
 
-# Sliding Floor & Ratchet Thresholds
 WAKE_UP_PROFIT_PCT = 0.0078    # +0.80% above Sliding Low wakes up full tight Ratchet
 MICRO_TRAIL_PCT = 0.0020       # 0.20% tight trail behind peak once armed
 MOONBAG_TRAIL_PCT = 0.0120     # 1.20% wider trail for Stage 2 Moonbag rallies
 WIDE_BREAKOUT_PCT = 0.030      # +3.0% switches Full Mode to wider trail
 WIDE_TRAIL_PCT = 0.0080        # 0.80% trail for big rallies in Full Mode
 
-# Strict Share-Keeper Two-Door Re-Buy Thresholds
 DIP_PULLBACK_TARGET = -0.0038  # Door 1: Instant re-buy at -0.4% dip (Grows shares + 100% Escrow to Vault!)
 STEP_UP_REBUY_PCT = 0.0020     # Door 2: +0.2% Step-Up (ONLY triggers if Escrow covers 100% of Target Shares!)
 
-bot_state = {"coins": DEFAULT_COINS, "logs": [], "radar": []}
+bot_state = {
+    "coins": DEFAULT_COINS,
+    "logs": [],
+    "radar": [],
+    "history": [],
+    "skims": [],
+    "alerts": {
+        "enabled": True,
+        "ntfy_topic": "",
+        "tg_token": "",
+        "tg_chat_id": "",
+        "webhook_url": ""
+    }
+}
 state_lock = threading.Lock()
 worker_started = False
 db_dirty = False
@@ -106,6 +116,117 @@ def add_log(msg):
     bot_state["logs"] = bot_state["logs"][:70]
 
 
+def calculate_totals():
+    vault_cash = 0.0
+    reinvested = 0.0
+    total_skims = 0
+    for c in bot_state.get("coins", {}).values():
+        vault_cash += (c.get("vault_profit_usd", 0.0) + c.get("pending_profit_usd", 0.0))
+        reinvested += c.get("reinvested_anchor_usd", 0.0)
+        total_skims += int(c.get("trades_count", 0))
+    return round(vault_cash + reinvested, 4), round(vault_cash, 4), round(reinvested, 4), total_skims
+
+
+def record_skim_and_chart(symbol, skim_type, price, shares, profit_added):
+    """Records a point on the Day 4 Live Profit Chart and adds an entry to the Skim Ledger."""
+    now_str = datetime.utcnow().strftime("%H:%M:%S")
+    grand_total, vault_cash, reinvested, _ = calculate_totals()
+
+    bot_state.setdefault("history", [])
+    bot_state["history"].append({
+        "time": now_str,
+        "total": grand_total,
+        "vault": vault_cash,
+        "reinvested": reinvested,
+        "label": f"{symbol} +${profit_added:.4f}"
+    })
+    bot_state["history"] = bot_state["history"][-50:]
+
+    bot_state.setdefault("skims", [])
+    bot_state["skims"].insert(0, {
+        "time": now_str,
+        "symbol": symbol,
+        "type": skim_type,
+        "price": fmt_px(price),
+        "shares": fmt_qty(shares),
+        "profit": round(profit_added, 4),
+        "grand_total": grand_total
+    })
+    bot_state["skims"] = bot_state["skims"][:30]
+
+
+# ==========================================
+# 2. DAY 4 INSTANT PHONE NOTIFICATION ENGINE
+# ==========================================
+def _dispatch_alert_async(title, message, payload, alerts_cfg):
+    # 1. ntfy.sh Instant Push (Zero signup required)
+    ntfy_topic = (alerts_cfg.get("ntfy_topic") or "").strip()
+    if ntfy_topic:
+        try:
+            requests.post(
+                f"https://ntfy.sh/{ntfy_topic}",
+                data=message.encode("utf-8"),
+                headers={"Title": title, "Priority": "high", "Tags": "moneybag,chart_with_upwards_trend"},
+                timeout=4
+            )
+        except Exception:
+            pass
+
+    # 2. Telegram Bot Push
+    tg_token = (alerts_cfg.get("tg_token") or "").strip()
+    tg_chat = (alerts_cfg.get("tg_chat_id") or "").strip()
+    if tg_token and tg_chat:
+        try:
+            tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+            requests.post(
+                tg_url,
+                json={"chat_id": tg_chat, "text": f"💰 *{title}*\n{message}", "parse_mode": "Markdown"},
+                timeout=4
+            )
+        except Exception:
+            pass
+
+    # 3. Custom Webhook (WhatsApp / Make / Discord)
+    webhook = (alerts_cfg.get("webhook_url") or "").strip()
+    if webhook:
+        try:
+            requests.post(
+                webhook,
+                json={"title": title, "content": f"💰 **{title}**\n{message}", "data": payload},
+                timeout=4
+            )
+        except Exception:
+            pass
+
+
+def trigger_phone_alert(symbol, skim_type, profit_usd, price, shares):
+    alerts_cfg = bot_state.get("alerts") or {}
+    if not alerts_cfg.get("enabled", True):
+        return
+    if not any([alerts_cfg.get("ntfy_topic"), alerts_cfg.get("tg_token"), alerts_cfg.get("webhook_url")]):
+        return
+
+    grand_total, vault_cash, reinvested, total_skims = calculate_totals()
+    title = f"VaultSkim: {symbol} +${profit_usd:.4f}!"
+    message = (
+        f"{skim_type} on {symbol}/USDT @ ${fmt_px(price)}\n"
+        f"Profit Locked: +${profit_usd:.4f} | Shares Protected: {fmt_qty(shares)} {symbol}\n"
+        f"Total Profit Generated: ${grand_total:.2f} (Vault: ${vault_cash:.2f} | Anchors: +${reinvested:.2f} | {total_skims} skims)"
+    )
+    payload = {
+        "symbol": symbol,
+        "skim_type": skim_type,
+        "profit_usd": profit_usd,
+        "price": price,
+        "grand_total_usd": grand_total
+    }
+    threading.Thread(
+        target=_dispatch_alert_async,
+        args=(title, message, payload, dict(alerts_cfg)),
+        daemon=True
+    ).start()
+
+
 KNOWN_INITIAL_ANCHORS = {
     "QNT": 204.0, "CELO": 100.0, "KSM": 100.0, "SOL": 100.0,
     "DASH": 60.0, "LTC": 60.0, "PENGU": 50.0, "WIF": 50.0,
@@ -117,6 +238,12 @@ KNOWN_INITIAL_ANCHORS = {
 
 def ensure_coin_fields():
     bot_state.setdefault("radar", [])
+    bot_state.setdefault("history", [])
+    bot_state.setdefault("skims", [])
+    bot_state.setdefault("alerts", {
+        "enabled": True, "ntfy_topic": "", "tg_token": "", "tg_chat_id": "", "webhook_url": ""
+    })
+
     for pair, c in bot_state.get("coins", {}).items():
         sym = c.get("symbol", "")
         c.setdefault("last_sell_price", 0.0)
@@ -136,7 +263,6 @@ def ensure_coin_fields():
         c.setdefault("security_badge", "🛡️ VERIFIED CEX")
         c.setdefault("price_source", "CEX")
 
-        # Reconstruct exact Share-Keeper top-ups already added to Bucket A so Total Profit reflects 100%!
         base_init = KNOWN_INITIAL_ANCHORS.get(sym, c.get("anchor_usd", 50.0))
         c.setdefault("initial_anchor_usd", base_init)
         if c.get("reinvested_anchor_usd", 0.0) <= 0 and c.get("anchor_usd", 0.0) > c["initial_anchor_usd"]:
@@ -147,12 +273,20 @@ def ensure_coin_fields():
         if c.get("local_low", 0.0) <= 0 and c.get("entry_price", 0.0) > 0:
             c["local_low"] = c["entry_price"]
 
+    # Seed initial chart points if history is empty so the chart looks great immediately!
+    if len(bot_state["history"]) == 0:
+        grand_total, vault_cash, reinvested, _ = calculate_totals()
+        now_str = datetime.utcnow().strftime("%H:%M:%S")
+        bot_state["history"] = [
+            {"time": "Start", "total": 0.0, "vault": 0.0, "reinvested": 0.0, "label": "Bot Initialized"},
+            {"time": now_str, "total": grand_total, "vault": vault_cash, "reinvested": reinvested, "label": "CurrentSynced"}
+        ]
+
 
 # ==========================================
-# 2. DAY 3 DEXSCREENER & ANTI-RUG SCANNER
+# 3. DEXSCREENER & TARGETED PRICE FEED
 # ==========================================
 def inspect_dexscreener_token(query_str):
-    """Queries DexScreener API by symbol or contract address and runs Anti-Rug liquidity checks."""
     try:
         q = query_str.strip()
         if len(q) > 25 and " " not in q:
@@ -168,7 +302,6 @@ def inspect_dexscreener_token(query_str):
         if not pairs:
             return None
 
-        # Pick the highest-liquidity USD/USDT/USDC/SOL/WETH pool
         best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0))
         price_usd = float(best.get("priceUsd") or 0.0)
         liq_usd = float((best.get("liquidity") or {}).get("usd") or 0.0)
@@ -215,8 +348,6 @@ def fetch_live_prices(symbols_list=None):
             symbols_list = [c["symbol"] for _, c in coins_snapshot]
 
     prices = {}
-
-    # 1. Targeted Gate.io per-coin query (Fastest CEX feed)
     for sym in symbols_list:
         pair_key = f"{sym}USDT"
         try:
@@ -229,7 +360,6 @@ def fetch_live_prices(symbols_list=None):
         except Exception:
             pass
 
-    # 2. Backup Batch Fetch via CryptoCompare
     missing = [s for s in symbols_list if f"{s}USDT" not in prices]
     if missing:
         try:
@@ -246,7 +376,6 @@ def fetch_live_prices(symbols_list=None):
         except Exception:
             pass
 
-    # 3. Day 3 DexScreener On-Chain Price Feed for any DEX / Meme Coin
     for pair_key, c in coins_snapshot:
         if pair_key not in prices or c.get("price_source") == "DEX":
             query = c.get("token_address") or c.get("symbol")
@@ -263,7 +392,7 @@ def fetch_live_prices(symbols_list=None):
 
 
 # ==========================================
-# 3. v3.0 ENGINE: 100% SHARE LOCK + ZERO-LOSS
+# 4. v4.0 ENGINE: 100% SHARE LOCK + ALERTS
 # ==========================================
 def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     global db_dirty
@@ -271,7 +400,6 @@ def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     target_sh = coin.get("target_shares", 0.0)
     top_up_used = 0.0
 
-    # Strict Share-Keeper Escrow: Reinvests required profit into Bucket A & tracks it in reinvested_anchor_usd!
     if pending > 0 and target_sh > 0:
         required_anchor_for_same_shares = (target_sh * live_price) / (1.0 - TRADING_FEE_PCT)
         if required_anchor_for_same_shares > coin["anchor_usd"]:
@@ -288,7 +416,6 @@ def deploy_anchor_buy(coin, live_price, reason="Anchor Deployed"):
     net_invest = coin["anchor_usd"] - fee
     new_shares = net_invest / live_price
 
-    # Guarantee target_shares never ratchets downward
     coin["token_qty"] = new_shares
     coin["target_shares"] = max(target_sh, new_shares)
     coin["active_anchor_usd"] = coin["anchor_usd"]
@@ -324,9 +451,7 @@ def process_coin(pair, coin, live_price):
         return
     coin["current_price"] = live_price
 
-    # =========================================================================
     # CASE 1: IN CASH -> -0.4% DIP BUY OR STRICT 100%-SHARE +0.2% STEP-UP BUY
-    # =========================================================================
     if not coin["in_position"] or coin["entry_price"] <= 0:
         if coin.get("mode") == "TRAILING_DIP_BUY" and coin.get("last_sell_price", 0) > 0:
             sell_px = coin["last_sell_price"]
@@ -344,12 +469,9 @@ def process_coin(pair, coin, live_price):
             dip_from_sliding_peak = (live_price - peak_ref) / peak_ref
             gain_above_sell = (live_price - sell_px) / sell_px
 
-            # DOOR 1: Price dipped -0.4% -> Re-buy cheaper (Grows share count + 100% Escrow goes to Vault!)
             if dip_from_sliding_peak <= DIP_PULLBACK_TARGET:
                 deploy_anchor_buy(coin, live_price, reason=f"-0.4% Dip Re-Buy from ${fmt_px(peak_ref)}")
                 return
-
-            # DOOR 2: Price rose +0.20% -> Check if Escrow + Anchor can buy 100% of target_shares without losing a single share!
             elif gain_above_sell >= STEP_UP_REBUY_PCT:
                 target_sh = coin.get("target_shares", 0.0)
                 pending = coin.get("pending_profit_usd", 0.0)
@@ -359,7 +481,6 @@ def process_coin(pair, coin, live_price):
                     deploy_anchor_buy(coin, live_price, reason="+0.2% Strict Share-Keeper Step-Up")
                     return
                 else:
-                    # If Stage 2 rallied above what Escrow covers, wait for price to dip below sell_px so 0 shares are ever lost!
                     if live_price <= (sell_px * 0.9985):
                         deploy_anchor_buy(coin, live_price, reason="Zero-Dilution Pullback Re-Buy")
                         return
@@ -368,9 +489,7 @@ def process_coin(pair, coin, live_price):
             deploy_anchor_buy(coin, live_price, reason="Initial Entry")
             return
 
-    # =========================================================================
     # CASE 2: HOLDING SHARES -> IRONCLAD ZERO-LOSS SHIELD & HYBRID RATCHET
-    # =========================================================================
     if live_price > coin["peak_price"]:
         coin["peak_price"] = live_price
 
@@ -385,7 +504,6 @@ def process_coin(pair, coin, live_price):
 
     zero_loss_floor_px = coin["entry_price"] * (1.0 + MIN_NET_PROFIT_FLOOR)
 
-    # STEP A: Update Stop Price (With Ironclad Zero-Loss Floor Clamp)
     if coin.get("moonbag_active"):
         raw_stop = coin["peak_price"] * (1.0 - MOONBAG_TRAIL_PCT)
         clamped_stop = max(raw_stop, zero_loss_floor_px)
@@ -428,7 +546,7 @@ def process_coin(pair, coin, live_price):
         exec_price = max(live_price, coin["ratchet_stop_price"]) if live_price >= coin["entry_price"] else live_price
         is_above_entry = exec_price >= (coin["entry_price"] * (1.0 + (2 * TRADING_FEE_PCT)))
 
-        # SUB-ENTRY SLIDING FLOOR SKIM (Keeps 100% of shares & lowers Entry Price bar)
+        # 1. SUB-ENTRY SLIDING FLOOR SKIM
         if not is_above_entry and not coin.get("moonbag_active"):
             net_bounce_pct = max(0.001, bounce_from_low - (2 * TRADING_FEE_PCT))
             skimmed_profit = max(0.0001, (coin["anchor_usd"] * 0.50) * net_bounce_pct)
@@ -445,10 +563,12 @@ def process_coin(pair, coin, live_price):
                 f"SLIDING FLOOR SKIM {coin['symbol']} @ ${fmt_px(live_price)}: "
                 f"Locked +${skimmed_profit:.4f} in Vault & lowered Entry (${fmt_px(old_entry)} -> ${fmt_px(coin['entry_price'])})!"
             )
+            record_skim_and_chart(coin["symbol"], "Sliding Floor Skim", live_price, coin["token_qty"], skimmed_profit)
+            trigger_phone_alert(coin["symbol"], "Sliding Floor Skim", skimmed_profit, live_price, coin["token_qty"])
             db_dirty = True
             return
 
-        # STAGE 1 HYBRID SKIM (50% Shares Sold -> Profit Held in Escrow)
+        # 2. STAGE 1 HYBRID SKIM (50% Shares Sold -> Profit Held in Escrow)
         if coin.get("strategy") == "HYBRID_50_50" and not coin.get("moonbag_active"):
             coin["target_shares"] = max(coin.get("target_shares", 0.0), coin["token_qty"])
             sell_qty = coin["token_qty"] * 0.5
@@ -470,10 +590,12 @@ def process_coin(pair, coin, live_price):
                 f"Sold {fmt_qty(sell_qty)} shares -> +${skimmed_profit:.4f} in Escrow! "
                 f"Riding {fmt_qty(coin['token_qty'])} Moonbag shares"
             )
+            record_skim_and_chart(coin["symbol"], "Stage 1 Hybrid (50%)", exec_price, coin["target_shares"], skimmed_profit)
+            trigger_phone_alert(coin["symbol"], "Stage 1 Hybrid Skim (50%)", skimmed_profit, exec_price, coin["target_shares"])
             db_dirty = True
             return
 
-        # FINAL SALE (100% Full Skim OR Stage 2 Moonbag Exit)
+        # 3. FINAL SALE (100% Full Skim OR Stage 2 Moonbag Exit)
         if not coin.get("moonbag_active"):
             coin["target_shares"] = max(coin.get("target_shares", 0.0), coin["token_qty"])
 
@@ -486,12 +608,15 @@ def process_coin(pair, coin, live_price):
 
         coin["pending_profit_usd"] = coin.get("pending_profit_usd", 0.0) + skimmed_profit
         coin["trades_count"] += 1
-        exit_label = "STAGE 2 MOONBAG EXIT" if coin.get("moonbag_active") else "VAULT SKIM"
+        exit_label = "Stage 2 Moonbag Exit" if coin.get("moonbag_active") else "100% Full Vault Skim"
         add_log(
-            f"{exit_label} {coin['symbol']} @ ${fmt_px(exec_price)}! "
+            f"{exit_label.upper()} {coin['symbol']} @ ${fmt_px(exec_price)}! "
             f"Sold {fmt_qty(sold_shares)} shares -> +${coin['pending_profit_usd']:.4f} ready in Escrow "
             f"(Protecting {fmt_qty(coin['target_shares'])} {coin['symbol']} shares)"
         )
+        record_skim_and_chart(coin["symbol"], exit_label, exec_price, coin["target_shares"], skimmed_profit)
+        trigger_phone_alert(coin["symbol"], exit_label, skimmed_profit, exec_price, coin["target_shares"])
+
         coin["in_position"] = False
         coin["moonbag_active"] = False
         coin["token_qty"] = 0.0
@@ -508,7 +633,7 @@ def process_coin(pair, coin, live_price):
 
 
 # ==========================================
-# 4. BACKGROUND THREADS (NEON POOLER COMPATIBLE)
+# 5. BACKGROUND THREADS (NEON POOLER COMPATIBLE)
 # ==========================================
 def init_db_async():
     global bot_state
@@ -526,10 +651,17 @@ def init_db_async():
                 with state_lock:
                     for pair, saved_c in loaded["coins"].items():
                         bot_state["coins"][pair] = saved_c
+                    if "history" in loaded and isinstance(loaded["history"], list):
+                        bot_state["history"] = loaded["history"]
+                    if "skims" in loaded and isinstance(loaded["skims"], list):
+                        bot_state["skims"] = loaded["skims"]
+                    if "alerts" in loaded and isinstance(loaded["alerts"], dict):
+                        bot_state["alerts"].update(loaded["alerts"])
                     ensure_coin_fields()
-            add_log("Neon PostgreSQL synced: Restored all coins, shares, and Vault profits.")
+            add_log("Neon PostgreSQL synced: Restored coins, chart history, and phone alert settings.")
         else:
             with state_lock:
+                ensure_coin_fields()
                 snapshot = json.dumps(bot_state)
             cur.execute("INSERT INTO vault_store (id, state_json) VALUES (1, %s);", (snapshot,))
             conn.commit()
@@ -559,7 +691,7 @@ def save_state_to_db():
 
 
 def price_engine_loop():
-    add_log("VaultSkim v3.0 (Day 3: Meme Sniper + Anti-Rug + PWA App) live.")
+    add_log("VaultSkim v4.0 (Day 4: Phone Alerts + Live Profit Chart + Skim Ledger) live.")
     threading.Thread(target=init_db_async, daemon=True).start()
     last_save = time.time()
 
@@ -591,7 +723,7 @@ def ensure_worker_threads():
 
 
 # ==========================================
-# 5. INSTALLABLE PWA MANIFEST & SERVICE WORKER
+# 6. INSTALLABLE PWA MANIFEST & SERVICE WORKER
 # ==========================================
 APP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect width="512" height="512" rx="110" fill="#020617"/>
@@ -631,7 +763,7 @@ def service_worker():
 
 
 # ==========================================
-# 6. v3.0 DASHBOARD UI (PWA + MEME RADAR)
+# 7. v4.0 DASHBOARD UI (CHART + ALERTS + LEDGER)
 # ==========================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -644,8 +776,9 @@ DASHBOARD_HTML = """
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
-  <title>VaultSkim v3.0 — Meme Sniper & Share-Keeper</title>
+  <title>VaultSkim v4.0 — Day 4 Chart & Phone Alerts</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-4 md:p-6 font-sans">
   <div class="max-w-6xl mx-auto">
@@ -654,12 +787,15 @@ DASHBOARD_HTML = """
       <div>
         <div class="flex items-center gap-2 flex-wrap">
           <h1 class="text-2xl font-bold text-emerald-400">VaultSkim Command Center</h1>
-          <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded font-semibold">v3.0 · Day 3 Sniper</span>
+          <span class="text-xs bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded font-semibold">v4.0 · Day 4 Alerts & Chart</span>
           <button id="btn-install" onclick="installPWA()" class="hidden bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold px-3 py-1 rounded-lg shadow transition cursor-pointer">
             📲 Install App
           </button>
+          <button onclick="toggleAlertsPanel()" class="bg-sky-900/70 hover:bg-sky-800 border border-sky-500/40 text-sky-200 text-xs font-semibold px-3 py-1 rounded-lg transition cursor-pointer">
+            📱 Setup Phone Alerts
+          </button>
         </div>
-        <p class="text-xs md:text-sm text-slate-400 mt-1">Zero-Loss Shield + 100% Share-Keeper + DexScreener Anti-Rug Sniper</p>
+        <p class="text-xs md:text-sm text-slate-400 mt-1">Live Profit Growth Chart + Instant Phone Push Alerts + 100% Share-Keeper</p>
       </div>
 
       <div class="flex flex-wrap items-center gap-3 w-full md:w-auto justify-between md:justify-end">
@@ -672,10 +808,75 @@ DASHBOARD_HTML = """
           </button>
         </div>
 
-        <div class="bg-emerald-950/60 border border-emerald-500/40 px-4 py-2.5 rounded-xl text-right min-w-[230px]">
+        <div class="bg-emerald-950/60 border border-emerald-500/40 px-4 py-2.5 rounded-xl text-right min-w-[235px]">
           <div class="text-[11px] uppercase tracking-wider text-emerald-300 font-semibold">Total Untouchable Profit Generated</div>
           <div id="total-vault" class="text-3xl font-extrabold text-emerald-400">$0.00</div>
           <div id="vault-breakdown" class="text-[11px] text-slate-300 font-mono mt-0.5">Vault Cash: $0.00 | Added to Anchors: +$0.00</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Collapsible Day 4 Phone Alerts Setup Panel -->
+    <div id="alerts-panel" class="hidden bg-slate-900 border border-sky-500/40 rounded-xl p-5 mb-6 shadow-xl">
+      <div class="flex justify-between items-center mb-3">
+        <div>
+          <h2 class="text-base font-bold text-sky-300">📱 Instant Phone Profit Alerts (Saved to Neon Cloud)</h2>
+          <p class="text-xs text-slate-400">Get an instant notification on your phone every time VaultSkim locks profit into your Vault.</p>
+        </div>
+        <button onclick="toggleAlertsPanel()" class="text-slate-400 hover:text-white text-sm font-bold px-2">✕</button>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+        <div class="bg-slate-950 border border-slate-800 p-3.5 rounded-lg">
+          <div class="text-xs font-bold text-emerald-400 mb-1">Option 1: ntfy.sh (10-Sec Zero-Signup Push)</div>
+          <p class="text-[11px] text-slate-400 mb-2">Type any secret topic word below, install the free <b>ntfy</b> phone app (or open <code>ntfy.sh/your_topic</code>), and subscribe to it!</p>
+          <input id="alert-ntfy" type="text" placeholder="e.g. vaultskim_enoch_777" class="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white font-mono">
+        </div>
+
+        <div class="bg-slate-950 border border-slate-800 p-3.5 rounded-lg">
+          <div class="text-xs font-bold text-sky-400 mb-1">Option 2: Telegram Bot Alerts</div>
+          <p class="text-[11px] text-slate-400 mb-2">Paste your Telegram Bot Token (from @BotFather) and your Chat ID:</p>
+          <input id="alert-tg-token" type="text" placeholder="Bot Token (e.g. 123456:ABC...)" class="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-xs text-white font-mono mb-1.5">
+          <input id="alert-tg-chat" type="text" placeholder="Chat ID (e.g. 987654321)" class="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-xs text-white font-mono">
+        </div>
+
+        <div class="bg-slate-950 border border-slate-800 p-3.5 rounded-lg">
+          <div class="text-xs font-bold text-indigo-400 mb-1">Option 3: WhatsApp / Discord Webhook</div>
+          <p class="text-[11px] text-slate-400 mb-2">Paste any Discord, Make.com, or WhatsApp Bridge Webhook URL:</p>
+          <input id="alert-webhook" type="text" placeholder="https://..." class="w-full bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white font-mono">
+        </div>
+      </div>
+
+      <div class="flex flex-wrap gap-3 justify-end">
+        <button id="btn-test-alert" onclick="testPhoneAlert()" class="bg-slate-800 hover:bg-slate-700 border border-slate-600 text-amber-300 text-xs font-semibold px-4 py-2 rounded-lg transition cursor-pointer">
+          🔔 Send Test Alert to My Phone
+        </button>
+        <button id="btn-save-alert" onclick="saveAlertSettings()" class="bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold px-5 py-2 rounded-lg transition cursor-pointer">
+          💾 Save Alert Settings
+        </button>
+      </div>
+    </div>
+
+    <!-- Day 4 Live Vault Growth Chart & Verified Skim Ledger -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-6">
+      <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg flex flex-col justify-between">
+        <div class="flex justify-between items-center mb-2">
+          <div>
+            <h2 class="text-sm font-bold text-emerald-400 uppercase tracking-wider">📈 Live Vault Profit Growth Curve</h2>
+            <p class="text-xs text-slate-400">Tracks cumulative Vault Cash + Share-Keeper Anchor Top-Ups across every skim</p>
+          </div>
+          <span id="total-skims-badge" class="text-xs bg-emerald-950 text-emerald-300 border border-emerald-700/40 px-2.5 py-1 rounded-full font-mono">0 Total Skims</span>
+        </div>
+        <div class="relative h-48 w-full">
+          <canvas id="vaultChart"></canvas>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg flex flex-col">
+        <h2 class="text-sm font-bold text-amber-300 uppercase tracking-wider mb-1">🧾 Verified Skim Ledger</h2>
+        <p class="text-xs text-slate-400 mb-2">Recent completed profit sweeps</p>
+        <div id="skim-ledger" class="space-y-2 max-h-48 overflow-y-auto text-xs font-mono pr-1">
+          <div class="text-slate-500 text-xs">Waiting for next profit skim...</div>
         </div>
       </div>
     </div>
@@ -695,7 +896,6 @@ DASHBOARD_HTML = """
         </div>
       </div>
 
-      <!-- Live Meme-Coin Radar Results -->
       <div id="radar-box" class="hidden border-t border-slate-800 pt-3 mt-1">
         <div class="text-xs font-semibold uppercase tracking-wider text-amber-300 mb-2">🔥 Live High-Volume Meme Candidates (Anti-Rug Verified):</div>
         <div id="radar-items" class="grid grid-cols-1 md:grid-cols-4 gap-2.5"></div>
@@ -713,8 +913,10 @@ DASHBOARD_HTML = """
   </div>
 
   <script>
-    // Register Service Worker for Installable App (PWA)
     let deferredPrompt = null;
+    let vaultChartInstance = null;
+    let alertsLoadedIntoInputs = false;
+
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {});
     }
@@ -730,6 +932,81 @@ DASHBOARD_HTML = """
         deferredPrompt = null;
       } else {
         alert('To install VaultSkim: Tap your browser menu (⋮) and select "Install app" or "Add to Home screen".');
+      }
+    }
+
+    function toggleAlertsPanel() {
+      const p = document.getElementById('alerts-panel');
+      p.classList.toggle('hidden');
+    }
+
+    async function saveAlertSettings() {
+      const btn = document.getElementById('btn-save-alert');
+      btn.innerText = '⏳ Saving...';
+      const payload = {
+        ntfy_topic: document.getElementById('alert-ntfy').value.trim(),
+        tg_token: document.getElementById('alert-tg-token').value.trim(),
+        tg_chat_id: document.getElementById('alert-tg-chat').value.trim(),
+        webhook_url: document.getElementById('alert-webhook').value.trim(),
+        enabled: true
+      };
+      await fetch('/api/save_alerts', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      btn.innerText = '✅ Saved!';
+      setTimeout(() => { btn.innerText = '💾 Save Alert Settings'; }, 1400);
+    }
+
+    async function testPhoneAlert() {
+      await saveAlertSettings();
+      const btn = document.getElementById('btn-test-alert');
+      btn.innerText = '📡 Sending Push...';
+      const res = await fetch('/api/test_alert', {method: 'POST'});
+      const out = await res.json();
+      btn.innerText = out.ok ? '✅ Alert Sent!' : '⚠️ Add a Topic/Token First';
+      setTimeout(() => { btn.innerText = '🔔 Send Test Alert to My Phone'; }, 1800);
+    }
+
+    function initOrUpdateChart(historyData) {
+      const ctx = document.getElementById('vaultChart');
+      if (!ctx || !historyData || historyData.length === 0) return;
+
+      const labels = historyData.map(h => h.time);
+      const totals = historyData.map(h => h.total);
+
+      if (!vaultChartInstance) {
+        vaultChartInstance = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [{
+              label: 'Total Profit Generated ($)',
+              data: totals,
+              borderColor: '#10b981',
+              backgroundColor: 'rgba(16, 185, 129, 0.15)',
+              borderWidth: 2.5,
+              pointRadius: 3,
+              pointBackgroundColor: '#34d399',
+              fill: true,
+              tension: 0.3
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+              x: { ticks: { color: '#64748b', maxTicksLimit: 8 }, grid: { color: 'rgba(30, 41, 59, 0.5)' } },
+              y: { ticks: { color: '#34d399', callback: (v) => '$' + v.toFixed(2) }, grid: { color: 'rgba(30, 41, 59, 0.5)' } }
+            }
+          }
+        });
+      } else {
+        vaultChartInstance.data.labels = labels;
+        vaultChartInstance.data.datasets[0].data = totals;
+        vaultChartInstance.update('none');
       }
     }
 
@@ -854,13 +1131,23 @@ DASHBOARD_HTML = """
         const data = await res.json();
         let totalVaultCash = 0;
         let totalReinvestedAnchors = 0;
+        let totalSkimsCount = 0;
         let cardsHtml = '';
+
+        if (!alertsLoadedIntoInputs && data.alerts) {
+          document.getElementById('alert-ntfy').value = data.alerts.ntfy_topic || '';
+          document.getElementById('alert-tg-token').value = data.alerts.tg_token || '';
+          document.getElementById('alert-tg-chat').value = data.alerts.tg_chat_id || '';
+          document.getElementById('alert-webhook').value = data.alerts.webhook_url || '';
+          alertsLoadedIntoInputs = true;
+        }
 
         for (const [pair, c] of Object.entries(data.coins)) {
           const pending = c.pending_profit_usd || 0;
           const reinvested = c.reinvested_anchor_usd || 0;
           totalVaultCash += (c.vault_profit_usd + pending);
           totalReinvestedAnchors += reinvested;
+          totalSkimsCount += (c.trades_count || 0);
 
           const tokenVal = c.in_position && c.current_price > 0 ? (c.token_qty * c.current_price) : 0;
           const safeCashHalf = c.moonbag_active ? (c.anchor_usd * 0.5) : (c.in_position ? 0 : c.anchor_usd);
@@ -936,7 +1223,7 @@ DASHBOARD_HTML = """
 
                 <div class="text-[11px] text-slate-400 mb-2 flex justify-between items-center">
                   <span>${secBadge}</span>
-                  ${reinvested > 0 ? `<span class="text-emerald-400 font-mono">+${reinvested.toFixed(2)} Share-TopUp</span>` : ''}
+                  ${reinvested > 0 ? `<span class="text-emerald-400 font-mono">+$${reinvested.toFixed(2)} Share-TopUp</span>` : ''}
                 </div>
 
                 <button onclick="toggleStrategy('${pair}')" class="w-full text-left text-xs font-semibold px-3 py-1.5 rounded-lg border mb-3 transition cursor-pointer flex justify-between items-center ${stratStyle}">
@@ -977,7 +1264,26 @@ DASHBOARD_HTML = """
         document.getElementById('total-vault').innerText = '$' + grandTotalProfit.toFixed(2);
         document.getElementById('vault-breakdown').innerText =
           `Vault Cash: $${totalVaultCash.toFixed(2)} | Added to Anchors: +$${totalReinvestedAnchors.toFixed(2)}`;
+        document.getElementById('total-skims-badge').innerText = `${totalSkimsCount} Total Skims`;
         document.getElementById('logs').innerHTML = data.logs.map(l => `<div>${l}</div>`).join('');
+
+        // Update Day 4 Chart & Verified Skim Ledger
+        initOrUpdateChart(data.history || []);
+        if (data.skims && data.skims.length > 0) {
+          document.getElementById('skim-ledger').innerHTML = data.skims.map(s => `
+            <div class="bg-slate-950 border border-slate-800/80 rounded p-2 flex justify-between items-center">
+              <div>
+                <span class="text-emerald-400 font-bold">${s.symbol}</span>
+                <span class="text-slate-400 text-[10px] ml-1">(${s.type})</span>
+                <div class="text-[10px] text-slate-400">@ $${s.price} · ${s.time}</div>
+              </div>
+              <div class="text-right">
+                <div class="text-emerald-300 font-bold">+$${s.profit.toFixed(4)}</div>
+                <div class="text-[10px] text-sky-300">${s.shares} sh</div>
+              </div>
+            </div>
+          `).join('');
+        }
       } catch (e) {}
     }
     setInterval(refresh, 3000);
@@ -996,9 +1302,47 @@ def api_state():
     with state_lock:
         return jsonify(bot_state)
 
+@app.route("/api/save_alerts", methods=["POST"])
+def api_save_alerts():
+    global db_dirty
+    data = request.json or {}
+    with state_lock:
+        bot_state.setdefault("alerts", {})
+        bot_state["alerts"]["ntfy_topic"] = data.get("ntfy_topic", "").strip()
+        bot_state["alerts"]["tg_token"] = data.get("tg_token", "").strip()
+        bot_state["alerts"]["tg_chat_id"] = data.get("tg_chat_id", "").strip()
+        bot_state["alerts"]["webhook_url"] = data.get("webhook_url", "").strip()
+        bot_state["alerts"]["enabled"] = bool(data.get("enabled", True))
+        add_log("PHONE ALERTS CONFIGURED: Notification channels saved to Neon database.")
+        db_dirty = True
+    save_state_to_db()
+    return jsonify({"ok": True})
+
+@app.route("/api/test_alert", methods=["POST"])
+def api_test_alert():
+    with state_lock:
+        alerts_cfg = dict(bot_state.get("alerts") or {})
+        grand_total, vault_cash, reinvested, total_skims = calculate_totals()
+
+    if not any([alerts_cfg.get("ntfy_topic"), alerts_cfg.get("tg_token"), alerts_cfg.get("webhook_url")]):
+        return jsonify({"ok": False})
+
+    title = "VaultSkim Test Alert Connected!"
+    msg = (
+        f"Your 24/7 Phone Profit Alerts are active!\n"
+        f"Current Total Profit: ${grand_total:.2f} (Vault Cash: ${vault_cash:.2f} | Anchor Top-Ups: +${reinvested:.2f})\n"
+        f"Completed Skims: {total_skims}"
+    )
+    threading.Thread(
+        target=_dispatch_alert_async,
+        args=(title, msg, {"test": True, "grand_total": grand_total}, alerts_cfg),
+        daemon=True
+    ).start()
+    add_log("SENT TEST PHONE ALERT: Check your ntfy app, Telegram, or Webhook!")
+    return jsonify({"ok": True})
+
 @app.route("/api/meme_radar")
 def api_meme_radar():
-    """Scans popular/trending meme tokens on DexScreener and filters out low-liquidity rug pools."""
     watch_seeds = ["BONK", "FLOKI", "POPCAT", "BRETT", "MOG", "BOME", "NEIRO", "GOAT"]
     candidates = []
     for sym in watch_seeds:
@@ -1022,7 +1366,6 @@ def add_coin():
     prices = fetch_live_prices([clean_sym]) if len(raw) <= 12 else {}
     pair = f"{clean_sym}USDT"
 
-    # 1. If available on Gate.io / CryptoCompare CEX
     if pair in prices and prices[pair] > 0:
         with state_lock:
             bot_state["coins"][pair] = make_coin_template(clean_sym, anchor, strategy="HYBRID_50_50")
@@ -1030,7 +1373,6 @@ def add_coin():
             db_dirty = True
         return jsonify({"ok": True})
 
-    # 2. Otherwise scan DexScreener On-Chain Pools + Run Anti-Rug Liquidity Check
     dex_info = inspect_dexscreener_token(raw)
     if not dex_info or dex_info["price_usd"] <= 0:
         add_log(f"SNIPER WARNING: Could not find active price pool for '{raw}'.")
@@ -1164,6 +1506,11 @@ def reset_live():
                 coin["trades_count"] = 0
             if live_px > 0:
                 deploy_anchor_buy(coin, live_px, reason="Synced to Live Market")
+        if clear_vault:
+            bot_state["history"] = [
+                {"time": datetime.utcnow().strftime("%H:%M:%S"), "total": 0.0, "vault": 0.0, "reinvested": 0.0, "label": "Reset"}
+            ]
+            bot_state["skims"] = []
         add_log("SYNCED TO LIVE MARKET: All anchors deployed at live prices." + (" (Vault reset to $0.00)" if clear_vault else ""))
         db_dirty = True
     return jsonify({"ok": True})
