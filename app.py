@@ -4,7 +4,7 @@
 # Fixes engineered specifically from live Gate.io Spot inspection:
 #   1. STRICT LIVE MODE: Any coin set to ⚡ LIVE ORDER can NEVER execute a [PAPER]
 #      trade, never run a fake Sliding Floor Skim, and never book profit unless
-#      Gate.io returns HTTP 200/201 with a real filled Order ID.
+#      Gate.io returns HTTP 200/201 with a real filled Order ID. 
 #   2. REAL WALLET TRUTH: Switching a coin to ⚡ LIVE ORDER (or clicking Sync Live)
 #      queries Gate.io `/api/v4/spot/accounts` and sets `shares_owned` to the
 #      EXACT token balance in your Gate.io Spot wallet (e.g., 0.12275 QNT, 0 LQTY).
