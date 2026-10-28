@@ -1,6 +1,5 @@
 # ==============================================================================
-# VAULTSKIM COMMAND CENTER — v5.2 PURE LIVE TRUTH (FULL PRODUCTION MONOLITH)
-# PART 1 OF 2: BACKEND ENGINE, GATE.IO V4 / BINANCE V3 BRIDGE & FLASK ROUTES
+# VAULTSKIM COMMAND CENTER — v5.3 PURE LIVE TRUTH (FULL PRODUCTION MONOLITH)
 # ==============================================================================
 import os
 import sys
@@ -23,12 +22,9 @@ from flask import (
     jsonify,
     Response,
     make_response,
-    render_template_string,
-    redirect,
-    url_for
+    render_template_string
 )
 
-# Optional PostgreSQL driver for persistent cloud state on Render / Neon
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -36,7 +32,6 @@ try:
 except ImportError:
     HAS_PSYCOPG2 = False
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -55,18 +50,25 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
 state_lock = threading.RLock()
-order_cooldowns = {}          # symbol -> timestamp of last live buy attempt
+tick_lock = threading.Lock()
+order_cooldowns = {}          # symbol -> timestamp of last live order attempt
 pair_rules_cache = {}         # pair -> precision & minimum order rules
 price_cache = {}              # symbol -> {price, ask, bid, source, ts}
 
-# Default system state matching v5.2 Pure Live Truth schema
+_worker_pid = None
+_engine_thread = None
+_keepalive_thread = None
+_last_engine_tick_ts = 0.0
+_last_wallet_sync_ts = 0.0
+
 DEFAULT_STATE = {
-    "version": "v5.2 - Pure Live Truth",
+    "version": "v5.3 - Pure Live Truth",
     "vault_cash": 0.0,
     "added_to_anchors": 0.0,
     "total_skims": 0,
     "total_withdrawn": 0.0,
     "frozen": False,
+    "last_price_tick_hms": "--:--:--",
     "profit_curve": [
         {
             "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -77,7 +79,7 @@ DEFAULT_STATE = {
     "cashout_history": [],
     "logs": [
         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        f"VaultSkim v5.2 Pure Live Truth Engine Initialized."
+        f"VaultSkim v5.3 Pure Live Truth Engine Initialized."
     ],
     "exchange_bridge": {
         "exchange": "gateio",
@@ -106,7 +108,6 @@ DEFAULT_STATE = {
 # DATABASE & FILE PERSISTENCE LAYER (NEON POSTGRESQL + LOCAL JSON FALLBACK)
 # ==============================================================================
 def init_db():
-    """Initializes the Neon PostgreSQL state table if DATABASE_URL is configured."""
     if not DATABASE_URL or not HAS_PSYCOPG2:
         return False
     try:
@@ -128,8 +129,25 @@ def init_db():
         return False
 
 
+def merge_default_state(loaded):
+    merged = json.loads(json.dumps(DEFAULT_STATE))
+    if not isinstance(loaded, dict):
+        return merged
+    for k, v in loaded.items():
+        if isinstance(v, dict) and k in merged and isinstance(merged[k], dict) and k != "coins":
+            merged[k].update(v)
+        else:
+            merged[k] = v
+    merged["version"] = "v5.3 - Pure Live Truth"
+    for sym, c in merged.get("coins", {}).items():
+        c.setdefault("cash_reserve_usd", 0.0)
+        c.setdefault("escrow_profit_usd", 0.0)
+        c.setdefault("last_exit_price", 0.0)
+        c.setdefault("zero_loss_stop", 0.0)
+    return merged
+
+
 def load_persistent_state():
-    """Loads state from PostgreSQL first, falling back to local JSON file."""
     if DATABASE_URL and HAS_PSYCOPG2:
         try:
             conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
@@ -159,22 +177,7 @@ def load_persistent_state():
     return json.loads(json.dumps(DEFAULT_STATE))
 
 
-def merge_default_state(loaded):
-    """Ensures all required keys exist when upgrading state versions."""
-    merged = json.loads(json.dumps(DEFAULT_STATE))
-    if not isinstance(loaded, dict):
-        return merged
-    for k, v in loaded.items():
-        if isinstance(v, dict) and k in merged and isinstance(merged[k], dict) and k != "coins":
-            merged[k].update(v)
-        else:
-            merged[k] = v
-    merged["version"] = "v5.2 - Pure Live Truth"
-    return merged
-
-
 def save_persistent_state():
-    """Saves current STATE to local JSON and asynchronously syncs to PostgreSQL."""
     with state_lock:
         snapshot = json.loads(json.dumps(STATE))
 
@@ -224,13 +227,11 @@ def add_log(message):
 
 
 def dispatch_phone_alert(title, message, category="skim"):
-    """Sends instant push alerts via ntfy.sh and/or Telegram Bot API."""
     with state_lock:
         alerts = dict(STATE.get("alerts", {}))
 
     if not alerts.get("enabled"):
         return
-
     if category == "skim" and not alerts.get("alert_on_skim", True):
         return
     if category == "shield" and not alerts.get("alert_on_shield", True):
@@ -278,7 +279,6 @@ def dispatch_phone_alert(title, message, category="skim"):
 # CRYPTOGRAPHIC SIGNING & PRECISION HELPERS (GATE.IO V4 & BINANCE V3)
 # ==============================================================================
 def quantize_value(val, decimals, mode=ROUND_DOWN):
-    """Formats a float/Decimal to exact exchange decimal places without rounding up."""
     try:
         d = int(decimals)
         q = Decimal("10") ** (-d) if d > 0 else Decimal("1")
@@ -288,7 +288,6 @@ def quantize_value(val, decimals, mode=ROUND_DOWN):
 
 
 def gateio_v4_sign(api_key, api_secret, method, url_path, query_string="", body_str=""):
-    """Generates Gate.io API v4 HMAC-SHA512 authentication headers."""
     ts = str(int(time.time()))
     m = hashlib.sha512()
     m.update((body_str or "").encode("utf-8"))
@@ -311,7 +310,6 @@ def gateio_v4_sign(api_key, api_secret, method, url_path, query_string="", body_
 
 
 def binance_v3_sign(api_secret, query_params):
-    """Generates Binance Spot v3 HMAC-SHA256 signed query string."""
     query_string = urlencode(query_params)
     signature = hmac.new(
         api_secret.strip().encode("utf-8"),
@@ -322,10 +320,6 @@ def binance_v3_sign(api_secret, query_params):
 
 
 def get_exchange_pair_rules(symbol):
-    """
-    Fetches and caches exact decimal precision and minimum order rules from Gate.io Spot v4
-    so orders never fail with INVALID_PRECISION or AMOUNT_TOO_SMALL.
-    """
     sym = symbol.upper().strip()
     pair = f"{sym}_USDT"
     now_ts = time.time()
@@ -367,21 +361,28 @@ def get_exchange_pair_rules(symbol):
 
 
 # ==============================================================================
-# MULTI-SOURCE REAL-TIME MARKET PRICE & DEX ANTI-RUG SCANNER
+# MULTI-SOURCE REAL-TIME MARKET PRICE & DEX ANTI-RUG SCANNER (CACHE-BUSTED)
 # ==============================================================================
 def fetch_live_market_quote(symbol, contract=""):
     """
-    Reads real-time market price, best ask, and best bid.
-    Prioritizes Gate.io Spot v4 -> Binance Spot v3 -> DexScreener Pools.
+    Reads real-time market price, best ask, and best bid with cache-busting headers
+    so Gate.io / Binance / DexScreener never return a frozen price.
     """
     sym = symbol.upper().strip().replace("/USDT", "").replace("_USDT", "")
     now_ts = time.time()
+    req_headers = {
+        "Accept": "application/json",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "User-Agent": f"VaultSkimEngine/5.3 ({int(now_ts)})"
+    }
 
-    # 1. Primary: Gate.io Spot v4 Ticker
+    # 1. Primary: Gate.io Spot v4 Ticker (with cache-buster _t)
     try:
         r = requests.get(
             "https://api.gateio.ws/api/v4/spot/tickers",
-            params={"currency_pair": f"{sym}_USDT"},
+            params={"currency_pair": f"{sym}_USDT", "_t": int(now_ts * 1000)},
+            headers=req_headers,
             timeout=4
         )
         if r.status_code == 200:
@@ -391,6 +392,9 @@ def fetch_live_market_quote(symbol, contract=""):
                 last_p = float(t_obj.get("last") or 0.0)
                 ask_p = float(t_obj.get("lowest_ask") or last_p)
                 bid_p = float(t_obj.get("highest_bid") or last_p)
+                # If last_p lags behind bid/ask midpoint, use live bid/ask midpoint
+                if ask_p > 0 and bid_p > 0 and (last_p < bid_p or last_p > ask_p):
+                    last_p = round((ask_p + bid_p) / 2.0, 6)
                 change_24h = float(t_obj.get("change_percentage") or 0.0)
                 vol_24h = float(t_obj.get("quote_volume") or 0.0)
                 if last_p > 0:
@@ -407,14 +411,15 @@ def fetch_live_market_quote(symbol, contract=""):
                     }
                     price_cache[sym] = res
                     return res
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gate.io ticker fetch notice for {sym}: {e}")
 
     # 2. Secondary: Binance Spot v3 Book Ticker
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/ticker/bookTicker",
             params={"symbol": f"{sym}USDT"},
+            headers=req_headers,
             timeout=4
         )
         if r.status_code == 200:
@@ -447,7 +452,7 @@ def fetch_live_market_quote(symbol, contract=""):
             if len(lookup) > 15
             else f"https://api.dexscreener.com/latest/dex/search?q={lookup}"
         )
-        r = requests.get(url, timeout=5)
+        r = requests.get(url, headers=req_headers, timeout=5)
         if r.status_code == 200:
             pairs = r.json().get("pairs") or []
             if pairs:
@@ -484,10 +489,6 @@ def fetch_live_market_quote(symbol, contract=""):
 # LIVE EXCHANGE WALLET BALANCE & ORDER EXECUTION BRIDGE
 # ==============================================================================
 def fetch_live_exchange_balances():
-    """
-    Reads real Spot balances from Gate.io v4 (or Binance v3).
-    Returns (balances_dict, error_string).
-    """
     with state_lock:
         bridge = dict(STATE.get("exchange_bridge", {}))
 
@@ -553,7 +554,7 @@ def fetch_live_exchange_balances():
 
 def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None):
     """
-    Executes a real live Spot order on Gate.io v4 (or Binance v3) with:
+    Executes a real live Spot order on Gate.io v4 with:
     - Automatic wallet balance clamping (never exceeds available USDT or token shares)
     - Exact currency_pair decimal precision formatting
     - Marketable limit pricing (+0.35% on BUY / -0.35% on SELL) so orders fill immediately
@@ -590,19 +591,17 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
     if side_lower == "buy":
         requested_usd = min(float(usd_amount or 10.0), max_cap)
         if usdt_avail < requested_usd:
-            if usdt_avail >= rules["min_quote_amount"]:
+            if usdt_avail >= max(rules["min_quote_amount"], 1.5):
                 requested_usd = usdt_avail * 0.985
             else:
                 msg = f"Insufficient USDT (${usdt_avail:.2f} available, need ${requested_usd:.2f})"
                 add_log(f"⚠️ LIVE BUY SKIPPED ({sym}): {msg}")
                 return False, msg, None
 
-        # Use marketable limit price (+0.35% over best ask) so Gate.io fills immediately
         exec_price = quote["ask"] * 1.0035
         price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
         exec_price_float = float(price_str)
 
-        # Clamp share quantity to 99.1% of requested_usd so total + fee never triggers BALANCE_NOT_ENOUGH
         raw_shares = (requested_usd * 0.991) / exec_price_float
         amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
         amount_float = float(amount_str)
@@ -621,8 +620,12 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
             add_log(f"⚠️ LIVE SELL SKIPPED ({sym}): {msg}")
             return False, msg, None
 
-        # Clamp sell shares to actual available balance in Spot wallet
-        raw_shares = min(float(share_amount or coin_avail), coin_avail * 0.9995)
+        # If selling >= 85% of wallet balance, sell the exact wallet balance (clamped)
+        if share_amount is None or float(share_amount) >= (coin_avail * 0.85):
+            raw_shares = coin_avail * 0.9998
+        else:
+            raw_shares = min(float(share_amount), coin_avail * 0.9998)
+
         exec_price = quote["bid"] * 0.9965
         price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
         amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
@@ -634,9 +637,9 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
                 f"Sell order (${amount_float * exec_price_float:.2f}) below "
                 f"Gate.io minimum (${rules['min_quote_amount']:.2f} USDT)."
             )
+            add_log(f"⚠️ LIVE SELL NOTICE ({sym}): {msg}")
             return False, msg, None
 
-    # Execute on Gate.io Spot v4
     if exch == "gateio":
         url_path = "/api/v4/spot/orders"
         order_payload = {
@@ -646,7 +649,7 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
             "side": side_lower,
             "amount": amount_str,
             "price": price_str,
-            "time_in_force": "ioc"  # Immediate-Or-Cancel prevents funds getting stuck in open orders
+            "time_in_force": "ioc"
         }
         body_str = json.dumps(order_payload)
         headers = gateio_v4_sign(api_key, api_secret, "POST", url_path, "", body_str)
@@ -664,7 +667,6 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
                 orig_amt = float(resp_data.get("amount") or amount_str)
                 filled_amt = max(0.0, orig_amt - left_amt)
 
-                # If IOC didn't fill due to momentary book gap, place standard GTC marketable limit
                 if filled_amt <= 0:
                     order_payload["time_in_force"] = "gtc"
                     body_str = json.dumps(order_payload)
@@ -677,9 +679,12 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
                     )
                     if r_gtc.status_code in (200, 201):
                         resp_data = r_gtc.json()
-                        time.sleep(1.2)
+                        time.sleep(1.0)
 
                 order_id = resp_data.get("id", "OK")
+                filled_usdt = float(resp_data.get("filled_total") or (amount_float * float(quote["price"])))
+                resp_data["_filled_usdt"] = filled_usdt
+                resp_data["_filled_shares"] = filled_amt if filled_amt > 0 else amount_float
                 add_log(
                     f"✅ LIVE GATE.IO {side_lower.upper()} EXECUTED ({sym}): "
                     f"{amount_str} {sym} @ ~${price_str} (Order #{order_id})"
@@ -697,11 +702,11 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
     return False, "Exchange execution driver not configured.", None
 
 
-def sync_all_live_cards_with_gateio(auto_buy_waiting=True):
+def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
     """
     Synchronizes every active coin card with your real Gate.io Spot wallet balances.
-    CRITICAL FIX: If a coin is in LIVE mode with 0.0000 shares (WAITING_LIVE_BUY) and
-    auto_buy_waiting=True, it automatically executes the initial Anchor BUY on Gate.io!
+    Preserves WAITING_DIP_REBUY state when waiting for a dip after a full skim exit,
+    and automatically deploys WAITING_LIVE_BUY anchors when funded.
     """
     balances, err = fetch_live_exchange_balances()
     if balances is None:
@@ -726,6 +731,7 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True):
             contract = card.get("contract", "")
             is_live_coin = bool(card.get("live_enabled", False))
             anchor_usd = float(card.get("anchor_usd") or 10.0)
+            current_status = card.get("status", "HOLDING_ANCHOR")
 
         quote = fetch_live_market_quote(sym, contract)
         if quote and quote["price"] > 0:
@@ -740,21 +746,34 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True):
             real_shares = balances.get(sym, {}).get("available", 0.0)
             locked_shares = balances.get(sym, {}).get("locked", 0.0)
             total_real_shares = real_shares + locked_shares
+            bag_usd = total_real_shares * price
 
-            # Case 1: User already holds real shares of this coin on Gate.io
-            if total_real_shares > 0.00005 and (total_real_shares * price) >= 0.50:
+            # Case 1: User holds real tokens of this coin on Gate.io
+            if total_real_shares > 0.00005 and bag_usd >= 0.80:
                 with state_lock:
-                    was_waiting = (card.get("status") == "WAITING_LIVE_BUY" or card.get("shares", 0) <= 0)
+                    was_waiting = (card.get("status") in ("WAITING_LIVE_BUY", "WAITING_DIP_REBUY") or card.get("shares", 0) <= 0)
                     card["shares"] = real_shares if real_shares > 0 else total_real_shares
                     if was_waiting or card.get("entry_price", 0) <= 0:
                         card["entry_price"] = price
                         card["sliding_low"] = price
                         card["highest_price"] = price
-                    if card.get("status") == "WAITING_LIVE_BUY":
-                        card["status"] = "HOLDING_ANCHOR"
-                sync_notes.append(f"{sym}: {total_real_shares:.4f} sh on Gate.io -> Active")
+                    if card.get("status") in ("WAITING_LIVE_BUY", "WAITING_DIP_REBUY"):
+                        if "50/50" in (card.get("strategy") or "") and bag_usd < (anchor_usd * 0.72) and usdt_avail >= (bag_usd * 0.45):
+                            card["status"] = "MOONBAG_RIDING"
+                            card["cash_reserve_usd"] = round(max(0.0, anchor_usd - bag_usd), 2)
+                        else:
+                            card["status"] = "HOLDING_ANCHOR"
+                            card["cash_reserve_usd"] = 0.0
+                sync_notes.append(f"{sym}: {total_real_shares:.6f} sh (${bag_usd:.2f}) Active")
 
-            # Case 2: 0.0000 shares on Gate.io -> WAITING_LIVE_BUY
+            # Case 2: 0 shares on Gate.io, but waiting for Dip Re-Buy after a skim
+            elif current_status == "WAITING_DIP_REBUY":
+                with state_lock:
+                    card["shares"] = 0.0
+                    card["cash_reserve_usd"] = round(anchor_usd, 2)
+                sync_notes.append(f"{sym}: Waiting -0.35% Dip Re-Buy (${anchor_usd:.2f} USDT ready)")
+
+            # Case 3: 0.0000 shares on Gate.io -> WAITING_LIVE_BUY
             else:
                 with state_lock:
                     card["shares"] = 0.0
@@ -767,22 +786,22 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True):
                 now_ts = time.time()
                 last_attempt = order_cooldowns.get(sym, 0)
 
-                # Automatically fire the live initial Anchor BUY on Gate.io if armed & funded
                 if (
                     auto_buy_waiting
                     and live_armed
                     and not is_frozen
-                    and usdt_avail >= max(anchor_usd, 1.5)
-                    and (now_ts - last_attempt) > 20
+                    and usdt_avail >= 1.50
+                    and (now_ts - last_attempt) > 15
                 ):
                     order_cooldowns[sym] = now_ts
+                    buy_usd = min(anchor_usd, usdt_avail * 0.985)
                     add_log(
                         f"🚀 AUTO-DEPLOYING LIVE ANCHOR ({sym}): "
-                        f"Buying ${anchor_usd:.2f} of {sym}/USDT on Gate.io Spot..."
+                        f"Buying ${buy_usd:.2f} of {sym}/USDT on Gate.io Spot..."
                     )
-                    ok, msg, _ = execute_live_exchange_order(sym, "buy", usd_amount=anchor_usd)
+                    ok, msg, resp_data = execute_live_exchange_order(sym, "buy", usd_amount=buy_usd)
                     if ok:
-                        time.sleep(1.3)
+                        time.sleep(1.1)
                         updated_bals, _ = fetch_live_exchange_balances()
                         if updated_bals:
                             balances = updated_bals
@@ -795,20 +814,22 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True):
                                     card["entry_price"] = price
                                     card["sliding_low"] = price
                                     card["highest_price"] = price
+                                    card["cash_reserve_usd"] = 0.0
                                     card["status"] = "HOLDING_ANCHOR"
                             if new_sh > 0:
                                 sync_notes.append(f"{sym}: Bought {new_sh:.5f} sh @ ${price:.4f}")
                                 dispatch_phone_alert(
                                     f"VaultSkim Live Buy: {sym}",
-                                    f"Bought {new_sh:.5f} {sym} (${anchor_usd:.2f} Anchor) @ ${price:.4f} on Gate.io!",
+                                    f"Bought {new_sh:.5f} {sym} @ ${price:.4f} on Gate.io!",
                                     category="buy"
                                 )
                                 continue
 
                 sync_notes.append(f"{sym}: 0.0000 sh on Gate.io -> Ready for Live Buy")
 
-    summary_str = " | ".join(sync_notes) if sync_notes else "All cards aligned"
-    add_log(f"REAL GATE.IO WALLET SYNCED: Available USDT = ${usdt_avail:.2f} | {summary_str}")
+    if verbose:
+        summary_str = " | ".join(sync_notes) if sync_notes else "All cards aligned"
+        add_log(f"REAL GATE.IO WALLET SYNCED: Available USDT = ${usdt_avail:.2f} | {summary_str}")
     save_persistent_state()
     return True, usdt_avail
 
@@ -818,11 +839,11 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True):
 # ==============================================================================
 def evaluate_coin_tick(sym):
     """
-    Runs every 3 seconds per active coin:
-    - Updates live price from Gate.io / Binance / DexScreener
-    - If WAITING_LIVE_BUY and Live Bridge is armed, triggers automatic initial Gate.io BUY
-    - Tracks Sliding Low floor and arms Zero-Loss Shield at +0.35%
-    - Executes Share-Keeper dip re-alignment and 50/50 Hybrid / Stage 2 Moonbag skims
+    Updates live price from Gate.io / Binance / DexScreener every tick and evaluates:
+    - WAITING_LIVE_BUY -> Auto-buys initial anchor on Gate.io
+    - HOLDING_ANCHOR -> Sliding Low Ratchet + +0.35% Zero-Loss Shield + +0.80% Stage 1 Skim
+    - MOONBAG_RIDING -> Rides remaining 50% Moonbag to +1.60% or Zero-Loss trailing stop
+    - WAITING_DIP_REBUY -> Re-buys anchor on Gate.io on a -0.35% dip or +0.40% breakout
     """
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -845,10 +866,58 @@ def evaluate_coin_tick(sym):
             return
         card["current_price"] = price
         card["source"] = quote["source"]
+        STATE["last_price_tick_hms"] = now_hms()
+
+        status = card.get("status", "HOLDING_ANCHOR")
         shares = float(card.get("shares") or 0.0)
         anchor_usd = float(card.get("anchor_usd") or 10.0)
+        strategy = card.get("strategy") or "50/50 Hybrid Moonbag"
 
-        # If holding 0 shares (WAITING_LIVE_BUY), keep baseline aligned with live market price
+        # ----------------------------------------------------------------------
+        # STATE 0: WAITING_DIP_REBUY (100% IN USDT CASH AFTER FULL SKIM EXIT)
+        # ----------------------------------------------------------------------
+        if status == "WAITING_DIP_REBUY":
+            exit_px = float(card.get("last_exit_price") or card.get("entry_price") or price)
+            dip_pct = ((exit_px - price) / exit_px) * 100.0 if exit_px > 0 else 0.0
+            breakout_pct = ((price - exit_px) / exit_px) * 100.0 if exit_px > 0 else 0.0
+            card["gain_from_low_pct"] = round(-dip_pct, 3)
+
+            if not is_frozen and (dip_pct >= 0.35 or breakout_pct >= 0.45):
+                now_ts = time.time()
+                if is_live and live_armed:
+                    if (now_ts - order_cooldowns.get(sym, 0)) <= 12:
+                        return
+                    order_cooldowns[sym] = now_ts
+                    ok, msg, _ = execute_live_exchange_order(sym, "buy", usd_amount=anchor_usd)
+                    if not ok:
+                        return
+                    time.sleep(1.0)
+                    bals, _ = fetch_live_exchange_balances()
+                    new_sh = bals.get(sym, {}).get("available", 0.0) if bals else (anchor_usd * 0.99 / price)
+                    if bals and "USDT" in bals:
+                        STATE["exchange_bridge"]["available_usdt"] = round(bals["USDT"]["available"], 2)
+                    card["shares"] = new_sh if new_sh > 0 else round((anchor_usd * 0.99) / price, 6)
+                else:
+                    card["shares"] = round(anchor_usd / price, 6)
+
+                card["cash_reserve_usd"] = 0.0
+                card["entry_price"] = price
+                card["sliding_low"] = price
+                card["highest_price"] = price
+                card["gain_from_low_pct"] = 0.0
+                card["ratchet_armed"] = False
+                card["zero_loss_stop"] = 0.0
+                card["status"] = "HOLDING_ANCHOR"
+                add_log(
+                    f"🔄 SHARE-KEEPER RE-BUY ({sym}) @ ${price:.4f}: "
+                    f"Re-entered {card['shares']:.6f} {sym} shares!"
+                )
+                save_persistent_state()
+            return
+
+        # ----------------------------------------------------------------------
+        # STATE 1: WAITING_LIVE_BUY (0 SHARES HELD ON INITIAL LAUNCH)
+        # ----------------------------------------------------------------------
         if shares <= 0.000001:
             card["entry_price"] = price
             card["sliding_low"] = price
@@ -861,12 +930,11 @@ def evaluate_coin_tick(sym):
                 card["shares"] = round(anchor_usd / price, 6)
                 card["status"] = "HOLDING_ANCHOR"
 
-    # If Live coin is waiting for initial buy and bridge is armed + funded, trigger auto-buy
     if is_live and shares <= 0.000001 and live_armed and not is_frozen:
         now_ts = time.time()
         usdt_avail = float(STATE["exchange_bridge"].get("available_usdt") or 0.0)
-        if usdt_avail >= max(anchor_usd, 1.5) and (now_ts - order_cooldowns.get(sym, 0)) > 20:
-            sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+        if usdt_avail >= 1.50 and (now_ts - order_cooldowns.get(sym, 0)) > 15:
+            sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=False)
         return
 
     with state_lock:
@@ -874,11 +942,12 @@ def evaluate_coin_tick(sym):
         if not card or float(card.get("shares") or 0.0) <= 0:
             return
 
+        status = card.get("status", "HOLDING_ANCHOR")
         shares = float(card["shares"])
         sliding_low = float(card.get("sliding_low") or price)
         entry_price = float(card.get("entry_price") or price)
 
-        # Layer 1: Sliding Floor Ratchet (lowers floor on dips to catch rebounds faster)
+        # Layer 1: Sliding Floor Ratchet (lowers rebound baseline on dips)
         if sliding_low <= 0 or price < sliding_low:
             old_low = sliding_low
             sliding_low = price
@@ -890,14 +959,17 @@ def evaluate_coin_tick(sym):
                 )
 
         gain_pct = ((price - sliding_low) / sliding_low) * 100.0 if sliding_low > 0 else 0.0
+        gain_from_entry_pct = ((price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
         card["gain_from_low_pct"] = round(gain_pct, 3)
 
-        # Layer 2: Zero-Loss Shield (+0.35% above sliding low)
-        if gain_pct >= 0.35 and not card.get("ratchet_armed"):
+        # Layer 2: Zero-Loss Shield (+0.35% above entry & sliding low)
+        if gain_pct >= 0.35 and gain_from_entry_pct >= 0.25 and not card.get("ratchet_armed"):
             card["ratchet_armed"] = True
             card["highest_price"] = price
-            card["status"] = "RATCHET_ARMED"
-            stop_floor = sliding_low * 1.0020
+            stop_floor = max(entry_price * 1.0022, sliding_low * 1.0022)
+            card["zero_loss_stop"] = stop_floor
+            if status == "HOLDING_ANCHOR":
+                card["status"] = "RATCHET_ARMED"
             add_log(
                 f"🛡️ ZERO-LOSS SHIELD ARMED {sym} @ ${price:.4f}: "
                 f"Guaranteed profit floor locked @ ${stop_floor:.4f}"
@@ -908,89 +980,100 @@ def evaluate_coin_tick(sym):
                 category="shield"
             )
 
-        if card.get("ratchet_armed"):
+        if card.get("ratchet_armed") or status == "MOONBAG_RIDING":
             if price > float(card.get("highest_price") or price):
                 card["highest_price"] = price
+                trail_stop = price * 0.9972
+                if trail_stop > float(card.get("zero_loss_stop") or 0.0):
+                    card["zero_loss_stop"] = trail_stop
 
         highest_p = float(card.get("highest_price") or price)
+        stop_px = float(card.get("zero_loss_stop") or (entry_price * 1.0022))
+        strictly_profitable = price >= (entry_price * 1.0022)
 
-        # Layer 3: Profit Skim Triggers
-        # Trigger A: +0.80% target hit
-        target_hit = gain_pct >= 0.80
-        # Trigger B: Stage 2 Moonbag Surge (+1.60% breakout)
-        moonbag_hit = gain_pct >= 1.60
-        # Trigger C: Trailing Ratchet Stop (armed above +0.48% and pulls back 0.18% from peak)
-        trailing_stop_hit = (
-            card.get("ratchet_armed")
-            and gain_pct >= 0.48
-            and highest_p > 0
-            and price <= (highest_p * 0.9982)
-        )
+        # Layer 3: Evaluate Stage 1 vs Stage 2 Moonbag Triggers
+        if status == "MOONBAG_RIDING":
+            moonbag_target_hit = (gain_from_entry_pct >= 1.60 and strictly_profitable)
+            moonbag_stop_hit = (price <= stop_px and strictly_profitable)
+            should_skim = moonbag_target_hit or moonbag_stop_hit
+            stage_label = "Stage 2 Moonbag Exit"
+        else:
+            target_hit = (gain_pct >= 0.80 and strictly_profitable)
+            trailing_stop_hit = (
+                card.get("ratchet_armed")
+                and gain_pct >= 0.45
+                and strictly_profitable
+                and highest_p > 0
+                and price <= (highest_p * 0.9980)
+            )
+            should_skim = target_hit or trailing_stop_hit
+            stage_label = "Stage 1 Hybrid (50%)" if "50/50" in strategy else "Full Anchor Skim"
 
-    if not is_frozen and (moonbag_hit or target_hit or trailing_stop_hit):
-        stage_label = (
-            "Stage 2 Moonbag Exit"
-            if moonbag_hit
-            else ("Stage 1 Hybrid (50%)" if target_hit else "Sliding Floor Skim")
-        )
+    if not is_frozen and should_skim:
         perform_profit_skim(sym, price, gain_pct, stage_label)
 
 
 def perform_profit_skim(sym, price, gain_pct, stage_label):
     """
-    Executes a verified profit skim according to the card's active strategy:
-    - 50/50 Hybrid Moonbag: 50% to Untouchable Vault Cash, 50% compounded into Anchor Top-Up
-    - 100% Pure Cash Skim: 100% to Untouchable Vault Cash
-    - 100% Share Compounder: 100% compounded into Anchor Top-Up
+    Executes a verified profit skim on Gate.io Spot:
+    - Stage 1 Hybrid (50%): Sells 50% of shares (~$25 order on a $50 anchor, well above Gate.io $1 min!),
+      locks Stage 1 profit, and rides remaining 50% in MOONBAG_RIDING.
+    - Stage 2 Moonbag Exit / Full Skim: Sells 100% of remaining shares on Gate.io, locks profit in
+      Vault & Anchor Top-Up, and transitions to WAITING_DIP_REBUY.
     """
     with state_lock:
         card = STATE["coins"].get(sym)
         if not card:
             return
         shares = float(card.get("shares") or 0.0)
+        entry_price = float(card.get("entry_price") or price)
         anchor_usd = float(card.get("anchor_usd") or 10.0)
         strategy = card.get("strategy") or "50/50 Hybrid Moonbag"
+        status = card.get("status", "HOLDING_ANCHOR")
         is_live = bool(card.get("live_enabled")) and bool(STATE["exchange_bridge"].get("live_armed"))
 
     if shares <= 0 or price <= 0:
         return
 
-    bucket_val = shares * price
-    raw_surplus = max(0.0, bucket_val - anchor_usd)
-    pct_gain_usd = bucket_val * max(0.004, (gain_pct / 100.0) * 0.85)
-    skim_usd = max(raw_surplus, pct_gain_usd)
-
-    if skim_usd < 0.015:
+    now_ts = time.time()
+    if is_live and (now_ts - order_cooldowns.get(sym, 0)) <= 10:
         return
 
-    shares_to_sell = skim_usd / price
+    is_stage1_hybrid = ("50/50" in strategy and status != "MOONBAG_RIDING")
+    sell_fraction = 0.50 if is_stage1_hybrid else 1.00
+    shares_to_sell = shares * sell_fraction
+
+    # Calculate true profit on the sold tranche (accounting for 0.2% round-trip exchange fees)
+    cost_basis_sold = shares_to_sell * entry_price
+    gross_proceeds = shares_to_sell * price
+    net_proceeds = gross_proceeds * 0.999
+    skim_usd = max(0.01, net_proceeds - (cost_basis_sold * 1.001))
+
     mode_tag = "LIVE" if is_live else "PAPER"
 
     if is_live:
-        rules = get_exchange_pair_rules(sym)
-        # If skim USD meets Gate.io minimum order size, sell the skimmed portion to USDT
-        if (shares_to_sell * price) >= rules["min_quote_amount"]:
-            ok, msg, _ = execute_live_exchange_order(sym, "sell", share_amount=shares_to_sell)
-            if not ok:
-                return
+        order_cooldowns[sym] = now_ts
+        ok, msg, _ = execute_live_exchange_order(
+            sym,
+            "sell",
+            share_amount=shares_to_sell if is_stage1_hybrid else None
+        )
+        if not ok:
+            return
+        time.sleep(0.9)
+        bals, _ = fetch_live_exchange_balances()
+        if bals:
             with state_lock:
-                card["shares"] = max(0.0, float(card["shares"]) - shares_to_sell)
+                STATE["exchange_bridge"]["available_usdt"] = round(bals.get("USDT", {}).get("available", 0.0), 2)
+                rem_sh = bals.get(sym, {}).get("available", 0.0)
+                card["shares"] = rem_sh if is_stage1_hybrid else 0.0
         else:
-            # Below exchange min order ($1 USDT): lock 100% inside Share-Keeper Escrow compounding
-            add_log(
-                f"🔒 [{sym}] Micro-Skim (+${skim_usd:.4f}) below Gate.io $1 min sell -> "
-                f"Compounded in Share-Keeper Escrow!"
-            )
+            with state_lock:
+                card["shares"] = max(0.0, shares - shares_to_sell) if is_stage1_hybrid else 0.0
     else:
         with state_lock:
-            if "100% Pure Cash" in strategy:
-                card["shares"] = max(0.0, shares - shares_to_sell)
-            elif "100% Share" in strategy:
-                pass
-            else:
-                card["shares"] = max(0.0, shares - (shares_to_sell * 0.50))
+            card["shares"] = max(0.0, shares - shares_to_sell) if is_stage1_hybrid else 0.0
 
-    # Split profit according to selected strategy
     if "100% Pure Cash" in strategy:
         vault_cut = skim_usd
         topup_cut = 0.0
@@ -1012,13 +1095,23 @@ def perform_profit_skim(sym, price, gain_pct, stage_label):
         card["vaulted_usd"] = round(float(card.get("vaulted_usd", 0.0)) + vault_cut, 4)
         card["skim_count"] = int(card.get("skim_count", 0)) + 1
 
-        # Reset floor to current price after locking profit
-        card["entry_price"] = price
-        card["sliding_low"] = price
-        card["highest_price"] = price
-        card["gain_from_low_pct"] = 0.0
-        card["ratchet_armed"] = False
-        card["status"] = "HOLDING_ANCHOR"
+        if is_stage1_hybrid:
+            card["status"] = "MOONBAG_RIDING"
+            card["cash_reserve_usd"] = round(cost_basis_sold, 2)
+            card["highest_price"] = price
+            card["zero_loss_stop"] = max(entry_price * 1.0022, price * 0.9968)
+            card["ratchet_armed"] = True
+        else:
+            card["status"] = "WAITING_DIP_REBUY"
+            card["shares"] = 0.0
+            card["cash_reserve_usd"] = round(card["anchor_usd"], 2)
+            card["last_exit_price"] = price
+            card["entry_price"] = price
+            card["sliding_low"] = price
+            card["highest_price"] = price
+            card["gain_from_low_pct"] = 0.0
+            card["ratchet_armed"] = False
+            card["zero_loss_stop"] = 0.0
 
         total_generated = round(STATE["vault_cash"] + STATE["added_to_anchors"], 4)
         STATE["profit_curve"].append({"time": ts_now, "value": total_generated})
@@ -1042,7 +1135,7 @@ def perform_profit_skim(sym, price, gain_pct, stage_label):
 
     add_log(
         f"💰 [{mode_tag}] {stage_label.upper()} {sym} @ ${price:.4f}: "
-        f"Locked +${vault_cut:.4f} in Vault & +${topup_cut:.4f} to Anchor!"
+        f"Sold {shares_to_sell:.5f} {sym} -> Locked +${vault_cut:.4f} in Vault & +${topup_cut:.4f} to Anchor!"
     )
     dispatch_phone_alert(
         f"VaultSkim Profit Locked ({sym})",
@@ -1053,31 +1146,41 @@ def perform_profit_skim(sym, price, gain_pct, stage_label):
 
 
 # ==============================================================================
-# BACKGROUND DAEMON THREADS (MARKET TICKER + SELF-PING HEARTBEAT)
+# SELF-HEALING WORKER ENGINE (SURVIVES GUNICORN FORKS & RENDER RELOADS)
 # ==============================================================================
+def run_single_engine_cycle():
+    """Executes one non-blocking market tick across all active coins."""
+    global _last_engine_tick_ts, _last_wallet_sync_ts
+    if not tick_lock.acquire(blocking=False):
+        return
+    try:
+        _last_engine_tick_ts = time.time()
+        with state_lock:
+            active_symbols = list(STATE.get("coins", {}).keys())
+            live_armed = bool(STATE.get("exchange_bridge", {}).get("live_armed", False))
+            if not active_symbols:
+                STATE["last_price_tick_hms"] = now_hms()
+
+        for sym in active_symbols:
+            evaluate_coin_tick(sym)
+
+        now_ts = time.time()
+        if live_armed and (now_ts - _last_wallet_sync_ts) >= 35:
+            _last_wallet_sync_ts = now_ts
+            sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=False)
+    except Exception as e:
+        logger.debug(f"Single engine cycle notice: {e}")
+    finally:
+        tick_lock.release()
+
+
 def market_engine_loop():
-    """Main 3-second trading & wallet synchronization daemon."""
-    last_wallet_sync = 0
     while True:
-        try:
-            with state_lock:
-                active_symbols = list(STATE.get("coins", {}).keys())
-                live_armed = bool(STATE.get("exchange_bridge", {}).get("live_armed", False))
-
-            for sym in active_symbols:
-                evaluate_coin_tick(sym)
-
-            now_ts = time.time()
-            if live_armed and (now_ts - last_wallet_sync) >= 25:
-                last_wallet_sync = now_ts
-                sync_all_live_cards_with_gateio(auto_buy_waiting=True)
-        except Exception as e:
-            logger.error(f"Engine loop exception: {e}")
-        time.sleep(3)
+        run_single_engine_cycle()
+        time.sleep(2.5)
 
 
 def keep_alive_self_ping_loop():
-    """Pings Render external URL every 4 minutes so the instance never sleeps."""
     while True:
         time.sleep(240)
         if RENDER_EXTERNAL_URL:
@@ -1087,8 +1190,28 @@ def keep_alive_self_ping_loop():
                 pass
 
 
-threading.Thread(target=market_engine_loop, daemon=True).start()
-threading.Thread(target=keep_alive_self_ping_loop, daemon=True).start()
+def ensure_worker_threads_running():
+    """
+    Ensures the background ticker thread is alive inside the current Gunicorn worker PID,
+    and triggers an immediate non-blocking tick if >2.5s elapsed since last tick.
+    """
+    global _worker_pid, _engine_thread, _keepalive_thread
+    curr_pid = os.getpid()
+    if _worker_pid != curr_pid or _engine_thread is None or not _engine_thread.is_alive():
+        _worker_pid = curr_pid
+        _engine_thread = threading.Thread(target=market_engine_loop, daemon=True)
+        _engine_thread.start()
+        _keepalive_thread = threading.Thread(target=keep_alive_self_ping_loop, daemon=True)
+        _keepalive_thread.start()
+        logger.info(f"Started live market ticker thread in worker PID {curr_pid}.")
+
+    if (time.time() - _last_engine_tick_ts) >= 2.4:
+        threading.Thread(target=run_single_engine_cycle, daemon=True).start()
+
+
+@app.before_request
+def before_any_request():
+    ensure_worker_threads_running()
 
 
 # ==============================================================================
@@ -1103,16 +1226,18 @@ threading.Thread(target=keep_alive_self_ping_loop, daemon=True).start()
 @app.route("/api/health")
 @app.route("/api/heartbeat")
 def route_heartbeat():
-    """Handles cron-job.org keep-alive checks with a guaranteed 200 OK response."""
+    ensure_worker_threads_running()
     with state_lock:
         armed = bool(STATE.get("exchange_bridge", {}).get("live_armed", False))
         count = len(STATE.get("coins", {}))
+        last_tick = STATE.get("last_price_tick_hms", "--:--:--")
     return jsonify({
         "ok": True,
         "status": "ALIVE",
-        "version": "v5.2 - Pure Live Truth",
+        "version": "v5.3 - Pure Live Truth",
         "live_bridge_armed": armed,
         "active_coins": count,
+        "last_price_tick_utc": last_tick,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
 
@@ -1162,6 +1287,7 @@ def route_sw():
 
 @app.route("/api/state")
 def route_api_state():
+    ensure_worker_threads_running()
     with state_lock:
         b = STATE.get("exchange_bridge", {})
         raw_key = b.get("api_key") or ""
@@ -1188,14 +1314,15 @@ def route_api_state():
         }
         vc = float(STATE.get("vault_cash") or 0.0)
         aa = float(STATE.get("added_to_anchors") or 0.0)
-        return jsonify({
-            "version": STATE.get("version", "v5.2 - Pure Live Truth"),
+        payload = {
+            "version": STATE.get("version", "v5.3 - Pure Live Truth"),
             "vault_cash": vc,
             "added_to_anchors": aa,
             "total_profit": round(vc + aa, 4),
             "total_skims": int(STATE.get("total_skims") or 0),
             "total_withdrawn": float(STATE.get("total_withdrawn") or 0.0),
             "frozen": bool(STATE.get("frozen", False)),
+            "last_price_tick_hms": STATE.get("last_price_tick_hms", now_hms()),
             "profit_curve": STATE.get("profit_curve", []),
             "skim_ledger": STATE.get("skim_ledger", []),
             "cashout_history": STATE.get("cashout_history", []),
@@ -1203,7 +1330,10 @@ def route_api_state():
             "exchange_bridge": safe_bridge,
             "alerts": safe_alerts,
             "coins": STATE.get("coins", {})
-        })
+        }
+    resp = make_response(jsonify(payload))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.route("/api/bridge/save", methods=["POST"])
@@ -1228,9 +1358,8 @@ def route_bridge_save():
         elif "live_armed" in data:
             b["live_armed"] = bool(data["live_armed"])
 
-    # Clear cooldowns so any WAITING_LIVE_BUY cards immediately execute on save/verify
     order_cooldowns.clear()
-    ok, result = sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+    ok, result = sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True)
     if not ok:
         add_log(f"❌ EXCHANGE BRIDGE ERROR: {result}")
         save_persistent_state()
@@ -1249,7 +1378,8 @@ def route_bridge_save():
 @app.route("/api/sync_live", methods=["POST"])
 def route_sync_live():
     order_cooldowns.clear()
-    ok, result = sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+    run_single_engine_cycle()
+    ok, result = sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True)
     if not ok:
         return jsonify({"ok": False, "error": result}), 400
     return jsonify({"ok": True, "available_usdt": result})
@@ -1297,8 +1427,11 @@ def route_coin_launch():
             "entry_price": price,
             "sliding_low": price,
             "highest_price": price,
+            "last_exit_price": price,
+            "zero_loss_stop": 0.0,
             "gain_from_low_pct": 0.0,
             "anchor_usd": anchor_usd,
+            "cash_reserve_usd": anchor_usd if live_armed else 0.0,
             "shares": 0.0 if live_armed else round(anchor_usd / price, 6),
             "share_topup_usd": 0.0,
             "vaulted_usd": 0.0,
@@ -1310,7 +1443,7 @@ def route_coin_launch():
 
     if live_armed:
         order_cooldowns[sym] = 0
-        sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+        sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True)
     else:
         save_persistent_state()
 
@@ -1341,7 +1474,7 @@ def route_coin_switch_mode():
 
     if is_now_live:
         order_cooldowns[sym] = 0
-        sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+        sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True)
     else:
         save_persistent_state()
 
@@ -1371,7 +1504,6 @@ def route_coin_cycle_strategy():
 
 @app.route("/api/coin/force_buy", methods=["POST"])
 def route_coin_force_buy():
-    """Allows immediate 1-tap live Gate.io purchase when a card is in WAITING_LIVE_BUY."""
     data = request.json or {}
     sym = (data.get("symbol") or "").upper().strip()
     with state_lock:
@@ -1385,8 +1517,8 @@ def route_coin_force_buy():
     order_cooldowns[sym] = 0
     ok, msg, _ = execute_live_exchange_order(sym, "buy", usd_amount=anchor_usd)
     if ok:
-        time.sleep(1.2)
-        sync_all_live_cards_with_gateio(auto_buy_waiting=False)
+        time.sleep(1.1)
+        sync_all_live_cards_with_gateio(auto_buy_waiting=False, verbose=True)
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": msg}), 400
 
@@ -1404,8 +1536,11 @@ def route_coin_edit_anchor():
         card = STATE["coins"].get(sym)
         if not card:
             return jsonify({"ok": False, "error": "Coin not found."}), 404
+        old_anchor = float(card.get("anchor_usd") or 10.0)
+        delta_usd = new_anchor - old_anchor
         card["anchor_usd"] = round(new_anchor, 2)
         is_live = bool(card.get("live_enabled"))
+        shares_now = float(card.get("shares") or 0.0)
         if not is_live:
             price = float(card.get("current_price") or 1.0)
             card["shares"] = round(new_anchor / price, 6)
@@ -1413,7 +1548,12 @@ def route_coin_edit_anchor():
 
     if is_live:
         order_cooldowns[sym] = 0
-        sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+        # If already holding tokens and user increased anchor by >= $1.50, buy the top-up delta on Gate.io
+        if shares_now > 0 and delta_usd >= 1.50:
+            ok, _, _ = execute_live_exchange_order(sym, "buy", usd_amount=delta_usd)
+            if ok:
+                time.sleep(1.0)
+        sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True)
     else:
         save_persistent_state()
 
@@ -1446,12 +1586,11 @@ def route_coin_remove():
             del STATE["coins"][sym]
             add_log(f"🗑️ Removed coin card {sym}.")
             save_persistent_state()
-    return jsonify({"ok": True})# ==============================================================================
-# PART 2 OF 2: RADAR SCANNER, ALERTS, CASHOUT & FULL FRONTEND COMMAND CENTER UI
-# ==============================================================================
+    return jsonify({"ok": True})
+
+
 @app.route("/api/radar/scan")
 def route_radar_scan():
-    """Scans high-liquidity trending CEX & DEX movers with Anti-Rug verification."""
     candidates = ["QNT", "LQTY", "PEPE", "BONK", "SOL", "SUI", "FET", "RENDER"]
     results = []
     for sym in candidates:
@@ -1499,7 +1638,7 @@ def route_cashout_record():
         amount = float(data.get("amount") or 0.0)
     except Exception:
         amount = 0.0
-    dest = (data.get("destination") or "Gate.io Spot USDT / External Wallet").strip()
+    dest = (data.get("destination") or "Gate.io Spot USDT / Accrue").strip()
 
     with state_lock:
         avail_vault = float(STATE.get("vault_cash") or 0.0)
@@ -1576,7 +1715,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/svg+xml" href="/icon.svg">
     <link rel="apple-touch-icon" href="/icon.svg">
-    <title>VaultSkim Command Center • v5.2 - Pure Live Truth</title>
+    <title>VaultSkim Command Center • v5.3 - Pure Live Truth</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root {
@@ -1636,12 +1775,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="flex items-center justify-between gap-2 mb-1">
             <h1 class="text-lg sm:text-xl font-extrabold text-white tracking-tight">VaultSkim Command Center</h1>
             <span id="versionBadge" class="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-950/90 text-emerald-400 border border-emerald-600/60 mono whitespace-nowrap">
-                v5.2 - Pure Live Truth
+                v5.3 - Pure Live Truth
             </span>
         </div>
-        <p class="text-[11px] text-slate-400 mb-3">
-            Strict Live Gate.io Wallet Sync • Zero Paper Fallback on Live Coins
-        </p>
+        <div class="flex items-center justify-between text-[11px] text-slate-400 mb-3">
+            <span>Strict Live Gate.io Wallet Sync • Zero Paper Fallback</span>
+            <span id="liveTickClock" class="text-emerald-400 mono font-bold">● Tick: --:--:--</span>
+        </div>
 
         <!-- 3 Action Drawer Toggles -->
         <div class="flex flex-wrap gap-1.5 mb-3">
@@ -1878,7 +2018,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
 <script>
-// Register PWA Service Worker
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
@@ -1972,7 +2111,7 @@ function formatPrice(p) {
 
 async function pollState() {
     try {
-        const r = await fetch('/api/state');
+        const r = await fetch('/api/state?_t=' + Date.now(), { cache: 'no-store' });
         if (!r.ok) return;
         const data = await r.json();
         updateUI(data);
@@ -1982,14 +2121,15 @@ async function pollState() {
 }
 
 function updateUI(data) {
-    // Profit Hero
     document.getElementById('heroTotalProfit').innerText = `$${Number(data.total_profit || 0).toFixed(2)}`;
     document.getElementById('heroProfitSub').innerText =
         `Vault Cash: $${Number(data.vault_cash || 0).toFixed(2)} | Added to Anchors: +$${Number(data.added_to_anchors || 0).toFixed(2)}`;
     document.getElementById('cashoutAvailDisplay').innerText = `$${Number(data.vault_cash || 0).toFixed(2)}`;
     document.getElementById('chartSkimBadge').innerText = `${data.total_skims || 0} Total Skims`;
+    if (data.last_price_tick_hms) {
+        document.getElementById('liveTickClock').innerText = `● Tick: ${data.last_price_tick_hms} UTC`;
+    }
 
-    // Bridge status badges
     const b = data.exchange_bridge || {};
     const liveBadge = document.getElementById('liveBridgeBadge');
     const exchUpper = (b.exchange || 'gateio').toUpperCase();
@@ -2010,7 +2150,6 @@ function updateUI(data) {
         document.getElementById('savedKeyLabel').innerText = `Saved Key: ${b.masked_key}`;
     }
 
-    // Freeze button
     const freezeBtn = document.getElementById('freezeBtn');
     if (data.frozen) {
         freezeBtn.innerText = "▶️ Resume Live";
@@ -2020,10 +2159,8 @@ function updateUI(data) {
         freezeBtn.className = "btn-press px-3 py-1.5 rounded-lg bg-rose-950/90 text-rose-300 border border-rose-700/70 font-bold text-xs";
     }
 
-    // Profit Growth Curve SVG
     renderProfitCurveSvg(data.profit_curve || []);
 
-    // Skim Ledger
     const ledgerBox = document.getElementById('skimLedgerList');
     const ledger = data.skim_ledger || [];
     if (ledger.length === 0) {
@@ -2047,7 +2184,6 @@ function updateUI(data) {
         `).join('');
     }
 
-    // Active Coin Cards
     const coinsBox = document.getElementById('activeCoinsContainer');
     const coins = data.coins || {};
     const syms = Object.keys(coins);
@@ -2065,31 +2201,40 @@ function updateUI(data) {
             const low = Number(c.sliding_low || price);
             const entry = Number(c.entry_price || price);
             const anchor = Number(c.anchor_usd || 10);
+            const cashRes = Number(c.cash_reserve_usd || 0);
             const tokenVal = sh * price;
+            const totalBucketVal = (c.status === 'MOONBAG_RIDING' || c.status === 'WAITING_DIP_REBUY')
+                ? (cashRes + tokenVal)
+                : tokenVal;
             const gainPct = low > 0 ? (((price - low) / low) * 100) : 0;
             const targetPrice = low * 1.008;
             const pctBar = Math.max(0, Math.min(100, (gainPct / 0.80) * 100));
 
             const modePill = isLive
-                ? `<span class="px-2 py-0.5 rounded bg-rose-950/90 text-rose-400 border border-rose-700/70 text-[10px] font-extrabold mono">⚡ LIVE ORDER</span>`
-                : `<span class="px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-bold mono">📄 PAPER</span>`;
+                ? `<button onclick="switchCoinMode('${sym}', true)" class="btn-press px-2 py-0.5 rounded bg-rose-950/90 text-rose-400 border border-rose-700/70 text-[10px] font-extrabold mono">⚡ LIVE ORDER</button>`
+                : `<button onclick="switchCoinMode('${sym}', false)" class="btn-press px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-bold mono">📄 PAPER</button>`;
 
             const statusPill = c.status === 'WAITING_LIVE_BUY'
                 ? `<span class="px-2 py-0.5 rounded bg-purple-950/90 text-purple-300 border border-purple-700/70 text-[10px] font-extrabold mono">WAITING_LIVE_BUY</span>`
                 : `<span class="px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-400 border border-emerald-700/70 text-[10px] font-extrabold mono">${c.status}</span>`;
 
-            const bucketAText = (isLive && sh <= 0)
-                ? `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(Waiting Gate.io Buy - $0 in Token)</span>`
-                : `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(In Token)</span>`;
-
-            const totalBucketText = (isLive && sh <= 0)
-                ? `$${anchor.toFixed(2)} Cash Reserved ($0.00 in Token)`
-                : `$${tokenVal.toFixed(2)}`;
+            let bucketAText = `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(In Token)</span>`;
+            let totalBucketText = `$${tokenVal.toFixed(2)}`;
+            if (isLive && sh <= 0 && c.status === 'WAITING_LIVE_BUY') {
+                bucketAText = `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(Waiting Gate.io Buy)</span>`;
+                totalBucketText = `$${anchor.toFixed(2)} Cash Reserved ($0.00 in Token)`;
+            } else if (c.status === 'MOONBAG_RIDING') {
+                bucketAText = `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(50% Cash + 50% Moonbag)</span>`;
+                totalBucketText = `$${totalBucketVal.toFixed(2)} ($${cashRes.toFixed(2)} Cash + $${tokenVal.toFixed(2)} Bag)`;
+            } else if (c.status === 'WAITING_DIP_REBUY') {
+                bucketAText = `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(100% USDT — Waiting Dip)</span>`;
+                totalBucketText = `$${cashRes.toFixed(2)} USDT Ready for Dip Re-Buy`;
+            }
 
             const bottomBar = isLive
                 ? (sh <= 0
                     ? `<button onclick="forceLiveBuy('${sym}')" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-emerald-950/90 hover:bg-emerald-900 text-emerald-300 border border-emerald-600/80 font-extrabold text-xs flex items-center justify-center gap-1.5">
-                           <span>🟢</span> <span>Live Gate.io Node Active — Paper Simulator Disabled (Tap to Buy Now)</span>
+                           <span>🟢</span> <span>Live Gate.io Node Active — Tap to Buy/Re-Enter Now</span>
                        </button>`
                     : `<button onclick="manualSyncLive()" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-700/70 font-bold text-xs flex items-center justify-center gap-1.5">
                            <span>🟢</span> <span>Live Gate.io Node Active — Paper Simulator Disabled</span>
@@ -2115,17 +2260,17 @@ function updateUI(data) {
                 </div>
 
                 <div class="v-inner px-3 py-2 mb-3 flex items-center justify-between text-xs">
-                    <button onclick="cycleCoinStrategy('${sym}')" class="text-left text-indigo-300 font-bold hover:underline">
+                    <span class="text-left text-indigo-300 font-bold">
                         ⚡ Strategy: ${c.strategy || '50/50 Hybrid Moonbag'}
-                    </button>
-                    <button onclick="switchCoinMode('${sym}')" class="btn-press px-2.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-700/80 font-bold text-[11px]">
+                    </span>
+                    <button onclick="cycleCoinStrategy('${sym}')" class="btn-press px-2.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-700/80 font-bold text-[11px]">
                         Switch
                     </button>
                 </div>
 
                 <div class="flex items-baseline gap-2.5 mb-3">
                     <span class="text-2xl sm:text-3xl font-extrabold text-white mono">$${formatPrice(price)}</span>
-                    <span class="text-xs font-bold text-emerald-400 mono">(${gainPct >= 0 ? '' : ''}${gainPct.toFixed(2)}% from Low)</span>
+                    <span class="text-xs font-bold text-emerald-400 mono">(${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}% from Low)</span>
                 </div>
 
                 <div class="v-inner p-3 space-y-2 text-xs mono">
@@ -2156,7 +2301,7 @@ function updateUI(data) {
 
                     <div class="flex items-center justify-between">
                         <span class="text-slate-400">Zero-Loss / +0.8% Bar:</span>
-                        <span class="text-emerald-300 font-bold">Shield @ +0.35% | Target $${formatPrice(targetPrice)}</span>
+                        <span class="text-emerald-300 font-bold">${c.zero_loss_stop > 0 ? 'LOCKED Stop @ $' + formatPrice(c.zero_loss_stop) : 'Shield @ +0.35% | Target $' + formatPrice(targetPrice)}</span>
                     </div>
 
                     <div class="w-full bg-slate-900 h-2 rounded-full overflow-hidden border border-slate-800">
@@ -2174,7 +2319,6 @@ function updateUI(data) {
         }).join('');
     }
 
-    // Security Logs
     const logBox = document.getElementById('securityLogBox');
     logBox.innerHTML = (data.logs || []).map(line => `<div>${line}</div>`).join('');
 }
@@ -2273,7 +2417,10 @@ function quickLaunchFromRadar(sym) {
     launchNewCoin();
 }
 
-async function switchCoinMode(symbol) {
+async function switchCoinMode(symbol, currentlyLive) {
+    if (currentlyLive && !confirm(`Switch ${symbol} from LIVE Gate.io mode to PAPER simulator?`)) {
+        return;
+    }
     await fetch('/api/coin/switch_mode', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2325,6 +2472,7 @@ async function triggerPracticeSpike(symbol) {
 }
 
 async function removeCoinCard(symbol) {
+    if (!confirm(`Remove ${symbol} card from dashboard?`)) return;
     await fetch('/api/coin/remove', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2388,11 +2536,13 @@ setInterval(pollState, 2500);
 
 @app.route("/")
 def route_index():
+    ensure_worker_threads_running()
     resp = make_response(render_template_string(DASHBOARD_HTML))
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
 
 if __name__ == "__main__":
+    ensure_worker_threads_running()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, threaded=True)
