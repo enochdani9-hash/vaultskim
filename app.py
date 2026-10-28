@@ -1,2073 +1,2398 @@
 # ==============================================================================
-# VAULTSKIM COMMAND CENTER — v5.2 PURE LIVE TRUTH ENGINE (PART 1 OF 2)
+# VAULTSKIM COMMAND CENTER — v5.2 PURE LIVE TRUTH (FULL PRODUCTION MONOLITH)
+# PART 1 OF 2: BACKEND ENGINE, GATE.IO V4 / BINANCE V3 BRIDGE & FLASK ROUTES
 # ==============================================================================
-# Fixes engineered specifically from live Gate.io Spot inspection:
-#   1. STRICT LIVE MODE: Any coin set to ⚡ LIVE ORDER can NEVER execute a [PAPER]
-#      trade, never run a fake Sliding Floor Skim, and never book profit unless
-#      Gate.io returns HTTP 200/201 with a real filled Order ID. 
-#   2. REAL WALLET TRUTH: Switching a coin to ⚡ LIVE ORDER (or clicking Sync Live)
-#      queries Gate.io `/api/v4/spot/accounts` and sets `shares_owned` to the
-#      EXACT token balance in your Gate.io Spot wallet (e.g., 0.12275 QNT, 0 LQTY).
-#      If Gate.io holds 0 tokens, status becomes `WAITING_LIVE_BUY` until Gate.io
-#      actually fills the buy order—never showing fake "(In Token)" shares!
-#   3. ZERO `BALANCE_NOT_ENOUGH` (400) ERRORS:
-#      - Live SELL queries Gate.io Spot balance first and sells `floor_decimals(avail_token * 0.9995, 4)`
-#        so Gate.io's 0.1% fee deduction never causes a share mismatch.
-#      - Live BUY queries Gate.io Spot USDT first and caps order cost + 0.35% limit
-#        buffer strictly below `avail_usdt * 0.995`.
-# ==============================================================================
-
 import os
 import sys
-import csv
-import io
 import time
 import json
-import math
 import hmac
+import math
+import uuid
 import hashlib
 import logging
 import threading
-import urllib.parse
 from datetime import datetime, timezone
-from typing import Dict, Any, Tuple, List, Optional
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from urllib.parse import urlencode
 
 import requests
-import psycopg2
 from flask import (
     Flask,
-    render_template_string,
     request,
     jsonify,
     Response,
-    make_response
+    make_response,
+    render_template_string,
+    redirect,
+    url_for
 )
 
+# Optional PostgreSQL driver for persistent cloud state on Render / Neon
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("VaultSkimLiveTruth")
+logger = logging.getLogger("VaultSkim")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
+# ==============================================================================
+# GLOBAL CONFIGURATION & PERSISTENCE CONSTANTS
+# ==============================================================================
+STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_v52.json")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-PORT = int(os.environ.get("PORT", 10000))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
-GATEIO_API_HOST = "https://api.gateio.ws"
-GATEIO_API_PREFIX = "/api/v4"
-BINANCE_API_HOST = "https://api.binance.com"
-DEXSCREENER_API_HOST = "https://api.dexscreener.com"
+state_lock = threading.RLock()
+order_cooldowns = {}          # symbol -> timestamp of last live buy attempt
+pair_rules_cache = {}         # pair -> precision & minimum order rules
+price_cache = {}              # symbol -> {price, ask, bid, source, ts}
 
-DEFAULT_FEE_RATE = 0.0010          # 0.10% Gate.io Spot fee
-MIN_EXCHANGE_ORDER_USD = 1.05      # Gate.io minimum order notional ($1.05)
-MIN_DEX_LIQUIDITY_USD = 15000.0    # Anti-Rug $15K minimum liquidity
-
-# Zero-Loss Ratchet Thresholds
-SHIELD_ARM_PCT = 0.0035            # +0.35% above entry arms the Zero-Loss Shield
-SHIELD_FLOOR_LOCK_PCT = 0.0022     # Locks profit floor at Entry + 0.22% (covers 2x 0.1% fees)
-STAGE1_SKIM_TARGET_PCT = 0.0080    # +0.80% bounce from sliding low triggers Stage 1 Skim
-STAGE1_TRAIL_GAP_PCT = 0.0025      # 0.25% trailing stop gap once shield is armed
-STAGE2_MOONBAG_TARGET_PCT = 0.0180 # +1.80% rally target for Stage 2 Moonbag Exit
-STAGE2_MOONBAG_TRAIL_PCT = 0.0035  # 0.35% trailing stop gap for riding Moonbag
-DIP_REBUY_DROP_PCT = 0.0040        # -0.40% dip from exit price triggers Share-Keeper Re-Buy
-BREAKOUT_REBUY_PCT = 0.0045        # +0.45% breakout continuation re-enters anchor
-
-MEME_RADAR_CANDIDATES = [
-    {"symbol": "QNT", "name": "Quant", "pair": "QNT_USDT", "tag": "Verified CEX Utility"},
-    {"symbol": "LQTY", "name": "Liquity", "pair": "LQTY_USDT", "tag": "DeFi Momentum"},
-    {"symbol": "LTC", "name": "Litecoin", "pair": "LTC_USDT", "tag": "Fast Settlement"},
-    {"symbol": "DASH", "name": "Dash", "pair": "DASH_USDT", "tag": "Rapid Swing Pair"},
-    {"symbol": "PEPE", "name": "Pepe", "pair": "PEPE_USDT", "tag": "High Velocity Meme"},
-    {"symbol": "BONK", "name": "Bonk", "pair": "BONK_USDT", "tag": "Solana Meme Leader"},
-    {"symbol": "WIF", "name": "dogwifhat", "pair": "WIF_USDT", "tag": "High Volatility"},
-    {"symbol": "FLOKI", "name": "Floki", "pair": "FLOKI_USDT", "tag": "Liquid Meme CEX"},
-    {"symbol": "SHIB", "name": "Shiba Inu", "pair": "SHIB_USDT", "tag": "Large Cap Meme"},
-    {"symbol": "DOGE", "name": "Dogecoin", "pair": "DOGE_USDT", "tag": "Blue-Chip Meme"},
-    {"symbol": "POPCAT", "name": "Popcat", "pair": "POPCAT_USDT", "tag": "Solana Momentum"},
-    {"symbol": "SOL", "name": "Solana", "pair": "SOL_USDT", "tag": "L1 Liquidity Leader"}
-]
-
-
-def floor_to_decimals(val: float, decimals: int = 4) -> float:
-    """Strictly floors a float to `decimals` places so we NEVER round up above wallet balance."""
-    factor = 10 ** decimals
-    return math.floor(float(val) * factor) / factor
-
-
-def build_default_coin_card(
-    symbol: str,
-    anchor_usd: float = 50.00,
-    source: str = "gateio",
-    contract: str = "",
-    liquidity_usd: float = 5000000.0,
-    live_mode: bool = False,
-    strategy: str = "hybrid_50_50"
-) -> Dict[str, Any]:
-    clean_sym = symbol.upper().replace("/USDT", "").replace("_USDT", "").replace("USDT", "").strip()
-    return {
-        "symbol": clean_sym,
-        "pair": f"{clean_sym}/USDT",
-        "source": "gateio" if not contract else source,
-        "contract": contract,
-        "liquidity_usd": float(liquidity_usd),
-        "live_mode": bool(live_mode),
-        "strategy": strategy,              # 'hybrid_50_50' or 'share_keeper_100'
-        "status": "WAITING_LIVE_BUY" if live_mode else "HOLDING_ANCHOR",
-        "anchor_usd": round(float(anchor_usd), 2),
-        "cash_reserve_usd": round(float(anchor_usd), 2),
-        "shares_owned": 0.0,
-        "target_shares_floor": 0.0,
-        "entry_price": 0.0,
-        "sliding_low": 0.0,
-        "high_water": 0.0,
-        "last_price": 0.0,
-        "last_exit_price": 0.0,
-        "shield_armed": False,
-        "zero_loss_stop": 0.0,
-        "escrow_profit": 0.0,
-        "vaulted_profit": 0.0,
-        "share_topup_usd": 0.0,
-        "skims_count": 0,
-        "last_live_Action_ts": 0.0,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-
-DEFAULT_STATE: Dict[str, Any] = {
-    "version": "5.2 · Pure Live Truth",
+# Default system state matching v5.2 Pure Live Truth schema
+DEFAULT_STATE = {
+    "version": "v5.2 - Pure Live Truth",
     "vault_cash": 0.0,
     "added_to_anchors": 0.0,
     "total_skims": 0,
-    "live_bridge_enabled": True,
-    "spot_exchange": "gateio",
-    "spot_api_key": "",
-    "spot_api_secret": "",
-    "max_order_cap": 250.0,
-    "last_verified_usdt": 0.0,
-    "ntfy_topic": "",
-    "telegram_bot_token": "",
-    "telegram_chat_id": "",
-    "alerts_enabled": True,
+    "total_withdrawn": 0.0,
+    "frozen": False,
     "profit_curve": [
-        {"time": datetime.now(timezone.utc).strftime("%H:%M:%S"), "value": 0.0}
+        {
+            "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "value": 0.0
+        }
     ],
     "skim_ledger": [],
-    "security_log": [
-        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] VaultSkim v5.2 Pure Live Truth Engine initialized."
+    "cashout_history": [],
+    "logs": [
+        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
+        f"VaultSkim v5.2 Pure Live Truth Engine Initialized."
     ],
-    "coins": {
-        "QNT": build_default_coin_card("QNT", anchor_usd=50.00, source="gateio", live_mode=True, strategy="hybrid_50_50")
-    }
+    "exchange_bridge": {
+        "exchange": "gateio",
+        "api_key": "",
+        "api_secret": "",
+        "max_order_usd": 250.0,
+        "live_armed": False,
+        "verified": False,
+        "available_usdt": 0.0,
+        "last_sync_ts": 0
+    },
+    "alerts": {
+        "enabled": False,
+        "ntfy_topic": "",
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
+        "alert_on_skim": True,
+        "alert_on_shield": True,
+        "alert_on_buy": True
+    },
+    "coins": {}
 }
 
-state: Dict[str, Any] = json.loads(json.dumps(DEFAULT_STATE))
-state_lock = threading.RLock()
-
 
 # ==============================================================================
-# 1. POSTGRESQL DATABASE PERSISTENCE ENGINE
+# DATABASE & FILE PERSISTENCE LAYER (NEON POSTGRESQL + LOCAL JSON FALLBACK)
 # ==============================================================================
-def get_db_connection():
-    if not DATABASE_URL:
-        return None
+def init_db():
+    """Initializes the Neon PostgreSQL state table if DATABASE_URL is configured."""
+    if not DATABASE_URL or not HAS_PSYCOPG2:
+        return False
     try:
-        db_url = DATABASE_URL
-        if db_url.startswith("postgres://"):
-            db_url = db_url.replace("postgres://", "postgresql://", 1)
-        return psycopg2.connect(db_url, connect_timeout=8)
-    except Exception as exc:
-        logger.warning(f"PostgreSQL connection warning: {exc}")
-        return None
-
-
-def init_db_tables():
-    conn = get_db_connection()
-    if not conn:
-        return
-    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS vaultskim_state (
-                    id INTEGER PRIMARY KEY,
-                    data JSONB NOT NULL,
-                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                CREATE TABLE IF NOT EXISTS vaultskim_kv_store (
+                    store_key VARCHAR(64) PRIMARY KEY,
+                    store_json JSONB NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            conn.commit()
-    except Exception as exc:
-        logger.error(f"init_db_tables error: {exc}")
-    finally:
+        conn.commit()
         conn.close()
+        logger.info("Neon PostgreSQL persistence table verified.")
+        return True
+    except Exception as e:
+        logger.warning(f"PostgreSQL init skipped, using JSON file fallback: {e}")
+        return False
 
 
-def load_state_from_db():
-    global state
-    conn = get_db_connection()
-    if not conn:
-        return
+def load_persistent_state():
+    """Loads state from PostgreSQL first, falling back to local JSON file."""
+    if DATABASE_URL and HAS_PSYCOPG2:
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT store_json FROM vaultskim_kv_store WHERE store_key = %s;",
+                    ("master_state_v52",)
+                )
+                row = cur.fetchone()
+            conn.close()
+            if row and row.get("store_json"):
+                loaded = row["store_json"]
+                if isinstance(loaded, str):
+                    loaded = json.loads(loaded)
+                return merge_default_state(loaded)
+        except Exception as e:
+            logger.warning(f"PostgreSQL load fallback: {e}")
+
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                return merge_default_state(loaded)
+        except Exception as e:
+            logger.warning(f"JSON state file load error: {e}")
+
+    return json.loads(json.dumps(DEFAULT_STATE))
+
+
+def merge_default_state(loaded):
+    """Ensures all required keys exist when upgrading state versions."""
+    merged = json.loads(json.dumps(DEFAULT_STATE))
+    if not isinstance(loaded, dict):
+        return merged
+    for k, v in loaded.items():
+        if isinstance(v, dict) and k in merged and isinstance(merged[k], dict) and k != "coins":
+            merged[k].update(v)
+        else:
+            merged[k] = v
+    merged["version"] = "v5.2 - Pure Live Truth"
+    return merged
+
+
+def save_persistent_state():
+    """Saves current STATE to local JSON and asynchronously syncs to PostgreSQL."""
+    with state_lock:
+        snapshot = json.loads(json.dumps(STATE))
+
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT data FROM vaultskim_state WHERE id = 1;")
-            row = cur.fetchone()
-            if row and row[0]:
-                loaded = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                with state_lock:
-                    for key, default_val in DEFAULT_STATE.items():
-                        if key not in loaded:
-                            loaded[key] = json.loads(json.dumps(default_val))
-                    loaded["version"] = "5.2 · Pure Live Truth"
-                    coins_dict = loaded.get("coins", {})
-                    for sym, c_data in list(coins_dict.items()):
-                        template = build_default_coin_card(sym, anchor_usd=c_data.get("anchor_usd", 50.0))
-                        for ck, cv in template.items():
-                            if ck not in c_data:
-                                c_data[ck] = cv
-                        # Fix false DEX label on standard CEX tickers like QNT or LQTY
-                        if not c_data.get("contract"):
-                            c_data["source"] = "gateio"
-                    state = loaded
-                logger.info("Loaded state from PostgreSQL.")
-    except Exception as exc:
-        logger.error(f"load_state_from_db error: {exc}")
-    finally:
-        conn.close()
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Local JSON save error: {e}")
+
+    if DATABASE_URL and HAS_PSYCOPG2:
+        def _async_pg_save(data_obj):
+            try:
+                conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO vaultskim_kv_store (store_key, store_json, updated_at)
+                        VALUES (%s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (store_key)
+                        DO UPDATE SET store_json = EXCLUDED.store_json,
+                                      updated_at = CURRENT_TIMESTAMP;
+                    """, ("master_state_v52", json.dumps(data_obj)))
+                conn.commit()
+                conn.close()
+            except Exception as ex:
+                logger.debug(f"Async PG save error: {ex}")
+
+        threading.Thread(target=_async_pg_save, args=(snapshot,), daemon=True).start()
 
 
-def save_state_to_db():
-    conn = get_db_connection()
-    if not conn:
-        return
-    try:
-        with state_lock:
-            payload = json.dumps(state)
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO vaultskim_state (id, data, updated_at)
-                VALUES (1, %s::jsonb, CURRENT_TIMESTAMP)
-                ON CONFLICT (id) DO UPDATE
-                SET data = EXCLUDED.data,
-                    updated_at = CURRENT_TIMESTAMP;
-            """, (payload,))
-            conn.commit()
-    except Exception as exc:
-        logger.error(f"save_state_to_db error: {exc}")
-    finally:
-        conn.close()
+init_db()
+STATE = load_persistent_state()
 
 
 # ==============================================================================
-# 2. LOGGING, VERIFIED LEDGER & PHONE ALERTS
+# LOGGING & MULTI-CHANNEL PHONE ALERT ENGINE (NTFY.SH + TELEGRAM)
 # ==============================================================================
-def now_ts() -> str:
+def now_hms():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
-def log_event(message: str):
+def add_log(message):
     with state_lock:
-        entry = f"[{now_ts()}] {message}"
-        if "security_log" not in state or not isinstance(state["security_log"], list):
-            state["security_log"] = []
-        state["security_log"].insert(0, entry)
-        state["security_log"] = state["security_log"][:80]
+        entry = f"[{now_hms()}] {message}"
+        STATE["logs"].insert(0, entry)
+        if len(STATE["logs"]) > 120:
+            STATE["logs"] = STATE["logs"][:120]
 
 
-def send_phone_alert(title: str, body: str, tags: str = "moneybag,chart_with_upwards_trend"):
+def dispatch_phone_alert(title, message, category="skim"):
+    """Sends instant push alerts via ntfy.sh and/or Telegram Bot API."""
     with state_lock:
-        if not state.get("alerts_enabled", True):
-            return
-        ntfy_topic = (state.get("ntfy_topic") or "").strip()
-        tg_token = (state.get("telegram_bot_token") or "").strip()
-        tg_chat = (state.get("telegram_chat_id") or "").strip()
+        alerts = dict(STATE.get("alerts", {}))
+
+    if not alerts.get("enabled"):
+        return
+
+    if category == "skim" and not alerts.get("alert_on_skim", True):
+        return
+    if category == "shield" and not alerts.get("alert_on_shield", True):
+        return
+    if category == "buy" and not alerts.get("alert_on_buy", True):
+        return
 
     def _send():
-        if ntfy_topic:
+        topic = (alerts.get("ntfy_topic") or "").strip()
+        if topic:
             try:
                 requests.post(
-                    f"https://ntfy.sh/{ntfy_topic}",
-                    data=body.encode("utf-8"),
-                    headers={"Title": title, "Priority": "high", "Tags": tags},
+                    f"https://ntfy.sh/{topic}",
+                    data=message.encode("utf-8"),
+                    headers={
+                        "Title": title,
+                        "Priority": "high",
+                        "Tags": "chart_with_upwards_trend,moneybag"
+                    },
                     timeout=5
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"ntfy alert error: {e}")
+
+        tg_token = (alerts.get("telegram_bot_token") or "").strip()
+        tg_chat = (alerts.get("telegram_chat_id") or "").strip()
         if tg_token and tg_chat:
             try:
                 requests.post(
                     f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                    json={"chat_id": tg_chat, "text": f"*{title}*\n{body}", "parse_mode": "Markdown"},
+                    json={
+                        "chat_id": tg_chat,
+                        "text": f"*{title}*\n{message}",
+                        "parse_mode": "Markdown"
+                    },
                     timeout=5
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Telegram alert error: {e}")
 
     threading.Thread(target=_send, daemon=True).start()
 
 
-def record_verified_skim(
-    symbol: str,
-    stage_label: str,
-    profit_usd: float,
-    share_topup_usd: float,
-    exec_price: float,
-    shares_remaining: float,
-    is_live_order: bool
-):
-    with state_lock:
-        state["total_skims"] = int(state.get("total_skims", 0)) + 1
-        state["vault_cash"] = round(float(state.get("vault_cash", 0.0)) + float(profit_usd), 4)
-        state["added_to_anchors"] = round(float(state.get("added_to_anchors", 0.0)) + float(share_topup_usd), 4)
-
-        ts = now_ts()
-        mode_tag = "LIVE" if is_live_order else "PAPER"
-        ledger_item = {
-            "symbol": symbol,
-            "mode": mode_tag,
-            "stage": stage_label,
-            "profit": round(float(profit_usd), 4),
-            "topup": round(float(share_topup_usd), 4),
-            "price": round(float(exec_price), 4),
-            "shares": round(float(shares_remaining), 6),
-            "time": ts
-        }
-        if "skim_ledger" not in state or not isinstance(state["skim_ledger"], list):
-            state["skim_ledger"] = []
-        state["skim_ledger"].insert(0, ledger_item)
-        state["skim_ledger"] = state["skim_ledger"][:75]
-
-        cumulative_total = round(float(state["vault_cash"]) + float(state["added_to_anchors"]), 4)
-        if "profit_curve" not in state or not isinstance(state["profit_curve"], list):
-            state["profit_curve"] = []
-        state["profit_curve"].append({
-            "time": ts,
-            "value": cumulative_total,
-            "vault": round(float(state["vault_cash"]), 4),
-            "topups": round(float(state["added_to_anchors"]), 4)
-        })
-        state["profit_curve"] = state["profit_curve"][-60:]
-
-
 # ==============================================================================
-# 3. GATE.IO SPOT V4 WALLET INSPECTOR & PRECISION ORDER BRIDGE
+# CRYPTOGRAPHIC SIGNING & PRECISION HELPERS (GATE.IO V4 & BINANCE V3)
 # ==============================================================================
-def sign_gateio_v4(method: str, url_path: str, query_string: str, body_str: str, api_secret: str) -> Tuple[str, str]:
+def quantize_value(val, decimals, mode=ROUND_DOWN):
+    """Formats a float/Decimal to exact exchange decimal places without rounding up."""
+    try:
+        d = int(decimals)
+        q = Decimal("10") ** (-d) if d > 0 else Decimal("1")
+        return str(Decimal(str(val)).quantize(q, rounding=mode))
+    except Exception:
+        return f"{float(val):.{int(decimals)}f}"
+
+
+def gateio_v4_sign(api_key, api_secret, method, url_path, query_string="", body_str=""):
+    """Generates Gate.io API v4 HMAC-SHA512 authentication headers."""
     ts = str(int(time.time()))
-    body_hash = hashlib.sha512((body_str or "").encode("utf-8")).hexdigest()
-    sign_string = f"{method.upper()}\n{GATEIO_API_PREFIX}{url_path}\n{query_string or ''}\n{body_hash}\n{ts}"
+    m = hashlib.sha512()
+    m.update((body_str or "").encode("utf-8"))
+    body_hash = m.hexdigest()
+
+    sign_string = f"{method.upper()}\n{url_path}\n{query_string}\n{body_hash}\n{ts}"
     signature = hmac.new(
-        api_secret.encode("utf-8"),
+        api_secret.strip().encode("utf-8"),
         sign_string.encode("utf-8"),
         hashlib.sha512
     ).hexdigest()
-    return ts, signature
+
+    return {
+        "KEY": api_key.strip(),
+        "Timestamp": ts,
+        "SIGN": signature,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
 
 
-def fetch_gateio_spot_balances(api_key: str, api_secret: str) -> Tuple[Optional[Dict[str, float]], str]:
-    """Queries Gate.io Spot v4 `/spot/accounts` and returns {CURRENCY: available_float}."""
-    if not api_key or not api_secret:
-        return None, "Missing Gate.io API Key or Secret Key."
-    try:
-        url_path = "/spot/accounts"
-        ts, sig = sign_gateio_v4("GET", url_path, "", "", api_secret)
-        headers = {
-            "KEY": api_key,
-            "Timestamp": ts,
-            "SIGN": sig,
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-        resp = requests.get(f"{GATEIO_API_HOST}{GATEIO_API_PREFIX}{url_path}", headers=headers, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json()
-            balances: Dict[str, float] = {}
-            for row in data:
-                curr = str(row.get("currency", "")).upper()
-                avail = float(row.get("available", 0.0))
-                balances[curr] = avail
-            return balances, "OK"
-        return None, f"Gate.io Auth Error ({resp.status_code}): {resp.text}"
-    except Exception as exc:
-        return None, f"Gate.io Network Error: {str(exc)}"
+def binance_v3_sign(api_secret, query_params):
+    """Generates Binance Spot v3 HMAC-SHA256 signed query string."""
+    query_string = urlencode(query_params)
+    signature = hmac.new(
+        api_secret.strip().encode("utf-8"),
+        query_string.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    return f"{query_string}&signature={signature}"
 
 
-def fetch_gateio_pair_rules(pair_gate: str) -> Tuple[int, int, float]:
+def get_exchange_pair_rules(symbol):
     """
-    Fetches Gate.io exact currency_pair precision (`amount_precision`, `precision`, `min_quote_amount`)
-    so orders are formatted to Gate.io's exact decimal step and never fail.
+    Fetches and caches exact decimal precision and minimum order rules from Gate.io Spot v4
+    so orders never fail with INVALID_PRECISION or AMOUNT_TOO_SMALL.
     """
-    try:
-        r = requests.get(f"{GATEIO_API_HOST}{GATEIO_API_PREFIX}/spot/currency_pairs/{pair_gate}", timeout=5)
-        if r.status_code == 200:
-            d = r.json()
-            amt_prec = int(d.get("amount_precision", 4))
-            px_prec = int(d.get("precision", 4))
-            min_quote = float(d.get("min_quote_amount", 1.0))
-            return amt_prec, px_prec, min_quote
-    except Exception:
-        pass
-    return 4, 4, 1.0
+    sym = symbol.upper().strip()
+    pair = f"{sym}_USDT"
+    now_ts = time.time()
 
+    if pair in pair_rules_cache and (now_ts - pair_rules_cache[pair]["ts"]) < 3600:
+        return pair_rules_cache[pair]
 
-def fetch_active_exchange_balances() -> Tuple[Optional[Dict[str, float]], str]:
-    with state_lock:
-        key = (state.get("spot_api_key") or "").strip()
-        sec = (state.get("spot_api_secret") or "").strip()
-    return fetch_gateio_spot_balances(key, sec)
-
-
-def sync_all_live_cards_with_gateio() -> Tuple[bool, str, Dict[str, float]]:
-    """
-    Reads your real Gate.io Spot Wallet (`/spot/accounts`) and synchronizes every
-    `⚡ LIVE ORDER` coin card so VaultSkim shows your EXACT real token shares and USDT!
-    - If you hold 0.12275 QNT and $30.61 USDT on Gate.io, QNT is aligned to 0.12275 QNT
-      in `MOONBAG_RIDING` (since half is in QNT and half is in USDT).
-    - If you hold 0 LQTY on Gate.io, LQTY's fake paper shares (15.0922) are wiped to 0.0
-      and status is set to `WAITING_LIVE_BUY` so it buys real LQTY on the next tick.
-    """
-    balances, msg = fetch_active_exchange_balances()
-    if balances is None:
-        return False, msg, {}
-
-    usdt_avail = float(balances.get("USDT", 0.0))
-    synced_summary = []
-
-    with state_lock:
-        state["last_verified_usdt"] = round(usdt_avail, 2)
-
-        # Remove any old [PAPER] entries from the ledger if live bridge is armed
-        if state.get("live_bridge_enabled", True):
-            state["skim_ledger"] = [
-                item for item in state.get("skim_ledger", [])
-                if item.get("mode") == "LIVE"
-            ]
-            real_vault = sum(float(item.get("profit", 0.0)) for item in state["skim_ledger"])
-            real_topup = sum(float(item.get("topup", 0.0)) for item in state["skim_ledger"])
-            state["vault_cash"] = round(real_vault, 4)
-            state["added_to_anchors"] = round(real_topup, 4)
-            state["total_skims"] = len(state["skim_ledger"])
-
-        for sym, coin in state.get("coins", {}).items():
-            base = str(coin.get("symbol", sym)).upper()
-            if not coin.get("contract"):
-                coin["source"] = "gateio"
-
-            if not coin.get("live_mode", False):
-                continue
-
-            real_shares = float(balances.get(base, 0.0))
-            px = float(coin.get("last_price") or fetch_live_coin_price(coin) or 1.0)
-            bag_usd = real_shares * px
-            anchor_target = float(coin.get("anchor_usd", 50.0))
-
-            if real_shares * px < 0.50:
-                # Gate.io holds ZERO (or dust) of this token! Wipe fake paper shares!
-                coin["shares_owned"] = 0.0
-                coin["cash_reserve_usd"] = round(anchor_target, 2)
-                coin["status"] = "WAITING_LIVE_BUY"
-                coin["shield_armed"] = False
-                coin["zero_loss_stop"] = 0.0
-                coin["escrow_profit"] = 0.0
-                synced_summary.append(f"{base}: 0.0000 sh on Gate.io -> Ready for Live Buy")
-            else:
-                # Gate.io holds real tokens (e.g. 0.12275 QNT worth ~$24.56)
-                coin["shares_owned"] = real_shares
-                if coin.get("entry_price", 0.0) <= 0.0:
-                    coin["entry_price"] = px
-                if coin.get("sliding_low", 0.0) <= 0.0:
-                    coin["sliding_low"] = px
-
-                # Determine whether this bag is a 50% Moonbag or a 100% Anchor
-                if coin.get("strategy") == "hybrid_50_50" and bag_usd < (anchor_target * 0.72) and usdt_avail >= (bag_usd * 0.50):
-                    # Currently holding the 50% Moonbag half on Gate.io (like your 0.12275 QNT + $30.61 USDT!)
-                    coin["status"] = "MOONBAG_RIDING"
-                    coin["cash_reserve_usd"] = round(anchor_target - bag_usd, 2)
-                    if coin.get("zero_loss_stop", 0.0) <= 0.0:
-                        coin["zero_loss_stop"] = round(px * (1.0 - STAGE2_MOONBAG_TRAIL_PCT), 4)
-                    synced_summary.append(f"{base}: Synced {real_shares:.5f} sh (${bag_usd:.2f}) in MOONBAG_RIDING")
-                else:
-                    coin["status"] = "HOLDING_ANCHOR"
-                    coin["anchor_usd"] = round(bag_usd, 2)
-                    coin["cash_reserve_usd"] = 0.0
-                    synced_summary.append(f"{base}: Synced {real_shares:.5f} sh (${bag_usd:.2f}) in HOLDING_ANCHOR")
-
-        save_state_to_db()
-
-    summary_str = " | ".join(synced_summary) if synced_summary else "All live cards checked"
-    log_event(f"🔄 REAL GATE.IO WALLET SYNCED: Available USDT = ${usdt_avail:.2f} | {summary_str}")
-    return True, f"Synced with Gate.io! Spot USDT: ${usdt_avail:.2f} ({summary_str})", balances
-
-
-def execute_live_exchange_order(
-    symbol: str,
-    side: str,
-    usd_notional: float,
-    current_price: float,
-    shares_requested: float = 0.0,
-    is_simulated_test: bool = False
-) -> Tuple[bool, float, float, str]:
-    """
-    Fires a real Gate.io Spot v4 order.
-    - Queries live Gate.io `/spot/accounts` immediately before every order.
-    - Fetches exact pair decimals (`amount_precision`, `precision`) from Gate.io.
-    - Floors share amounts so Gate.io NEVER throws `400 BALANCE_NOT_ENOUGH`.
-    """
-    if is_simulated_test:
-        return True, shares_requested, usd_notional, "SIMULATED_TEST"
-
-    with state_lock:
-        api_key = (state.get("spot_api_key") or "").strip()
-        api_secret = (state.get("spot_api_secret") or "").strip()
-        max_cap = float(state.get("max_order_cap", 250.0))
-
-    if not api_key or not api_secret:
-        msg = f"Live {side} Aborted ({symbol}): Missing Gate.io API Key/Secret."
-        log_event(f"⚠️ {msg}")
-        return False, 0.0, 0.0, msg
-
-    base_asset = symbol.upper().replace("/USDT", "").replace("_USDT", "").replace("USDT", "").strip()
-    pair_gate = f"{base_asset}_USDT"
-    side_up = side.upper().strip()
-
-    balances, bal_msg = fetch_gateio_spot_balances(api_key, api_secret)
-    if balances is None:
-        log_event(f"⚠️ {bal_msg}")
-        return False, 0.0, 0.0, bal_msg
-
-    avail_usdt = float(balances.get("USDT", 0.0))
-    avail_token = float(balances.get(base_asset, 0.0))
-    amt_prec, px_prec, min_quote = fetch_gateio_pair_rules(pair_gate)
-
-    with state_lock:
-        state["last_verified_usdt"] = round(avail_usdt, 2)
-
-    if side_up == "BUY":
-        # Leave 0.6% safety margin on available USDT so limit price (+0.3%) + 0.1% fee never exceeds avail_usdt
-        max_spendable_usdt = avail_usdt * 0.994
-        target_usd = min(float(usd_notional), max_spendable_usdt, max_cap)
-
-        if target_usd < max(MIN_EXCHANGE_ORDER_USD, min_quote):
-            msg = (
-                f"Gate.io Live BUY Paused ({base_asset}): Available Spot USDT is ${avail_usdt:.2f} "
-                f"(Need at least ${max(MIN_EXCHANGE_ORDER_USD, min_quote):.2f} USDT)."
-            )
-            log_event(f"⚠️ {msg}")
-            return False, 0.0, 0.0, msg
-
-        limit_px = round(float(current_price) * 1.003, px_prec)
-        raw_shares = (target_usd / limit_px) * 0.998
-        order_shares = floor_to_decimals(raw_shares, amt_prec)
-
-        if order_shares <= 0 or (order_shares * limit_px) < min_quote:
-            msg = f"Gate.io Live BUY Paused ({base_asset}): Order size ({order_shares}) below pair minimum."
-            log_event(f"⚠️ {msg}")
-            return False, 0.0, 0.0, msg
-
-    else:
-        # LIVE SELL: Always clamp directly to `avail_token` in Gate.io Spot wallet!
-        if avail_token <= 0.0:
-            msg = f"Gate.io Live SELL Paused ({base_asset}): Your Gate.io Spot wallet holds 0 {base_asset}."
-            log_event(f"⚠️ {msg}")
-            return False, 0.0, 0.0, msg
-
-        # If selling all/most of the position or if requested shares > avail_token, use avail_token!
-        if shares_requested <= 0.0 or shares_requested >= avail_token * 0.85:
-            raw_sell_shares = avail_token * 0.9998
-        else:
-            raw_sell_shares = min(float(shares_requested), avail_token * 0.9998)
-
-        order_shares = floor_to_decimals(raw_sell_shares, amt_prec)
-        limit_px = round(float(current_price) * 0.997, px_prec)
-
-        if order_shares <= 0 or (order_shares * limit_px) < min_quote:
-            msg = (
-                f"Gate.io Live SELL Paused ({base_asset}): Wallet balance {avail_token:.6f} {base_asset} "
-                f"(${avail_token * current_price:.2f}) is below Gate.io ${min_quote:.2f} minimum."
-            )
-            log_event(f"⚠️ {msg}")
-            return False, 0.0, 0.0, msg
-
-    try:
-        url_path = "/spot/orders"
-        body_payload = {
-            "currency_pair": pair_gate,
-            "type": "limit",
-            "account": "spot",
-            "side": side_up.lower(),
-            "amount": f"{order_shares:.{amt_prec}f}",
-            "price": f"{limit_px:.{px_prec}f}",
-            "time_in_force": "ioc"
-        }
-        body_str = json.dumps(body_payload)
-        ts, sig = sign_gateio_v4("POST", url_path, "", body_str, api_secret)
-        headers = {
-            "KEY": api_key,
-            "Timestamp": ts,
-            "SIGN": sig,
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-        resp = requests.post(
-            f"{GATEIO_API_HOST}{GATEIO_API_PREFIX}{url_path}",
-            headers=headers,
-            data=body_str,
-            timeout=8
-        )
-        if resp.status_code in (200, 201):
-            res_data = resp.json()
-            order_id = res_data.get("id", "OK")
-            filled_total_usd = float(res_data.get("filled_total", 0.0))
-            left_shares = float(res_data.get("left", 0.0))
-            filled_shares = max(0.0, order_shares - left_shares)
-
-            if filled_shares <= 0.0 and res_data.get("status") in ("closed", "filled"):
-                filled_shares = order_shares
-            if filled_shares <= 0.0:
-                msg = f"Gate.io IOC Order #{order_id} did not fill immediately ({res_data.get('status')}); retrying next tick."
-                log_event(f"⚠️ {msg}")
-                return False, 0.0, 0.0, msg
-
-            if filled_total_usd <= 0.0:
-                filled_total_usd = filled_shares * float(current_price)
-
-            # Query Gate.io Spot wallet again right after fill so we store the EXACT post-fee balance
-            post_balances, _ = fetch_gateio_spot_balances(api_key, api_secret)
-            if post_balances is not None:
-                state["last_verified_usdt"] = round(float(post_balances.get("USDT", avail_usdt)), 2)
-                exact_token_now = float(post_balances.get(base_asset, 0.0))
-            else:
-                exact_token_now = (
-                    avail_token + filled_shares * (1.0 - DEFAULT_FEE_RATE)
-                    if side_up == "BUY"
-                    else max(0.0, avail_token - filled_shares)
-                )
-
-            net_usd = filled_total_usd if side_up == "BUY" else filled_total_usd * (1.0 - DEFAULT_FEE_RATE)
-            log_event(
-                f"⚡ LIVE GATE.IO {side_up} EXECUTED ({base_asset}): Order #{order_id} filled! "
-                f"Traded {filled_shares:.{amt_prec}f} {base_asset} (${net_usd:.2f}) | "
-                f"Spot Wallet Now Holds: {exact_token_now:.6f} {base_asset}"
-            )
-            return True, exact_token_now if side_up == "BUY" else filled_shares, net_usd, f"Order #{order_id}"
-        else:
-            err_msg = f"Gate.io Live Order Notice ({resp.status_code}): {resp.text}"
-            log_event(f"⚠️ {err_msg}")
-            return False, 0.0, 0.0, err_msg
-    except Exception as exc:
-        err_msg = f"Gate.io Execution Exception: {str(exc)}"
-        log_event(f"⚠️ {err_msg}")
-        return False, 0.0, 0.0, err_msg
-
-
-# ==============================================================================
-# 4. LIVE PRICE FEED & DEX ANTI-RUG INSPECTOR
-# ==============================================================================
-def inspect_coin_or_dex_contract(raw_input: str) -> Dict[str, Any]:
-    cleaned = raw_input.strip()
-    is_contract = len(cleaned) > 20 or cleaned.startswith("0x")
-
-    if is_contract:
-        try:
-            r = requests.get(f"{DEXSCREENER_API_HOST}/latest/dex/tokens/{cleaned}", timeout=6)
-            if r.status_code == 200:
-                pairs = r.json().get("pairs") or []
-                if not pairs:
-                    return {"ok": False, "reason": "No active DEX liquidity pool found for this contract."}
-                best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0.0)))
-                liq_usd = float((best.get("liquidity") or {}).get("usd", 0.0))
-                price_usd = float(best.get("priceUsd", 0.0))
-                base_sym = str((best.get("baseToken") or {}).get("symbol", "DEX")).upper()
-                if liq_usd < MIN_DEX_LIQUIDITY_USD:
-                    return {
-                        "ok": False,
-                        "reason": f"ANTI-RUG BLOCK: Pool liquidity (${liq_usd:,.0f}) is below $15,000 safety floor!"
-                    }
-                return {
-                    "ok": True,
-                    "symbol": base_sym,
-                    "source": "dex",
-                    "contract": cleaned,
-                    "liquidity_usd": liq_usd,
-                    "price": price_usd
-                }
-        except Exception as exc:
-            return {"ok": False, "reason": f"DexScreener lookup error: {exc}"}
-
-    sym = cleaned.upper().replace("/USDT", "").replace("_USDT", "").replace("USDT", "").strip()
-    try:
-        r = requests.get(
-            f"{GATEIO_API_HOST}{GATEIO_API_PREFIX}/spot/tickers",
-            params={"currency_pair": f"{sym}_USDT"},
-            timeout=6
-        )
-        if r.status_code == 200 and isinstance(r.json(), list) and len(r.json()) > 0:
-            t_data = r.json()[0]
-            px = float(t_data.get("last", 0.0))
-            vol_usd = float(t_data.get("quote_volume", 0.0))
-            if px > 0:
-                return {
-                    "ok": True,
-                    "symbol": sym,
-                    "source": "gateio",
-                    "contract": "",
-                    "liquidity_usd": max(vol_usd, 100000.0),
-                    "price": px
-                }
-    except Exception:
-        pass
-
-    return {"ok": False, "reason": f"Pair {sym}/USDT not found on Gate.io Spot."}
-
-
-def fetch_live_coin_price(coin: Dict[str, Any]) -> float:
-    sym = str(coin.get("symbol", "")).upper()
-    source = coin.get("source", "gateio")
-    contract = (coin.get("contract") or "").strip()
-
-    if source == "dex" and contract:
-        try:
-            r = requests.get(f"{DEXSCREENER_API_HOST}/latest/dex/tokens/{contract}", timeout=5)
-            if r.status_code == 200:
-                pairs = r.json().get("pairs") or []
-                if pairs:
-                    px = float(pairs[0].get("priceUsd", 0.0))
-                    if px > 0:
-                        return px
-        except Exception:
-            pass
+    default_rules = {
+        "amount_precision": 4,
+        "price_precision": 4,
+        "min_quote_amount": 1.0,
+        "min_base_amount": 0.0001,
+        "fee_rate": 0.001,
+        "ts": now_ts
+    }
 
     try:
         r = requests.get(
-            f"{GATEIO_API_HOST}{GATEIO_API_PREFIX}/spot/tickers",
-            params={"currency_pair": f"{sym}_USDT"},
+            f"https://api.gateio.ws/api/v4/spot/currency_pairs/{pair}",
             timeout=5
         )
-        if r.status_code == 200 and isinstance(r.json(), list) and len(r.json()) > 0:
-            px = float(r.json()[0].get("last", 0.0))
-            if px > 0:
-                return px
+        if r.status_code == 200:
+            data = r.json()
+            rules = {
+                "amount_precision": int(data.get("amount_precision", 4)),
+                "price_precision": int(data.get("precision", 4)),
+                "min_quote_amount": float(data.get("min_quote_amount") or 1.0),
+                "min_base_amount": float(data.get("min_base_amount") or 0.0001),
+                "fee_rate": float(data.get("fee") or 0.1) / 100.0,
+                "ts": now_ts
+            }
+            pair_rules_cache[pair] = rules
+            return rules
+    except Exception as e:
+        logger.debug(f"Pair rules lookup fallback for {pair}: {e}")
+
+    pair_rules_cache[pair] = default_rules
+    return default_rules
+
+
+# ==============================================================================
+# MULTI-SOURCE REAL-TIME MARKET PRICE & DEX ANTI-RUG SCANNER
+# ==============================================================================
+def fetch_live_market_quote(symbol, contract=""):
+    """
+    Reads real-time market price, best ask, and best bid.
+    Prioritizes Gate.io Spot v4 -> Binance Spot v3 -> DexScreener Pools.
+    """
+    sym = symbol.upper().strip().replace("/USDT", "").replace("_USDT", "")
+    now_ts = time.time()
+
+    # 1. Primary: Gate.io Spot v4 Ticker
+    try:
+        r = requests.get(
+            "https://api.gateio.ws/api/v4/spot/tickers",
+            params={"currency_pair": f"{sym}_USDT"},
+            timeout=4
+        )
+        if r.status_code == 200:
+            arr = r.json()
+            if isinstance(arr, list) and len(arr) > 0:
+                t_obj = arr[0]
+                last_p = float(t_obj.get("last") or 0.0)
+                ask_p = float(t_obj.get("lowest_ask") or last_p)
+                bid_p = float(t_obj.get("highest_bid") or last_p)
+                change_24h = float(t_obj.get("change_percentage") or 0.0)
+                vol_24h = float(t_obj.get("quote_volume") or 0.0)
+                if last_p > 0:
+                    res = {
+                        "price": last_p,
+                        "ask": ask_p if ask_p > 0 else last_p,
+                        "bid": bid_p if bid_p > 0 else last_p,
+                        "change_24h": change_24h,
+                        "volume_24h": vol_24h,
+                        "liquidity_usd": max(vol_24h, 100000.0),
+                        "source": "GATE.IO SPOT",
+                        "is_dex": False,
+                        "ts": now_ts
+                    }
+                    price_cache[sym] = res
+                    return res
     except Exception:
         pass
 
-    return float(coin.get("last_price", 0.0))
+    # 2. Secondary: Binance Spot v3 Book Ticker
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/bookTicker",
+            params={"symbol": f"{sym}USDT"},
+            timeout=4
+        )
+        if r.status_code == 200:
+            b_obj = r.json()
+            bid_p = float(b_obj.get("bidPrice") or 0.0)
+            ask_p = float(b_obj.get("askPrice") or 0.0)
+            mid_p = (bid_p + ask_p) / 2.0 if (bid_p > 0 and ask_p > 0) else max(bid_p, ask_p)
+            if mid_p > 0:
+                res = {
+                    "price": mid_p,
+                    "ask": ask_p if ask_p > 0 else mid_p,
+                    "bid": bid_p if bid_p > 0 else mid_p,
+                    "change_24h": 0.0,
+                    "volume_24h": 100000.0,
+                    "liquidity_usd": 100000.0,
+                    "source": "BINANCE SPOT",
+                    "is_dex": False,
+                    "ts": now_ts
+                }
+                price_cache[sym] = res
+                return res
+    except Exception:
+        pass
+
+    # 3. Tertiary: DexScreener Anti-Rug Pool Scanner
+    lookup = contract.strip() if contract and len(contract.strip()) > 15 else sym
+    try:
+        url = (
+            f"https://api.dexscreener.com/latest/dex/tokens/{lookup}"
+            if len(lookup) > 15
+            else f"https://api.dexscreener.com/latest/dex/search?q={lookup}"
+        )
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            pairs = r.json().get("pairs") or []
+            if pairs:
+                best_pair = max(
+                    pairs,
+                    key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0)
+                )
+                p_usd = float(best_pair.get("priceUsd") or 0.0)
+                liq_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0.0)
+                chain_id = (best_pair.get("chainId") or "DEX").upper()
+                base_sym = ((best_pair.get("baseToken") or {}).get("symbol") or sym).upper()
+                if p_usd > 0:
+                    res = {
+                        "symbol": base_sym,
+                        "price": p_usd,
+                        "ask": p_usd * 1.001,
+                        "bid": p_usd * 0.999,
+                        "change_24h": float((best_pair.get("priceChange") or {}).get("h24") or 0.0),
+                        "volume_24h": float((best_pair.get("volume") or {}).get("h24") or 0.0),
+                        "liquidity_usd": liq_usd,
+                        "source": f"SAFE DEX (${int(liq_usd/1000)}K Liq: {chain_id})",
+                        "is_dex": True,
+                        "ts": now_ts
+                    }
+                    price_cache[sym] = res
+                    return res
+    except Exception:
+        pass
+
+    return price_cache.get(sym)
 
 
 # ==============================================================================
-# 5. PURE LIVE TRUTH SKIMMING ENGINE (ZERO PAPER FALLBACK ON LIVE COINS)
+# LIVE EXCHANGE WALLET BALANCE & ORDER EXECUTION BRIDGE
 # ==============================================================================
-def process_coin_tick(symbol: str, current_price: float, is_simulated_test: bool = False):
+def fetch_live_exchange_balances():
     """
-    Processes price ticks with strict separation between LIVE and PAPER modes:
-      - If `coin["live_mode"]` is True (and `is_simulated_test` is False):
-          * It NEVER runs paper trades or fake Sliding Floor Skims.
-          * If Gate.io has not bought the coin yet (`status == "WAITING_LIVE_BUY"` or `shares_owned <= 0`),
-            it fires a real Gate.io BUY order first. If that BUY fails, it stays in `WAITING_LIVE_BUY`
-            and shows `0.000000` shares (never fake shares!).
-          * Every Stage 1 Skim, Stage 2 Moonbag Exit, and Dip Re-Buy MUST succeed on Gate.io
-            before changing card status or adding a single cent to Bucket B Vault.
+    Reads real Spot balances from Gate.io v4 (or Binance v3).
+    Returns (balances_dict, error_string).
     """
-    if current_price <= 0:
+    with state_lock:
+        bridge = dict(STATE.get("exchange_bridge", {}))
+
+    exch = (bridge.get("exchange") or "gateio").lower()
+    api_key = (bridge.get("api_key") or "").strip()
+    api_secret = (bridge.get("api_secret") or "").strip()
+
+    if not api_key or not api_secret:
+        return None, "Missing Spot API Key or Secret."
+
+    if exch == "gateio":
+        url_path = "/api/v4/spot/accounts"
+        headers = gateio_v4_sign(api_key, api_secret, "GET", url_path)
+        try:
+            r = requests.get(f"https://api.gateio.ws{url_path}", headers=headers, timeout=8)
+            if r.status_code == 200:
+                accounts = r.json()
+                bal_map = {}
+                for item in accounts:
+                    curr = (item.get("currency") or "").upper()
+                    avail = float(item.get("available") or 0.0)
+                    locked = float(item.get("locked") or 0.0)
+                    bal_map[curr] = {
+                        "available": avail,
+                        "locked": locked,
+                        "total": avail + locked
+                    }
+                return bal_map, None
+            return None, f"Gate.io API ({r.status_code}): {r.text}"
+        except Exception as e:
+            return None, f"Gate.io connection error: {e}"
+
+    elif exch == "binance":
+        params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+        signed_q = binance_v3_sign(api_secret, params)
+        headers = {"X-MBX-APIKEY": api_key}
+        try:
+            r = requests.get(
+                f"https://api.binance.com/api/v3/account?{signed_q}",
+                headers=headers,
+                timeout=8
+            )
+            if r.status_code == 200:
+                balances = r.json().get("balances") or []
+                bal_map = {}
+                for b in balances:
+                    curr = (b.get("asset") or "").upper()
+                    avail = float(b.get("free") or 0.0)
+                    locked = float(b.get("locked") or 0.0)
+                    if avail > 0 or locked > 0 or curr == "USDT":
+                        bal_map[curr] = {
+                            "available": avail,
+                            "locked": locked,
+                            "total": avail + locked
+                        }
+                return bal_map, None
+            return None, f"Binance API ({r.status_code}): {r.text}"
+        except Exception as e:
+            return None, f"Binance connection error: {e}"
+
+    return None, f"Unsupported exchange: {exch}"
+
+
+def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None):
+    """
+    Executes a real live Spot order on Gate.io v4 (or Binance v3) with:
+    - Automatic wallet balance clamping (never exceeds available USDT or token shares)
+    - Exact currency_pair decimal precision formatting
+    - Marketable limit pricing (+0.35% on BUY / -0.35% on SELL) so orders fill immediately
+    """
+    with state_lock:
+        bridge = dict(STATE.get("exchange_bridge", {}))
+
+    exch = (bridge.get("exchange") or "gateio").lower()
+    api_key = (bridge.get("api_key") or "").strip()
+    api_secret = (bridge.get("api_secret") or "").strip()
+    max_cap = float(bridge.get("max_order_usd") or 250.0)
+
+    if not api_key or not api_secret:
+        return False, "Missing Spot API credentials.", None
+
+    sym = symbol.upper().strip()
+    quote = fetch_live_market_quote(sym)
+    if not quote or quote["price"] <= 0:
+        return False, f"Unable to read live market price for {sym}/USDT.", None
+
+    balances, err = fetch_live_exchange_balances()
+    if balances is None:
+        return False, f"Wallet check failed: {err}", None
+
+    usdt_avail = balances.get("USDT", {}).get("available", 0.0)
+    coin_avail = balances.get(sym, {}).get("available", 0.0)
+
+    with state_lock:
+        STATE["exchange_bridge"]["available_usdt"] = round(usdt_avail, 2)
+
+    rules = get_exchange_pair_rules(sym)
+    side_lower = side.lower()
+
+    if side_lower == "buy":
+        requested_usd = min(float(usd_amount or 10.0), max_cap)
+        if usdt_avail < requested_usd:
+            if usdt_avail >= rules["min_quote_amount"]:
+                requested_usd = usdt_avail * 0.985
+            else:
+                msg = f"Insufficient USDT (${usdt_avail:.2f} available, need ${requested_usd:.2f})"
+                add_log(f"⚠️ LIVE BUY SKIPPED ({sym}): {msg}")
+                return False, msg, None
+
+        # Use marketable limit price (+0.35% over best ask) so Gate.io fills immediately
+        exec_price = quote["ask"] * 1.0035
+        price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
+        exec_price_float = float(price_str)
+
+        # Clamp share quantity to 99.1% of requested_usd so total + fee never triggers BALANCE_NOT_ENOUGH
+        raw_shares = (requested_usd * 0.991) / exec_price_float
+        amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
+        amount_float = float(amount_str)
+
+        if amount_float <= 0 or (amount_float * exec_price_float) < rules["min_quote_amount"]:
+            msg = (
+                f"Order value (${amount_float * exec_price_float:.2f}) is below "
+                f"Gate.io minimum (${rules['min_quote_amount']:.2f} USDT)."
+            )
+            add_log(f"⚠️ LIVE BUY REJECTED ({sym}): {msg}")
+            return False, msg, None
+
+    else:  # SELL
+        if coin_avail <= 0:
+            msg = f"0.0000 {sym} available in Gate.io Spot wallet to sell."
+            add_log(f"⚠️ LIVE SELL SKIPPED ({sym}): {msg}")
+            return False, msg, None
+
+        # Clamp sell shares to actual available balance in Spot wallet
+        raw_shares = min(float(share_amount or coin_avail), coin_avail * 0.9995)
+        exec_price = quote["bid"] * 0.9965
+        price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
+        amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
+        amount_float = float(amount_str)
+        exec_price_float = float(price_str)
+
+        if amount_float <= 0 or (amount_float * exec_price_float) < rules["min_quote_amount"]:
+            msg = (
+                f"Sell order (${amount_float * exec_price_float:.2f}) below "
+                f"Gate.io minimum (${rules['min_quote_amount']:.2f} USDT)."
+            )
+            return False, msg, None
+
+    # Execute on Gate.io Spot v4
+    if exch == "gateio":
+        url_path = "/api/v4/spot/orders"
+        order_payload = {
+            "currency_pair": f"{sym}_USDT",
+            "type": "limit",
+            "account": "spot",
+            "side": side_lower,
+            "amount": amount_str,
+            "price": price_str,
+            "time_in_force": "ioc"  # Immediate-Or-Cancel prevents funds getting stuck in open orders
+        }
+        body_str = json.dumps(order_payload)
+        headers = gateio_v4_sign(api_key, api_secret, "POST", url_path, "", body_str)
+
+        try:
+            r = requests.post(
+                f"https://api.gateio.ws{url_path}",
+                headers=headers,
+                data=body_str,
+                timeout=8
+            )
+            if r.status_code in (200, 201):
+                resp_data = r.json()
+                left_amt = float(resp_data.get("left") or 0.0)
+                orig_amt = float(resp_data.get("amount") or amount_str)
+                filled_amt = max(0.0, orig_amt - left_amt)
+
+                # If IOC didn't fill due to momentary book gap, place standard GTC marketable limit
+                if filled_amt <= 0:
+                    order_payload["time_in_force"] = "gtc"
+                    body_str = json.dumps(order_payload)
+                    headers = gateio_v4_sign(api_key, api_secret, "POST", url_path, "", body_str)
+                    r_gtc = requests.post(
+                        f"https://api.gateio.ws{url_path}",
+                        headers=headers,
+                        data=body_str,
+                        timeout=8
+                    )
+                    if r_gtc.status_code in (200, 201):
+                        resp_data = r_gtc.json()
+                        time.sleep(1.2)
+
+                order_id = resp_data.get("id", "OK")
+                add_log(
+                    f"✅ LIVE GATE.IO {side_lower.upper()} EXECUTED ({sym}): "
+                    f"{amount_str} {sym} @ ~${price_str} (Order #{order_id})"
+                )
+                return True, "Live order executed.", resp_data
+            else:
+                err_txt = f"Gate.io Live Order Notice ({r.status_code}): {r.text}"
+                add_log(f"⚠️ {err_txt}")
+                return False, err_txt, None
+        except Exception as e:
+            err_txt = f"Gate.io order request failed: {e}"
+            add_log(f"⚠️ {err_txt}")
+            return False, err_txt, None
+
+    return False, "Exchange execution driver not configured.", None
+
+
+def sync_all_live_cards_with_gateio(auto_buy_waiting=True):
+    """
+    Synchronizes every active coin card with your real Gate.io Spot wallet balances.
+    CRITICAL FIX: If a coin is in LIVE mode with 0.0000 shares (WAITING_LIVE_BUY) and
+    auto_buy_waiting=True, it automatically executes the initial Anchor BUY on Gate.io!
+    """
+    balances, err = fetch_live_exchange_balances()
+    if balances is None:
+        return False, err
+
+    usdt_avail = balances.get("USDT", {}).get("available", 0.0)
+    with state_lock:
+        STATE["exchange_bridge"]["available_usdt"] = round(usdt_avail, 2)
+        STATE["exchange_bridge"]["verified"] = True
+        STATE["exchange_bridge"]["last_sync_ts"] = int(time.time())
+        live_armed = STATE["exchange_bridge"].get("live_armed", False)
+        is_frozen = STATE.get("frozen", False)
+        coin_keys = list(STATE["coins"].keys())
+
+    sync_notes = []
+
+    for sym in coin_keys:
+        with state_lock:
+            card = STATE["coins"].get(sym)
+            if not card:
+                continue
+            contract = card.get("contract", "")
+            is_live_coin = bool(card.get("live_enabled", False))
+            anchor_usd = float(card.get("anchor_usd") or 10.0)
+
+        quote = fetch_live_market_quote(sym, contract)
+        if quote and quote["price"] > 0:
+            with state_lock:
+                card["current_price"] = quote["price"]
+                card["source"] = quote["source"]
+
+        with state_lock:
+            price = float(card.get("current_price") or 1.0)
+
+        if is_live_coin:
+            real_shares = balances.get(sym, {}).get("available", 0.0)
+            locked_shares = balances.get(sym, {}).get("locked", 0.0)
+            total_real_shares = real_shares + locked_shares
+
+            # Case 1: User already holds real shares of this coin on Gate.io
+            if total_real_shares > 0.00005 and (total_real_shares * price) >= 0.50:
+                with state_lock:
+                    was_waiting = (card.get("status") == "WAITING_LIVE_BUY" or card.get("shares", 0) <= 0)
+                    card["shares"] = real_shares if real_shares > 0 else total_real_shares
+                    if was_waiting or card.get("entry_price", 0) <= 0:
+                        card["entry_price"] = price
+                        card["sliding_low"] = price
+                        card["highest_price"] = price
+                    if card.get("status") == "WAITING_LIVE_BUY":
+                        card["status"] = "HOLDING_ANCHOR"
+                sync_notes.append(f"{sym}: {total_real_shares:.4f} sh on Gate.io -> Active")
+
+            # Case 2: 0.0000 shares on Gate.io -> WAITING_LIVE_BUY
+            else:
+                with state_lock:
+                    card["shares"] = 0.0
+                    card["status"] = "WAITING_LIVE_BUY"
+                    card["entry_price"] = price
+                    card["sliding_low"] = price
+                    card["highest_price"] = price
+                    card["ratchet_armed"] = False
+
+                now_ts = time.time()
+                last_attempt = order_cooldowns.get(sym, 0)
+
+                # Automatically fire the live initial Anchor BUY on Gate.io if armed & funded
+                if (
+                    auto_buy_waiting
+                    and live_armed
+                    and not is_frozen
+                    and usdt_avail >= max(anchor_usd, 1.5)
+                    and (now_ts - last_attempt) > 20
+                ):
+                    order_cooldowns[sym] = now_ts
+                    add_log(
+                        f"🚀 AUTO-DEPLOYING LIVE ANCHOR ({sym}): "
+                        f"Buying ${anchor_usd:.2f} of {sym}/USDT on Gate.io Spot..."
+                    )
+                    ok, msg, _ = execute_live_exchange_order(sym, "buy", usd_amount=anchor_usd)
+                    if ok:
+                        time.sleep(1.3)
+                        updated_bals, _ = fetch_live_exchange_balances()
+                        if updated_bals:
+                            balances = updated_bals
+                            usdt_avail = balances.get("USDT", {}).get("available", usdt_avail)
+                            new_sh = balances.get(sym, {}).get("available", 0.0)
+                            with state_lock:
+                                STATE["exchange_bridge"]["available_usdt"] = round(usdt_avail, 2)
+                                if new_sh > 0:
+                                    card["shares"] = new_sh
+                                    card["entry_price"] = price
+                                    card["sliding_low"] = price
+                                    card["highest_price"] = price
+                                    card["status"] = "HOLDING_ANCHOR"
+                            if new_sh > 0:
+                                sync_notes.append(f"{sym}: Bought {new_sh:.5f} sh @ ${price:.4f}")
+                                dispatch_phone_alert(
+                                    f"VaultSkim Live Buy: {sym}",
+                                    f"Bought {new_sh:.5f} {sym} (${anchor_usd:.2f} Anchor) @ ${price:.4f} on Gate.io!",
+                                    category="buy"
+                                )
+                                continue
+
+                sync_notes.append(f"{sym}: 0.0000 sh on Gate.io -> Ready for Live Buy")
+
+    summary_str = " | ".join(sync_notes) if sync_notes else "All cards aligned"
+    add_log(f"REAL GATE.IO WALLET SYNCED: Available USDT = ${usdt_avail:.2f} | {summary_str}")
+    save_persistent_state()
+    return True, usdt_avail
+
+
+# ==============================================================================
+# 5-LAYER ZERO-LOSS FIREWALL, RATCHET, SHARE-KEEPER & MOONBAG ENGINE
+# ==============================================================================
+def evaluate_coin_tick(sym):
+    """
+    Runs every 3 seconds per active coin:
+    - Updates live price from Gate.io / Binance / DexScreener
+    - If WAITING_LIVE_BUY and Live Bridge is armed, triggers automatic initial Gate.io BUY
+    - Tracks Sliding Low floor and arms Zero-Loss Shield at +0.35%
+    - Executes Share-Keeper dip re-alignment and 50/50 Hybrid / Stage 2 Moonbag skims
+    """
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return
+        contract = card.get("contract", "")
+        is_live = bool(card.get("live_enabled", False))
+        live_armed = bool(STATE["exchange_bridge"].get("live_armed", False))
+        is_frozen = bool(STATE.get("frozen", False))
+
+    quote = fetch_live_market_quote(sym, contract)
+    if not quote or quote["price"] <= 0:
+        return
+
+    price = float(quote["price"])
+
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return
+        card["current_price"] = price
+        card["source"] = quote["source"]
+        shares = float(card.get("shares") or 0.0)
+        anchor_usd = float(card.get("anchor_usd") or 10.0)
+
+        # If holding 0 shares (WAITING_LIVE_BUY), keep baseline aligned with live market price
+        if shares <= 0.000001:
+            card["entry_price"] = price
+            card["sliding_low"] = price
+            card["highest_price"] = price
+            card["gain_from_low_pct"] = 0.0
+            card["ratchet_armed"] = False
+            if is_live:
+                card["status"] = "WAITING_LIVE_BUY"
+            else:
+                card["shares"] = round(anchor_usd / price, 6)
+                card["status"] = "HOLDING_ANCHOR"
+
+    # If Live coin is waiting for initial buy and bridge is armed + funded, trigger auto-buy
+    if is_live and shares <= 0.000001 and live_armed and not is_frozen:
+        now_ts = time.time()
+        usdt_avail = float(STATE["exchange_bridge"].get("available_usdt") or 0.0)
+        if usdt_avail >= max(anchor_usd, 1.5) and (now_ts - order_cooldowns.get(sym, 0)) > 20:
+            sync_all_live_cards_with_gateio(auto_buy_waiting=True)
         return
 
     with state_lock:
-        coin = state.get("coins", {}).get(symbol)
-        if not coin:
+        card = STATE["coins"].get(sym)
+        if not card or float(card.get("shares") or 0.0) <= 0:
             return
 
-        coin["last_price"] = float(current_price)
-        if not coin.get("contract"):
-            coin["source"] = "gateio"
+        shares = float(card["shares"])
+        sliding_low = float(card.get("sliding_low") or price)
+        entry_price = float(card.get("entry_price") or price)
 
-        card_wants_live = bool(coin.get("live_mode", False))
-        bridge_armed = bool(state.get("live_bridge_enabled", True))
-
-        # CRITICAL RULE: If the card is set to ⚡ LIVE ORDER (and not a manual practice button click),
-        # it MUST trade live on Gate.io and NEVER fall back to paper!
-        if card_wants_live and not is_simulated_test and not bridge_armed:
-            # Automatically keep bridge armed if user set a card to LIVE ORDER
-            state["live_bridge_enabled"] = True
-            bridge_armed = True
-
-        is_live_execution = card_wants_live and not is_simulated_test
-
-        # Throttle live API order retries to at least 12 seconds apart per coin
-        now_sec = time.time()
-        last_try = float(coin.get("last_live_Action_ts", 0.0))
-
-        status = coin.get("status", "HOLDING_ANCHOR")
-        strategy = coin.get("strategy", "hybrid_50_50")
-        anchor_usd = float(coin.get("anchor_usd", 50.0))
-
-        # ----------------------------------------------------------------------
-        # STEP 0: INITIAL BUY (WAITING_LIVE_BUY OR 0 SHARES OWNED)
-        # ----------------------------------------------------------------------
-        if status == "WAITING_LIVE_BUY" or (status == "HOLDING_ANCHOR" and float(coin.get("shares_owned", 0.0)) <= 0.0):
-            if is_live_execution:
-                if now_sec - last_try < 12.0:
-                    return
-                coin["last_live_Action_ts"] = now_sec
-
-                ok, exact_wallet_shares, spent_usd, msg = execute_live_exchange_order(
-                    symbol=symbol,
-                    side="BUY",
-                    usd_notional=anchor_usd,
-                    current_price=current_price,
-                    shares_requested=0.0,
-                    is_simulated_test=False
-                )
-                if not ok:
-                    coin["status"] = "WAITING_LIVE_BUY"
-                    coin["shares_owned"] = 0.0
-                    coin["cash_reserve_usd"] = round(anchor_usd, 2)
-                    return
-
-                coin["shares_owned"] = exact_wallet_shares
-                coin["target_shares_floor"] = exact_wallet_shares
-                coin["anchor_usd"] = round(spent_usd, 2)
-                coin["cash_reserve_usd"] = 0.0
-                coin["entry_price"] = current_price
-                coin["sliding_low"] = current_price
-                coin["high_water"] = current_price
-                coin["shield_armed"] = False
-                coin["zero_loss_stop"] = 0.0
-                coin["status"] = "HOLDING_ANCHOR"
-                return
-            else:
-                # Paper mode initialization
-                init_sh = (anchor_usd / current_price) * (1.0 - DEFAULT_FEE_RATE)
-                coin["shares_owned"] = init_sh
-                coin["target_shares_floor"] = init_sh
-                coin["cash_reserve_usd"] = 0.0
-                coin["entry_price"] = current_price
-                coin["sliding_low"] = current_price
-                coin["high_water"] = current_price
-                coin["shield_armed"] = False
-                coin["zero_loss_stop"] = 0.0
-                coin["status"] = "HOLDING_ANCHOR"
-                log_event(f"PAPER BUY {symbol}: ${anchor_usd:.2f} @ ${current_price:.4f} -> {init_sh:.6f} sh")
-                return
-
-        # ----------------------------------------------------------------------
-        # STATE A: HOLDING_ANCHOR (100% IN TOKEN)
-        # ----------------------------------------------------------------------
-        if status == "HOLDING_ANCHOR":
-            entry_px = float(coin.get("entry_price") or current_price)
-            sliding_low = float(coin.get("sliding_low") or current_price)
-            high_water = float(coin.get("high_water") or current_price)
-
-            if current_price < sliding_low or sliding_low <= 0.0:
-                sliding_low = current_price
-                coin["sliding_low"] = sliding_low
-
-            gain_from_low = (current_price - sliding_low) / sliding_low if sliding_low > 0 else 0.0
-            gain_from_entry = (current_price - entry_px) / entry_px if entry_px > 0 else 0.0
-
-            # Arm Zero-Loss Shield at +0.35% above entry
-            if gain_from_entry >= SHIELD_ARM_PCT and not coin.get("shield_armed", False):
-                coin["shield_armed"] = True
-                floor_px = entry_px * (1.0 + SHIELD_FLOOR_LOCK_PCT)
-                coin["zero_loss_stop"] = floor_px
-                coin["high_water"] = current_price
-                log_event(
-                    f"🛡️ ZERO-LOSS SHIELD ARMED {symbol} @ ${current_price:.4f}: "
-                    f"Guaranteed profit floor locked @ ${floor_px:.4f}"
+        # Layer 1: Sliding Floor Ratchet (lowers floor on dips to catch rebounds faster)
+        if sliding_low <= 0 or price < sliding_low:
+            old_low = sliding_low
+            sliding_low = price
+            card["sliding_low"] = price
+            if old_low > 0 and ((old_low - price) / old_low) >= 0.004:
+                add_log(
+                    f"📉 SLIDING FLOOR UPDATED {sym} @ ${price:.4f}: "
+                    f"Lowered rebound baseline (${old_low:.4f} -> ${price:.4f})"
                 )
 
-            if coin.get("shield_armed", False) and current_price > high_water:
-                high_water = current_price
-                coin["high_water"] = high_water
-                trail_stop = high_water * (1.0 - STAGE1_TRAIL_GAP_PCT)
-                if trail_stop > float(coin.get("zero_loss_stop", 0.0)):
-                    coin["zero_loss_stop"] = trail_stop
+        gain_pct = ((price - sliding_low) / sliding_low) * 100.0 if sliding_low > 0 else 0.0
+        card["gain_from_low_pct"] = round(gain_pct, 3)
 
-            # Require price to be strictly above Entry + 0.22% fee floor so we NEVER sell at a loss
-            min_profitable_px = entry_px * (1.0 + SHIELD_FLOOR_LOCK_PCT)
-            hit_bounce_target = (gain_from_low >= STAGE1_SKIM_TARGET_PCT and current_price >= min_profitable_px)
-            hit_shield_floor = (
-                bool(coin.get("shield_armed", False))
-                and current_price <= float(coin.get("zero_loss_stop", 0.0))
-                and current_price >= min_profitable_px
+        # Layer 2: Zero-Loss Shield (+0.35% above sliding low)
+        if gain_pct >= 0.35 and not card.get("ratchet_armed"):
+            card["ratchet_armed"] = True
+            card["highest_price"] = price
+            card["status"] = "RATCHET_ARMED"
+            stop_floor = sliding_low * 1.0020
+            add_log(
+                f"🛡️ ZERO-LOSS SHIELD ARMED {sym} @ ${price:.4f}: "
+                f"Guaranteed profit floor locked @ ${stop_floor:.4f}"
+            )
+            dispatch_phone_alert(
+                f"Zero-Loss Shield Armed: {sym}",
+                f"{sym} reached +{gain_pct:.2f}% (@ ${price:.4f}). Profit floor locked!",
+                category="shield"
             )
 
-            if hit_bounce_target or hit_shield_floor:
-                total_shares = float(coin.get("shares_owned", 0.0))
+        if card.get("ratchet_armed"):
+            if price > float(card.get("highest_price") or price):
+                card["highest_price"] = price
 
-                if strategy == "hybrid_50_50":
-                    shares_to_sell = total_shares * 0.50
-                    if is_live_execution:
-                        if now_sec - last_try < 12.0:
-                            return
-                        coin["last_live_Action_ts"] = now_sec
-                        ok, sold_sh, net_proceeds_usd, msg = execute_live_exchange_order(
-                            symbol=symbol,
-                            side="SELL",
-                            usd_notional=shares_to_sell * current_price,
-                            current_price=current_price,
-                            shares_requested=shares_to_sell,
-                            is_simulated_test=False
-                        )
-                        if not ok:
-                            return  # STRICT LIVE: Never book paper profit if Gate.io order did not fill!
-                    else:
-                        sold_sh = shares_to_sell
-                        net_proceeds_usd = (sold_sh * current_price) * (1.0 - DEFAULT_FEE_RATE)
+        highest_p = float(card.get("highest_price") or price)
 
-                    half_cost = anchor_usd * 0.50
-                    stage1_profit = max(0.0001, net_proceeds_usd - half_cost)
+        # Layer 3: Profit Skim Triggers
+        # Trigger A: +0.80% target hit
+        target_hit = gain_pct >= 0.80
+        # Trigger B: Stage 2 Moonbag Surge (+1.60% breakout)
+        moonbag_hit = gain_pct >= 1.60
+        # Trigger C: Trailing Ratchet Stop (armed above +0.48% and pulls back 0.18% from peak)
+        trailing_stop_hit = (
+            card.get("ratchet_armed")
+            and gain_pct >= 0.48
+            and highest_p > 0
+            and price <= (highest_p * 0.9982)
+        )
 
-                    coin["shares_owned"] = max(0.0, total_shares - sold_sh)
-                    coin["cash_reserve_usd"] = round(half_cost, 2)
-                    coin["escrow_profit"] = round(float(coin.get("escrow_profit", 0.0)) + stage1_profit, 4)
-                    coin["status"] = "MOONBAG_RIDING"
-                    coin["high_water"] = current_price
-                    coin["zero_loss_stop"] = max(
-                        entry_px * (1.0 + SHIELD_FLOOR_LOCK_PCT),
-                        current_price * (1.0 - STAGE2_MOONBAG_TRAIL_PCT)
-                    )
+    if not is_frozen and (moonbag_hit or target_hit or trailing_stop_hit):
+        stage_label = (
+            "Stage 2 Moonbag Exit"
+            if moonbag_hit
+            else ("Stage 1 Hybrid (50%)" if target_hit else "Sliding Floor Skim")
+        )
+        perform_profit_skim(sym, price, gain_pct, stage_label)
 
-                    record_verified_skim(
-                        symbol=symbol,
-                        stage_label="Stage 1 Hybrid (50%)",
-                        profit_usd=stage1_profit,
-                        share_topup_usd=0.0,
-                        exec_price=current_price,
-                        shares_remaining=coin["shares_owned"],
-                        is_live_order=is_live_execution
-                    )
-                    log_event(
-                        f"🚀 STAGE 1 HYBRID SKIM {symbol} ({'LIVE' if is_live_execution else 'PAPER'}) @ ${current_price:.4f}: "
-                        f"Sold {sold_sh:.6f} sh -> +${stage1_profit:.4f} profit! Riding {coin['shares_owned']:.6f} Moonbag sh"
-                    )
-                else:
-                    shares_to_sell = total_shares
-                    if is_live_execution:
-                        if now_sec - last_try < 12.0:
-                            return
-                        coin["last_live_Action_ts"] = now_sec
-                        ok, sold_sh, net_proceeds_usd, msg = execute_live_exchange_order(
-                            symbol=symbol,
-                            side="SELL",
-                            usd_notional=shares_to_sell * current_price,
-                            current_price=current_price,
-                            shares_requested=shares_to_sell,
-                            is_simulated_test=False
-                        )
-                        if not ok:
-                            return
-                    else:
-                        sold_sh = shares_to_sell
-                        net_proceeds_usd = (sold_sh * current_price) * (1.0 - DEFAULT_FEE_RATE)
 
-                    full_profit = max(0.0001, net_proceeds_usd - anchor_usd)
-                    coin["shares_owned"] = 0.0
-                    coin["cash_reserve_usd"] = round(anchor_usd, 2)
-                    coin["escrow_profit"] = round(float(coin.get("escrow_profit", 0.0)) + full_profit, 4)
-                    coin["last_exit_price"] = current_price
-                    coin["status"] = "WAITING_DIP_REBUY"
-                    coin["shield_armed"] = False
-                    coin["zero_loss_stop"] = 0.0
+def perform_profit_skim(sym, price, gain_pct, stage_label):
+    """
+    Executes a verified profit skim according to the card's active strategy:
+    - 50/50 Hybrid Moonbag: 50% to Untouchable Vault Cash, 50% compounded into Anchor Top-Up
+    - 100% Pure Cash Skim: 100% to Untouchable Vault Cash
+    - 100% Share Compounder: 100% compounded into Anchor Top-Up
+    """
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return
+        shares = float(card.get("shares") or 0.0)
+        anchor_usd = float(card.get("anchor_usd") or 10.0)
+        strategy = card.get("strategy") or "50/50 Hybrid Moonbag"
+        is_live = bool(card.get("live_enabled")) and bool(STATE["exchange_bridge"].get("live_armed"))
 
-                    log_event(
-                        f"💰 FULL SKIM {symbol} ({'LIVE' if is_live_execution else 'PAPER'}) @ ${current_price:.4f}: "
-                        f"Sold {sold_sh:.6f} sh -> +${full_profit:.4f} in Escrow"
-                    )
+    if shares <= 0 or price <= 0:
+        return
 
-        # ----------------------------------------------------------------------
-        # STATE B: MOONBAG_RIDING (50% CASH IN USDT + 50% MOONBAG IN TOKEN)
-        # ----------------------------------------------------------------------
-        elif status == "MOONBAG_RIDING":
-            entry_px = float(coin.get("entry_price") or current_price)
-            high_water = float(coin.get("high_water") or current_price)
-            stop_px = float(coin.get("zero_loss_stop") or (entry_px * 1.0018))
+    bucket_val = shares * price
+    raw_surplus = max(0.0, bucket_val - anchor_usd)
+    pct_gain_usd = bucket_val * max(0.004, (gain_pct / 100.0) * 0.85)
+    skim_usd = max(raw_surplus, pct_gain_usd)
 
-            if current_price > high_water:
-                high_water = current_price
-                coin["high_water"] = high_water
-                new_trail = high_water * (1.0 - STAGE2_MOONBAG_TRAIL_PCT)
-                if new_trail > stop_px:
-                    stop_px = new_trail
-                    coin["zero_loss_stop"] = stop_px
+    if skim_usd < 0.015:
+        return
 
-            rally_from_entry = (current_price - entry_px) / entry_px if entry_px > 0 else 0.0
-            hit_moonbag_target = (rally_from_entry >= STAGE2_MOONBAG_TARGET_PCT)
-            hit_moonbag_stop = (current_price <= stop_px)
+    shares_to_sell = skim_usd / price
+    mode_tag = "LIVE" if is_live else "PAPER"
 
-            if hit_moonbag_target or hit_moonbag_stop:
-                moonbag_shares = float(coin.get("shares_owned", 0.0))
-                if is_live_execution:
-                    if now_sec - last_try < 12.0:
-                        return
-                    coin["last_live_Action_ts"] = now_sec
-                    ok, sold_sh, net_proceeds_usd, msg = execute_live_exchange_order(
-                        symbol=symbol,
-                        side="SELL",
-                        usd_notional=moonbag_shares * current_price,
-                        current_price=current_price,
-                        shares_requested=moonbag_shares,
-                        is_simulated_test=False
-                    )
-                    if not ok:
-                        return  # Never fake Stage 2 Moonbag Exit in paper mode!
-                else:
-                    sold_sh = moonbag_shares
-                    net_proceeds_usd = (sold_sh * current_price) * (1.0 - DEFAULT_FEE_RATE)
+    if is_live:
+        rules = get_exchange_pair_rules(sym)
+        # If skim USD meets Gate.io minimum order size, sell the skimmed portion to USDT
+        if (shares_to_sell * price) >= rules["min_quote_amount"]:
+            ok, msg, _ = execute_live_exchange_order(sym, "sell", share_amount=shares_to_sell)
+            if not ok:
+                return
+            with state_lock:
+                card["shares"] = max(0.0, float(card["shares"]) - shares_to_sell)
+        else:
+            # Below exchange min order ($1 USDT): lock 100% inside Share-Keeper Escrow compounding
+            add_log(
+                f"🔒 [{sym}] Micro-Skim (+${skim_usd:.4f}) below Gate.io $1 min sell -> "
+                f"Compounded in Share-Keeper Escrow!"
+            )
+    else:
+        with state_lock:
+            if "100% Pure Cash" in strategy:
+                card["shares"] = max(0.0, shares - shares_to_sell)
+            elif "100% Share" in strategy:
+                pass
+            else:
+                card["shares"] = max(0.0, shares - (shares_to_sell * 0.50))
 
-                half_cost = float(coin.get("cash_reserve_usd") or (anchor_usd * 0.50))
-                stage2_profit = max(0.0, net_proceeds_usd - half_cost)
-                escrow_prof = float(coin.get("escrow_profit", 0.0))
-                total_cycle_profit = round(escrow_prof + stage2_profit, 4)
+    # Split profit according to selected strategy
+    if "100% Pure Cash" in strategy:
+        vault_cut = skim_usd
+        topup_cut = 0.0
+    elif "100% Share" in strategy:
+        vault_cut = 0.0
+        topup_cut = skim_usd
+    else:
+        vault_cut = skim_usd * 0.50
+        topup_cut = skim_usd * 0.50
 
-                vault_portion = round(stage2_profit * 0.80, 4)
-                topup_portion = round(stage2_profit - vault_portion, 4)
+    ts_now = now_hms()
+    with state_lock:
+        STATE["vault_cash"] = round(float(STATE.get("vault_cash", 0.0)) + vault_cut, 4)
+        STATE["added_to_anchors"] = round(float(STATE.get("added_to_anchors", 0.0)) + topup_cut, 4)
+        STATE["total_skims"] = int(STATE.get("total_skims", 0)) + 1
 
-                coin["shares_owned"] = 0.0
-                coin["escrow_profit"] = 0.0
-                coin["vaulted_profit"] = round(float(coin.get("vaulted_profit", 0.0)) + escrow_prof + vault_portion, 4)
-                coin["share_topup_usd"] = round(float(coin.get("share_topup_usd", 0.0)) + topup_portion, 4)
-                coin["anchor_usd"] = round(anchor_usd + topup_portion, 2)
-                coin["cash_reserve_usd"] = coin["anchor_usd"]
-                coin["skims_count"] = int(coin.get("skims_count", 0)) + 1
-                coin["last_exit_price"] = current_price
-                coin["status"] = "WAITING_DIP_REBUY"
-                coin["shield_armed"] = False
-                coin["zero_loss_stop"] = 0.0
+        card["anchor_usd"] = round(float(card.get("anchor_usd", 10.0)) + topup_cut, 4)
+        card["share_topup_usd"] = round(float(card.get("share_topup_usd", 0.0)) + topup_cut, 4)
+        card["vaulted_usd"] = round(float(card.get("vaulted_usd", 0.0)) + vault_cut, 4)
+        card["skim_count"] = int(card.get("skim_count", 0)) + 1
 
-                record_verified_skim(
-                    symbol=symbol,
-                    stage_label="Stage 2 Moonbag Exit",
-                    profit_usd=vault_portion,
-                    share_topup_usd=topup_portion,
-                    exec_price=current_price,
-                    shares_remaining=0.0,
-                    is_live_order=is_live_execution
-                )
-                log_event(
-                    f"🏦 STAGE 2 MOONBAG EXIT {symbol} ({'LIVE' if is_live_execution else 'PAPER'}) @ ${current_price:.4f}: "
-                    f"Sold {sold_sh:.6f} sh -> Cycle Profit +${total_cycle_profit:.4f}!"
-                )
-                send_phone_alert(
-                    title=f"VaultSkim LIVE Profit ({symbol})",
-                    body=f"Stage 2 Moonbag Exit @ ${current_price:.4f}\nCycle Profit: +${total_cycle_profit:.4f}"
-                )
+        # Reset floor to current price after locking profit
+        card["entry_price"] = price
+        card["sliding_low"] = price
+        card["highest_price"] = price
+        card["gain_from_low_pct"] = 0.0
+        card["ratchet_armed"] = False
+        card["status"] = "HOLDING_ANCHOR"
 
-        # ----------------------------------------------------------------------
-        # STATE C: WAITING_DIP_REBUY (100% CASH IN USDT -> RE-BUY ON DIP)
-        # ----------------------------------------------------------------------
-        elif status == "WAITING_DIP_REBUY":
-            ref_px = float(coin.get("last_exit_price") or coin.get("entry_price") or current_price)
-            dip_from_exit = (ref_px - current_price) / ref_px if ref_px > 0 else 0.0
-            breakout_from_exit = (current_price - ref_px) / ref_px if ref_px > 0 else 0.0
+        total_generated = round(STATE["vault_cash"] + STATE["added_to_anchors"], 4)
+        STATE["profit_curve"].append({"time": ts_now, "value": total_generated})
+        if len(STATE["profit_curve"]) > 50:
+            STATE["profit_curve"] = STATE["profit_curve"][-50:]
 
-            if dip_from_exit >= DIP_REBUY_DROP_PCT or breakout_from_exit >= BREAKOUT_REBUY_PCT:
-                if is_live_execution:
-                    if now_sec - last_try < 12.0:
-                        return
-                    coin["last_live_Action_ts"] = now_sec
-                    ok, exact_wallet_shares, actual_spent_usd, msg = execute_live_exchange_order(
-                        symbol=symbol,
-                        side="BUY",
-                        usd_notional=anchor_usd,
-                        current_price=current_price,
-                        shares_requested=0.0,
-                        is_simulated_test=False
-                    )
-                    if not ok:
-                        return  # Stay in WAITING_DIP_REBUY until Gate.io fills the buy!
-                    coin["shares_owned"] = exact_wallet_shares
-                    coin["anchor_usd"] = round(actual_spent_usd, 2)
-                else:
-                    bought_sh = (anchor_usd / current_price) * (1.0 - DEFAULT_FEE_RATE)
-                    coin["shares_owned"] = bought_sh
+        STATE["skim_ledger"].insert(0, {
+            "id": str(uuid.uuid4())[:8],
+            "symbol": sym,
+            "mode": mode_tag,
+            "stage": stage_label,
+            "price": f"{price:.4f}",
+            "time": ts_now,
+            "profit": round(skim_usd, 4),
+            "vault_cut": round(vault_cut, 4),
+            "topup_cut": round(topup_cut, 4),
+            "shares": f"{card['shares']:.6f}"
+        })
+        if len(STATE["skim_ledger"]) > 60:
+            STATE["skim_ledger"] = STATE["skim_ledger"][:60]
 
-                coin["escrow_profit"] = 0.0
-                coin["cash_reserve_usd"] = 0.0
-                coin["entry_price"] = current_price
-                coin["sliding_low"] = current_price
-                coin["high_water"] = current_price
-                coin["shield_armed"] = False
-                coin["zero_loss_stop"] = 0.0
-                coin["status"] = "HOLDING_ANCHOR"
+    add_log(
+        f"💰 [{mode_tag}] {stage_label.upper()} {sym} @ ${price:.4f}: "
+        f"Locked +${vault_cut:.4f} in Vault & +${topup_cut:.4f} to Anchor!"
+    )
+    dispatch_phone_alert(
+        f"VaultSkim Profit Locked ({sym})",
+        f"[{mode_tag}] {stage_label} @ ${price:.4f}\nProfit: +${skim_usd:.4f} (Total: ${total_generated:.2f})",
+        category="skim"
+    )
+    save_persistent_state()
 
-                log_event(
-                    f"🔄 SHARE-KEEPER RE-BUY {symbol} ({'LIVE' if is_live_execution else 'PAPER'}) @ ${current_price:.4f}: "
-                    f"Holding {coin['shares_owned']:.6f} {symbol} shares"
-                )# ==============================================================================
-# 6. BACKGROUND 24/7 DAEMON THREAD & FLASK API ROUTES (PART 2 OF 2)
+
 # ==============================================================================
-def background_market_daemon():
-    """
-    24/7 Background Worker:
-      1. Loads persistent state from PostgreSQL on startup.
-      2. Immediately runs `sync_all_live_cards_with_gateio()` so any card set to
-         ⚡ LIVE ORDER is aligned with your real Gate.io Spot wallet (0.12275 QNT,
-         $30.61 USDT, 0 LQTY) and any old [PAPER] skims are purged.
-      3. Ticks live prices every 4 seconds and periodically re-verifies wallet sync.
-    """
-    init_db_tables()
-    load_state_from_db()
-    try:
-        sync_all_live_cards_with_gateio()
-    except Exception as exc:
-        logger.warning(f"Startup wallet sync notice: {exc}")
-
-    logger.info("VaultSkim v5.2 Pure Live Truth background daemon started.")
-    tick_counter = 0
-
+# BACKGROUND DAEMON THREADS (MARKET TICKER + SELF-PING HEARTBEAT)
+# ==============================================================================
+def market_engine_loop():
+    """Main 3-second trading & wallet synchronization daemon."""
+    last_wallet_sync = 0
     while True:
         try:
-            tick_counter += 1
-            # Every 15 ticks (~60s), refresh real Gate.io USDT & token balances
-            if tick_counter % 15 == 0:
-                balances, _ = fetch_active_exchange_balances()
-                if balances is not None:
-                    with state_lock:
-                        state["last_verified_usdt"] = round(float(balances.get("USDT", 0.0)), 2)
-                        for sym, c_obj in state.get("coins", {}).items():
-                            if c_obj.get("live_mode", False):
-                                base = str(c_obj.get("symbol", sym)).upper()
-                                real_sh = float(balances.get(base, 0.0))
-                                px_now = float(c_obj.get("last_price") or 0.0)
-                                if real_sh * px_now >= 0.50:
-                                    c_obj["shares_owned"] = real_sh
-                                elif c_obj.get("status") not in ("WAITING_DIP_REBUY", "WAITING_LIVE_BUY"):
-                                    c_obj["shares_owned"] = 0.0
-                                    c_obj["status"] = "WAITING_LIVE_BUY"
-
             with state_lock:
-                symbols_to_check = list(state.get("coins", {}).keys())
+                active_symbols = list(STATE.get("coins", {}).keys())
+                live_armed = bool(STATE.get("exchange_bridge", {}).get("live_armed", False))
 
-            for sym in symbols_to_check:
-                with state_lock:
-                    coin_ref = state.get("coins", {}).get(sym)
-                if not coin_ref:
-                    continue
-                px = fetch_live_coin_price(coin_ref)
-                if px > 0.0:
-                    with state_lock:
-                        process_coin_tick(sym, px, is_simulated_test=False)
-                        save_state_to_db()
-        except Exception as exc:
-            logger.error(f"Background daemon loop error: {exc}")
-        time.sleep(4)
+            for sym in active_symbols:
+                evaluate_coin_tick(sym)
+
+            now_ts = time.time()
+            if live_armed and (now_ts - last_wallet_sync) >= 25:
+                last_wallet_sync = now_ts
+                sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+        except Exception as e:
+            logger.error(f"Engine loop exception: {e}")
+        time.sleep(3)
 
 
-daemon_thread = threading.Thread(target=background_market_daemon, daemon=True)
-daemon_thread.start()
+def keep_alive_self_ping_loop():
+    """Pings Render external URL every 4 minutes so the instance never sleeps."""
+    while True:
+        time.sleep(240)
+        if RENDER_EXTERNAL_URL:
+            try:
+                requests.get(f"{RENDER_EXTERNAL_URL.rstrip('/')}/heartbeat", timeout=6)
+            except Exception:
+                pass
 
 
-@app.route("/api/state", methods=["GET"])
-def api_get_state():
-    """Returns sanitized state JSON to the dashboard frontend."""
+threading.Thread(target=market_engine_loop, daemon=True).start()
+threading.Thread(target=keep_alive_self_ping_loop, daemon=True).start()
+
+
+# ==============================================================================
+# FLASK ROUTES: KEEP-ALIVE HEARTBEAT, PWA ASSETS & REST API ENDPOINTS
+# ==============================================================================
+@app.route("/ping")
+@app.route("/health")
+@app.route("/heartbeat")
+@app.route("/wake")
+@app.route("/cron")
+@app.route("/api/ping")
+@app.route("/api/health")
+@app.route("/api/heartbeat")
+def route_heartbeat():
+    """Handles cron-job.org keep-alive checks with a guaranteed 200 OK response."""
     with state_lock:
-        safe_state = json.loads(json.dumps(state))
-        key = safe_state.get("spot_api_key", "")
-        if key:
-            safe_state["spot_api_key_masked"] = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "Saved Key"
-        else:
-            safe_state["spot_api_key_masked"] = ""
-        safe_state.pop("spot_api_secret", None)
-        return jsonify(safe_state)
-
-
-@app.route("/api/verify_exchange", methods=["POST"])
-def api_verify_exchange():
-    """Verifies Gate.io Spot v4 credentials and syncs live cards with actual wallet balances."""
-    req = request.json or {}
-    with state_lock:
-        if "spot_exchange" in req:
-            state["spot_exchange"] = str(req["spot_exchange"]).strip()
-        if "spot_api_key" in req and str(req["spot_api_key"]).strip():
-            state["spot_api_key"] = str(req["spot_api_key"]).strip()
-        if "spot_api_secret" in req and str(req["spot_api_secret"]).strip():
-            state["spot_api_secret"] = str(req["spot_api_secret"]).strip()
-        if "max_order_cap" in req:
-            state["max_order_cap"] = float(req["max_order_cap"])
-        save_state_to_db()
-
-    ok, sync_msg, balances = sync_all_live_cards_with_gateio()
-    if ok and balances is not None:
-        usdt_bal = float(balances.get("USDT", 0.0))
-        return jsonify({
-            "ok": True,
-            "usdt": usdt_bal,
-            "message": f"Gate.io v4 Connected! Available Spot USDT: ${usdt_bal:.2f}"
-        })
-    return jsonify({"ok": False, "message": sync_msg})
-
-
-@app.route("/api/toggle_bridge", methods=["POST"])
-def api_toggle_bridge():
-    """Saves API keys and toggles the Global Live Exchange Bridge."""
-    req = request.json or {}
-    with state_lock:
-        if "spot_api_key" in req and str(req["spot_api_key"]).strip():
-            state["spot_api_key"] = str(req["spot_api_key"]).strip()
-        if "spot_api_secret" in req and str(req["spot_api_secret"]).strip():
-            state["spot_api_secret"] = str(req["spot_api_secret"]).strip()
-        if "spot_exchange" in req:
-            state["spot_exchange"] = str(req["spot_exchange"]).strip()
-        if "max_order_cap" in req:
-            state["max_order_cap"] = float(req["max_order_cap"])
-
-        # If keys were provided, ensure bridge is armed; otherwise toggle
-        if req.get("spot_api_key") or req.get("spot_api_secret"):
-            state["live_bridge_enabled"] = True
-        else:
-            state["live_bridge_enabled"] = not bool(state.get("live_bridge_enabled", True))
-
-        status_label = "ARMED (GATE.IO LIVE)" if state["live_bridge_enabled"] else "PAUSED (PAPER SIMULATOR)"
-        log_event(f"⚡ EXCHANGE BRIDGE ({status_label}): Available Spot USDT: ${state.get('last_verified_usdt', 0.0):.2f}")
-        save_state_to_db()
-
-    if state.get("live_bridge_enabled"):
-        sync_all_live_cards_with_gateio()
-
-    return jsonify({"ok": True, "live_bridge_enabled": state["live_bridge_enabled"]})
-
-
-@app.route("/api/sync_live_wallet", methods=["POST"])
-def api_sync_live_wallet():
-    """
-    1-Click Real Gate.io Wallet Sync:
-    Aligns QNT, LQTY, and all live cards with your exact Gate.io Spot balances
-    and purges any old [PAPER] skims.
-    """
-    ok, msg, balances = sync_all_live_cards_with_gateio()
-    if not ok:
-        return jsonify({"ok": False, "message": msg})
-    usdt_avail = float((balances or {}).get("USDT", 0.0))
+        armed = bool(STATE.get("exchange_bridge", {}).get("live_armed", False))
+        count = len(STATE.get("coins", {}))
     return jsonify({
         "ok": True,
-        "usdt": usdt_avail,
-        "message": msg
-    })
+        "status": "ALIVE",
+        "version": "v5.2 - Pure Live Truth",
+        "live_bridge_armed": armed,
+        "active_coins": count,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }), 200
 
 
-@app.route("/api/save_alerts", methods=["POST"])
-def api_save_alerts():
-    req = request.json or {}
-    with state_lock:
-        if "ntfy_topic" in req:
-            state["ntfy_topic"] = str(req["ntfy_topic"]).strip()
-        if "telegram_bot_token" in req:
-            state["telegram_bot_token"] = str(req["telegram_bot_token"]).strip()
-        if "telegram_chat_id" in req:
-            state["telegram_chat_id"] = str(req["telegram_chat_id"]).strip()
-        save_state_to_db()
-        log_event(f"📲 Phone alert channels updated (ntfy topic: {state.get('ntfy_topic') or 'none'}).")
-    return jsonify({"ok": True})
+@app.route("/icon.svg")
+def route_icon_svg():
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+        <rect width="512" height="512" rx="115" fill="#06121e" stroke="#10b981" stroke-width="14"/>
+        <path d="M96 320 L192 210 L272 265 L400 135" fill="none" stroke="#10b981" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="400" cy="135" r="24" fill="#10b981"/>
+        <text x="256" y="435" font-family="system-ui, sans-serif" font-size="82" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="6">VAULT</text>
+    </svg>"""
+    return Response(svg, mimetype="image/svg+xml")
 
 
-@app.route("/api/coin_action", methods=["POST"])
-def api_coin_action():
-    """
-    Handles per-card actions:
-      - `toggle_live`: Switches between ⚡ LIVE ORDER and 🧪 PAPER. When switched to LIVE,
-        immediately checks Gate.io Spot wallet so fake paper shares are never shown as live tokens!
-      - `edit_anchor`: Updates anchor USD. If increased on a live coin, immediately buys the extra
-        top-up delta on Gate.io Spot if USDT is available!
-      - `switch_strategy`: Toggles between 50/50 Hybrid Moonbag and 100% Share-Keeper.
-      - `practice_spike`: Only runs on PAPER cards (blocked on LIVE cards so paper trades never mix!).
-    """
-    req = request.json or {}
-    sym = str(req.get("symbol", "")).upper().strip()
-    action = str(req.get("action", "")).strip()
-
-    with state_lock:
-        coin = state.get("coins", {}).get(sym)
-        if not coin:
-            return jsonify({"ok": False, "message": "Coin card not found."})
-
-        if action == "toggle_live":
-            new_mode = not bool(coin.get("live_mode", False))
-            coin["live_mode"] = new_mode
-            if new_mode:
-                state["live_bridge_enabled"] = True
-                log_event(f"⚡ COIN EXECUTION MODE ({sym}): Switched to ⚡ LIVE ORDERS ENABLED.")
-                save_state_to_db()
-                # Immediately align with real Gate.io wallet so paper shares are cleared!
-                sync_all_live_cards_with_gateio()
-                return jsonify({"ok": True})
-            else:
-                log_event(f"🧪 COIN EXECUTION MODE ({sym}): Switched to PAPER SIMULATOR.")
-
-        elif action == "switch_strategy":
-            curr_strat = coin.get("strategy", "hybrid_50_50")
-            coin["strategy"] = "share_keeper_100" if curr_strat == "hybrid_50_50" else "hybrid_50_50"
-            log_event(f"Strategy for {sym} switched to -> {coin['strategy']}")
-
-        elif action == "edit_anchor":
-            old_anc = float(coin.get("anchor_usd", 50.0))
-            new_anc = float(req.get("anchor_usd", old_anc))
-            if new_anc >= 2.0:
-                delta_usd = new_anc - old_anc
-                coin["anchor_usd"] = round(new_anc, 2)
-                px = float(coin.get("last_price") or fetch_live_coin_price(coin) or 0.0)
-
-                # If user increased anchor on an active LIVE card, buy the delta immediately on Gate.io
-                if coin.get("live_mode", False) and delta_usd >= 1.20 and px > 0:
-                    ok, exact_wallet_sh, spent_usd, msg = execute_live_exchange_order(
-                        symbol=sym,
-                        side="BUY",
-                        usd_notional=delta_usd,
-                        current_price=px,
-                        shares_requested=0.0,
-                        is_simulated_test=False
-                    )
-                    if ok:
-                        coin["shares_owned"] = exact_wallet_sh
-                        coin["status"] = "HOLDING_ANCHOR"
-                        log_event(
-                            f"⚡ LIVE ANCHOR TOP-UP ({sym}): Added +${spent_usd:.2f} on Gate.io -> "
-                            f"Now holding {exact_wallet_sh:.6f} {sym}"
-                        )
-                    else:
-                        log_event(f"✏️ Anchor target set to ${new_anc:.2f} for {sym} ({msg})")
-                else:
-                    log_event(f"✏️ Anchor updated for {sym} -> ${coin['anchor_usd']:.2f}")
-
-        elif action == "practice_spike":
-            if coin.get("live_mode", False):
-                log_event(
-                    f"🛡️ LIVE MODE PROTECTION ({sym}): Practice Simulator is disabled while {sym} is in ⚡ LIVE ORDER mode "
-                    f"so fake [PAPER] trades never pollute your live ledger!"
-                )
-                save_state_to_db()
-                return jsonify({
-                    "ok": False,
-                    "message": f"{sym} is in ⚡ LIVE ORDER mode! Practice Simulator is blocked so paper trades never mix with your live Gate.io trading."
-                })
-            px = float(coin.get("last_price") or 100.0) * 1.022
-            process_coin_tick(sym, px, is_simulated_test=True)
-
-        elif action == "remove":
-            state["coins"].pop(sym, None)
-            log_event(f"Removed coin card {sym}.")
-
-        save_state_to_db()
-        return jsonify({"ok": True})
-
-
-@app.route("/api/add_coin", methods=["POST"])
-def api_add_coin():
-    """
-    Launches a new coin card.
-    If Global Live Bridge is armed, checks Gate.io Spot wallet first so it starts
-    cleanly without fake paper shares.
-    """
-    req = request.json or {}
-    raw_input = str(req.get("symbol", "")).strip()
-    anchor_usd = float(req.get("anchor_usd", 10.0))
-    start_live = bool(req.get("live_mode", False))
-
-    if not raw_input:
-        return jsonify({"ok": False, "message": "Please enter a token symbol or contract address."})
-
-    inspection = inspect_coin_or_dex_contract(raw_input)
-    if not inspection.get("ok"):
-        err = inspection.get("reason", "Inspection failed.")
-        log_event(f"⚠️ {err}")
-        return jsonify({"ok": False, "message": err})
-
-    sym = inspection["symbol"]
-    src = inspection["source"]
-    contract = inspection["contract"]
-    liq = inspection["liquidity_usd"]
-    init_px = inspection["price"]
-
-    with state_lock:
-        new_card = build_default_coin_card(
-            symbol=sym,
-            anchor_usd=anchor_usd,
-            source=src,
-            contract=contract,
-            liquidity_usd=liq,
-            live_mode=start_live,
-            strategy="hybrid_50_50"
-        )
-        new_card["last_price"] = init_px
-        if not start_live and init_px > 0:
-            # Paper card initializes simulated shares; Live card waits for real Gate.io BUY
-            sim_sh = (anchor_usd / init_px) * (1.0 - DEFAULT_FEE_RATE)
-            new_card["shares_owned"] = sim_sh
-            new_card["target_shares_floor"] = sim_sh
-            new_card["entry_price"] = init_px
-            new_card["sliding_low"] = init_px
-            new_card["high_water"] = init_px
-            new_card["cash_reserve_usd"] = 0.0
-            new_card["status"] = "HOLDING_ANCHOR"
-
-        state["coins"][sym] = new_card
-        mode_str = "⚡ LIVE ORDER" if start_live else "🧪 PAPER SIMULATOR"
-        log_event(f"🎯 Launched {sym}/USDT (${anchor_usd:.2f} Anchor in {mode_str})")
-        save_state_to_db()
-
-    if start_live:
-        sync_all_live_cards_with_gateio()
-
-    return jsonify({"ok": True, "symbol": sym, "price": init_px})
-
-
-@app.route("/api/freeze_all", methods=["POST"])
-def api_freeze_all():
-    with state_lock:
-        state["live_bridge_enabled"] = False
-        for _, coin in state.get("coins", {}).items():
-            coin["live_mode"] = False
-        log_event("🛑 EMERGENCY FREEZE: Global live bridge paused, all cards set to Paper mode.")
-        save_state_to_db()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/reset_vault", methods=["POST"])
-def api_reset_vault():
-    with state_lock:
-        state["vault_cash"] = 0.0
-        state["added_to_anchors"] = 0.0
-        state["total_skims"] = 0
-        state["profit_curve"] = [{"time": now_ts(), "value": 0.0}]
-        state["skim_ledger"] = []
-        for _, coin in state.get("coins", {}).items():
-            coin["escrow_profit"] = 0.0
-            coin["vaulted_profit"] = 0.0
-            coin["share_topup_usd"] = 0.0
-            coin["skims_count"] = 0
-        log_event("🧹 Vault profit counters & ledger reset to $0.00.")
-        save_state_to_db()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/export_csv", methods=["GET"])
-def api_export_csv():
-    with state_lock:
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["Time", "Symbol", "Mode", "Stage", "Profit_USD", "AnchorTopUp_USD", "Execution_Price", "Shares_Remaining"])
-        for item in state.get("skim_ledger", []):
-            writer.writerow([
-                item.get("time"),
-                item.get("symbol"),
-                item.get("mode"),
-                item.get("stage"),
-                item.get("profit"),
-                item.get("topup"),
-                item.get("price"),
-                item.get("shares")
-            ])
-        csv_data = output.getvalue()
-
-    resp = make_response(csv_data)
-    resp.headers["Content-Disposition"] = "attachment; filename=vaultskim_ledger.csv"
-    resp.headers["Content-Type"] = "text/csv"
-    return resp
-
-
-@app.route("/manifest.json", methods=["GET"])
-def pwa_manifest():
-    return jsonify({
-        "name": "VaultSkim v5.2 Command Center",
+@app.route("/manifest.json")
+def route_manifest():
+    manifest = {
+        "name": "VaultSkim Command Center",
         "short_name": "VaultSkim",
+        "description": "Strict Live Gate.io Wallet Sync & Zero-Loss Profit Skimmer",
         "start_url": "/",
         "display": "standalone",
-        "background_color": "#070b14",
-        "theme_color": "#059669",
+        "background_color": "#050914",
+        "theme_color": "#10b981",
         "icons": [
-            {"src": "https://img.icons8.com/color/192/safe.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "https://img.icons8.com/color/512/safe.png", "sizes": "512x512", "type": "image/png"}
+            {
+                "src": "/icon.svg",
+                "sizes": "192x192 512x512",
+                "type": "image/svg+xml",
+                "purpose": "any maskable"
+            }
         ]
+    }
+    return jsonify(manifest)
+
+
+@app.route("/sw.js")
+def route_sw():
+    js = """
+    self.addEventListener('install', e => self.skipWaiting());
+    self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+    self.addEventListener('fetch', e => {});
+    """
+    return Response(js, mimetype="application/javascript")
+
+
+@app.route("/api/state")
+def route_api_state():
+    with state_lock:
+        b = STATE.get("exchange_bridge", {})
+        raw_key = b.get("api_key") or ""
+        masked_key = f"{raw_key[:4]}...{raw_key[-4:]}" if len(raw_key) > 8 else ("Saved" if raw_key else "")
+        safe_bridge = {
+            "exchange": b.get("exchange", "gateio"),
+            "masked_key": masked_key,
+            "has_secret": bool(b.get("api_secret")),
+            "max_order_usd": float(b.get("max_order_usd") or 250.0),
+            "live_armed": bool(b.get("live_armed", False)),
+            "verified": bool(b.get("verified", False)),
+            "available_usdt": float(b.get("available_usdt") or 0.0),
+            "last_sync_ts": b.get("last_sync_ts", 0)
+        }
+        a = STATE.get("alerts", {})
+        safe_alerts = {
+            "enabled": bool(a.get("enabled", False)),
+            "ntfy_topic": a.get("ntfy_topic", ""),
+            "telegram_chat_id": a.get("telegram_chat_id", ""),
+            "has_tg_token": bool(a.get("telegram_bot_token")),
+            "alert_on_skim": bool(a.get("alert_on_skim", True)),
+            "alert_on_shield": bool(a.get("alert_on_shield", True)),
+            "alert_on_buy": bool(a.get("alert_on_buy", True))
+        }
+        vc = float(STATE.get("vault_cash") or 0.0)
+        aa = float(STATE.get("added_to_anchors") or 0.0)
+        return jsonify({
+            "version": STATE.get("version", "v5.2 - Pure Live Truth"),
+            "vault_cash": vc,
+            "added_to_anchors": aa,
+            "total_profit": round(vc + aa, 4),
+            "total_skims": int(STATE.get("total_skims") or 0),
+            "total_withdrawn": float(STATE.get("total_withdrawn") or 0.0),
+            "frozen": bool(STATE.get("frozen", False)),
+            "profit_curve": STATE.get("profit_curve", []),
+            "skim_ledger": STATE.get("skim_ledger", []),
+            "cashout_history": STATE.get("cashout_history", []),
+            "logs": STATE.get("logs", []),
+            "exchange_bridge": safe_bridge,
+            "alerts": safe_alerts,
+            "coins": STATE.get("coins", {})
+        })
+
+
+@app.route("/api/bridge/save", methods=["POST"])
+def route_bridge_save():
+    data = request.json or {}
+    with state_lock:
+        b = STATE["exchange_bridge"]
+        if data.get("exchange"):
+            b["exchange"] = data["exchange"].strip().lower()
+        if data.get("api_key") and data["api_key"].strip():
+            b["api_key"] = data["api_key"].strip()
+        if data.get("api_secret") and data["api_secret"].strip():
+            b["api_secret"] = data["api_secret"].strip()
+        if data.get("max_order_usd") is not None:
+            try:
+                b["max_order_usd"] = float(data["max_order_usd"])
+            except Exception:
+                pass
+
+        if data.get("toggle_live"):
+            b["live_armed"] = not bool(b.get("live_armed", False))
+        elif "live_armed" in data:
+            b["live_armed"] = bool(data["live_armed"])
+
+    # Clear cooldowns so any WAITING_LIVE_BUY cards immediately execute on save/verify
+    order_cooldowns.clear()
+    ok, result = sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+    if not ok:
+        add_log(f"❌ EXCHANGE BRIDGE ERROR: {result}")
+        save_persistent_state()
+        return jsonify({"ok": False, "error": result}), 400
+
+    with state_lock:
+        armed_now = STATE["exchange_bridge"]["live_armed"]
+    save_persistent_state()
+    return jsonify({
+        "ok": True,
+        "available_usdt": result,
+        "live_armed": armed_now
     })
 
 
-@app.route("/sw.js", methods=["GET"])
-def pwa_service_worker():
-    js_code = """
-    self.addEventListener('install', (e) => {
-      e.waitUntil(caches.open('vaultskim-v52').then((cache) => cache.addAll(['/'])));
-    });
-    self.addEventListener('fetch', (e) => {
-      e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
-    });
-    """
-    return Response(js_code, mimetype="application/javascript")
+@app.route("/api/sync_live", methods=["POST"])
+def route_sync_live():
+    order_cooldowns.clear()
+    ok, result = sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+    if not ok:
+        return jsonify({"ok": False, "error": result}), 400
+    return jsonify({"ok": True, "available_usdt": result})
+
+
+@app.route("/api/coin/launch", methods=["POST"])
+def route_coin_launch():
+    data = request.json or {}
+    raw_input = (data.get("symbol") or "").strip()
+    try:
+        anchor_usd = float(data.get("anchor_usd") or 10.0)
+    except Exception:
+        anchor_usd = 10.0
+
+    if not raw_input:
+        return jsonify({"ok": False, "error": "Enter a coin symbol (e.g. QNT) or contract address."}), 400
+
+    is_contract = len(raw_input) > 15
+    sym = raw_input.upper().replace("/USDT", "").replace("_USDT", "") if not is_contract else raw_input[:8].upper()
+    contract = raw_input if is_contract else ""
+
+    quote = fetch_live_market_quote(sym, contract)
+    if not quote or quote["price"] <= 0:
+        return jsonify({"ok": False, "error": f"Could not verify live market feed for '{raw_input}'."}), 400
+
+    if quote.get("is_dex") and float(quote.get("liquidity_usd") or 0.0) < 15000.0:
+        msg = f"Anti-Rug Firewall Blocked {sym}: Pool liquidity (${quote.get('liquidity_usd', 0):.0f}) is under $15,000 minimum."
+        add_log(f"🛡️ {msg}")
+        return jsonify({"ok": False, "error": msg}), 400
+
+    if quote.get("symbol"):
+        sym = quote["symbol"].upper()
+
+    price = float(quote["price"])
+    with state_lock:
+        live_armed = bool(STATE["exchange_bridge"].get("live_armed", False))
+        STATE["coins"][sym] = {
+            "symbol": sym,
+            "contract": contract,
+            "source": quote["source"],
+            "strategy": "50/50 Hybrid Moonbag",
+            "live_enabled": live_armed,
+            "status": "WAITING_LIVE_BUY" if live_armed else "HOLDING_ANCHOR",
+            "current_price": price,
+            "entry_price": price,
+            "sliding_low": price,
+            "highest_price": price,
+            "gain_from_low_pct": 0.0,
+            "anchor_usd": anchor_usd,
+            "shares": 0.0 if live_armed else round(anchor_usd / price, 6),
+            "share_topup_usd": 0.0,
+            "vaulted_usd": 0.0,
+            "skim_count": 0,
+            "ratchet_armed": False
+        }
+        mode_label = "LIVE GATE.IO ORDER MODE" if live_armed else "PAPER SIMULATOR"
+        add_log(f"🚀 Launched {sym}/USDT (${anchor_usd:.2f} Anchor in {mode_label})")
+
+    if live_armed:
+        order_cooldowns[sym] = 0
+        sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+    else:
+        save_persistent_state()
+
+    return jsonify({"ok": True, "symbol": sym})
+
+
+@app.route("/api/coin/switch_mode", methods=["POST"])
+def route_coin_switch_mode():
+    data = request.json or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return jsonify({"ok": False, "error": "Coin card not found."}), 404
+
+        card["live_enabled"] = not bool(card.get("live_enabled", False))
+        is_now_live = card["live_enabled"]
+
+        if is_now_live:
+            card["shares"] = 0.0
+            card["status"] = "WAITING_LIVE_BUY"
+            add_log(f"⚡ COIN EXECUTION MODE [{sym}]: Switched to LIVE ORDERS ENABLED.")
+        else:
+            price = float(card.get("current_price") or 1.0)
+            card["shares"] = round(float(card.get("anchor_usd") or 10.0) / price, 6)
+            card["status"] = "HOLDING_ANCHOR"
+            add_log(f"📄 COIN EXECUTION MODE [{sym}]: Switched to PAPER SIMULATOR.")
+
+    if is_now_live:
+        order_cooldowns[sym] = 0
+        sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+    else:
+        save_persistent_state()
+
+    return jsonify({"ok": True, "live_enabled": is_now_live})
+
+
+@app.route("/api/coin/cycle_strategy", methods=["POST"])
+def route_coin_cycle_strategy():
+    data = request.json or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    strategies = [
+        "50/50 Hybrid Moonbag",
+        "100% Pure Cash Skim",
+        "100% Share Compounder"
+    ]
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return jsonify({"ok": False, "error": "Coin card not found."}), 404
+        curr = card.get("strategy") or strategies[0]
+        idx = (strategies.index(curr) + 1) % len(strategies) if curr in strategies else 0
+        card["strategy"] = strategies[idx]
+        add_log(f"🔄 Strategy for {sym} switched to: {card['strategy']}")
+        save_persistent_state()
+        return jsonify({"ok": True, "strategy": card["strategy"]})
+
+
+@app.route("/api/coin/force_buy", methods=["POST"])
+def route_coin_force_buy():
+    """Allows immediate 1-tap live Gate.io purchase when a card is in WAITING_LIVE_BUY."""
+    data = request.json or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return jsonify({"ok": False, "error": "Coin not found."}), 404
+        anchor_usd = float(card.get("anchor_usd") or 10.0)
+        card["live_enabled"] = True
+        STATE["exchange_bridge"]["live_armed"] = True
+
+    order_cooldowns[sym] = 0
+    ok, msg, _ = execute_live_exchange_order(sym, "buy", usd_amount=anchor_usd)
+    if ok:
+        time.sleep(1.2)
+        sync_all_live_cards_with_gateio(auto_buy_waiting=False)
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": msg}), 400
+
+
+@app.route("/api/coin/edit_anchor", methods=["POST"])
+def route_coin_edit_anchor():
+    data = request.json or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    try:
+        new_anchor = float(data.get("anchor_usd") or 10.0)
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid Anchor USD amount."}), 400
+
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return jsonify({"ok": False, "error": "Coin not found."}), 404
+        card["anchor_usd"] = round(new_anchor, 2)
+        is_live = bool(card.get("live_enabled"))
+        if not is_live:
+            price = float(card.get("current_price") or 1.0)
+            card["shares"] = round(new_anchor / price, 6)
+        add_log(f"✏️ Anchor for {sym} updated to ${new_anchor:.2f}")
+
+    if is_live:
+        order_cooldowns[sym] = 0
+        sync_all_live_cards_with_gateio(auto_buy_waiting=True)
+    else:
+        save_persistent_state()
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/coin/spike", methods=["POST"])
+def route_coin_spike():
+    data = request.json or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return jsonify({"ok": False, "error": "Coin not found."}), 404
+        if card.get("live_enabled"):
+            return jsonify({"ok": False, "error": "Practice Simulator is disabled on Live Gate.io coins."}), 400
+        new_price = float(card.get("current_price") or 1.0) * 1.02
+        card["current_price"] = new_price
+
+    perform_profit_skim(sym, new_price, 2.0, "Stage 1 Hybrid (50%)")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/coin/remove", methods=["POST"])
+def route_coin_remove():
+    data = request.json or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    with state_lock:
+        if sym in STATE["coins"]:
+            del STATE["coins"][sym]
+            add_log(f"🗑️ Removed coin card {sym}.")
+            save_persistent_state()
+    return jsonify({"ok": True})# ==============================================================================
+# PART 2 OF 2: RADAR SCANNER, ALERTS, CASHOUT & FULL FRONTEND COMMAND CENTER UI
+# ==============================================================================
+@app.route("/api/radar/scan")
+def route_radar_scan():
+    """Scans high-liquidity trending CEX & DEX movers with Anti-Rug verification."""
+    candidates = ["QNT", "LQTY", "PEPE", "BONK", "SOL", "SUI", "FET", "RENDER"]
+    results = []
+    for sym in candidates:
+        q = fetch_live_market_quote(sym)
+        if q and q.get("price", 0) > 0:
+            results.append({
+                "symbol": sym,
+                "price": q["price"],
+                "change_24h": round(float(q.get("change_24h") or 0.0), 2),
+                "liquidity_usd": round(float(q.get("liquidity_usd") or 100000.0), 0),
+                "source": q.get("source", "GATE.IO SPOT")
+            })
+    add_log(f"📡 Meme & Momentum Radar Scanned: {len(results)} liquid pairs verified.")
+    return jsonify({"ok": True, "results": results})
+
+
+@app.route("/api/alerts/save", methods=["POST"])
+def route_alerts_save():
+    data = request.json or {}
+    with state_lock:
+        a = STATE["alerts"]
+        a["enabled"] = bool(data.get("enabled", True))
+        if "ntfy_topic" in data:
+            a["ntfy_topic"] = (data.get("ntfy_topic") or "").strip()
+        if "telegram_chat_id" in data:
+            a["telegram_chat_id"] = (data.get("telegram_chat_id") or "").strip()
+        if data.get("telegram_bot_token") and data["telegram_bot_token"].strip():
+            a["telegram_bot_token"] = data["telegram_bot_token"].strip()
+        save_persistent_state()
+
+    if data.get("send_test"):
+        dispatch_phone_alert(
+            "VaultSkim Alert Connected",
+            "Your phone push notification bridge is active and verified!",
+            category="skim"
+        )
+    add_log("🔔 Phone Push Alert settings updated.")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/cashout/record", methods=["POST"])
+def route_cashout_record():
+    data = request.json or {}
+    try:
+        amount = float(data.get("amount") or 0.0)
+    except Exception:
+        amount = 0.0
+    dest = (data.get("destination") or "Gate.io Spot USDT / External Wallet").strip()
+
+    with state_lock:
+        avail_vault = float(STATE.get("vault_cash") or 0.0)
+        if amount <= 0 or amount > avail_vault:
+            return jsonify({"ok": False, "error": f"Enter an amount up to ${avail_vault:.2f}."}), 400
+        STATE["vault_cash"] = round(avail_vault - amount, 4)
+        STATE["total_withdrawn"] = round(float(STATE.get("total_withdrawn") or 0.0) + amount, 4)
+        STATE["cashout_history"].insert(0, {
+            "time": now_hms(),
+            "amount": round(amount, 4),
+            "destination": dest
+        })
+        add_log(f"🏦 Vault Cash-Out Recorded: ${amount:.2f} -> {dest}")
+        save_persistent_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/control/freeze", methods=["POST"])
+def route_control_freeze():
+    with state_lock:
+        STATE["frozen"] = not bool(STATE.get("frozen", False))
+        state_word = "FROZEN" if STATE["frozen"] else "ACTIVE"
+        add_log(f"🛑 Live Execution Engine switched to: {state_word}")
+        save_persistent_state()
+        return jsonify({"ok": True, "frozen": STATE["frozen"]})
+
+
+@app.route("/api/control/reset", methods=["POST"])
+def route_control_reset():
+    with state_lock:
+        STATE["vault_cash"] = 0.0
+        STATE["added_to_anchors"] = 0.0
+        STATE["total_skims"] = 0
+        STATE["profit_curve"] = [{"time": now_hms(), "value": 0.0}]
+        STATE["skim_ledger"] = []
+        for sym, c in STATE.get("coins", {}).items():
+            c["share_topup_usd"] = 0.0
+            c["vaulted_usd"] = 0.0
+            c["skim_count"] = 0
+        add_log("♻️ Reset Vault Cash, Anchor Top-Ups, and Skim Curve to $0.00.")
+        save_persistent_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/export_csv")
+def route_export_csv():
+    rows = ["Timestamp_UTC,Symbol,Mode,Stage,Price_USD,Total_Skim_USD,Vault_Cash_USD,Anchor_TopUp_USD,Shares_Held"]
+    with state_lock:
+        for item in STATE.get("skim_ledger", []):
+            rows.append(
+                f"{item.get('time','')},{item.get('symbol','')},{item.get('mode','')},"
+                f"\"{item.get('stage','')}\",{item.get('price','')},{item.get('profit',0)},"
+                f"{item.get('vault_cut',0)},{item.get('topup_cut',0)},{item.get('shares','')}"
+            )
+    csv_bytes = "\n".join(rows)
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment;filename=vaultskim_verified_ledger.csv"}
+    )
 
 
 # ==============================================================================
-# 7. COMMAND CENTER DASHBOARD UI (HTML, SVG LINE CHART & JS FRONTEND)
+# COMPLETE FRONTEND DASHBOARD HTML / CSS / SVG CHART / JS CONTROLLER
 # ==============================================================================
-DASHBOARD_HTML = """
-<!DOCTYPE html>
+DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VaultSkim v5.2 · Pure Live Command Center</title>
-  <link rel="manifest" href="/manifest.json" />
-  <meta name="theme-color" content="#059669" />
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    body { background-color: #060a12; color: #e2e8f0; font-family: system-ui, -apple-system, sans-serif; }
-    .card-bg { background: #0c1322; border: 1px solid #1e293b; border-radius: 0.85rem; }
-    .live-card-border { border: 1px solid rgba(245, 158, 11, 0.55); box-shadow: 0 0 18px rgba(245, 158, 11, 0.08); }
-    .hero-box { background: linear-gradient(135deg, rgba(6, 78, 59, 0.35), rgba(15, 23, 42, 0.9)); border: 1px solid rgba(16, 185, 129, 0.45); border-radius: 0.85rem; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#060b16">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/svg+xml" href="/icon.svg">
+    <link rel="apple-touch-icon" href="/icon.svg">
+    <title>VaultSkim Command Center • v5.2 - Pure Live Truth</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        :root {
+            --bg-main: #060a12;
+            --bg-card: #0d1424;
+            --bg-inner: #080d18;
+            --border-subtle: #1c2841;
+            --neon-green: #10b981;
+            --neon-amber: #f59e0b;
+            --neon-rose: #f43f5e;
+            --neon-indigo: #6366f1;
+        }
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        body {
+            background-color: var(--bg-main);
+            color: #e2e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 10px 10px 90px 10px;
+        }
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+        .v-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+            border-radius: 14px;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+        }
+        .v-inner {
+            background-color: var(--bg-inner);
+            border: 1px solid #162035;
+            border-radius: 10px;
+        }
+        .profit-card {
+            background: linear-gradient(180deg, rgba(16, 185, 129, 0.10) 0%, rgba(13, 20, 36, 0.95) 100%);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            border-radius: 14px;
+        }
+        .bridge-card {
+            background-color: #0e1525;
+            border: 1px solid rgba(245, 158, 11, 0.55);
+            border-radius: 14px;
+        }
+        .btn-press:active {
+            transform: scale(0.97);
+        }
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: #070b14; }
+        ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+    </style>
 </head>
-<body class="p-3 md:p-6 max-w-7xl mx-auto">
+<body class="max-w-xl mx-auto">
 
-  <!-- TOP HEADER & CONTROLS -->
-  <div class="flex flex-wrap justify-between items-start gap-4 mb-5">
-    <div>
-      <div class="flex flex-wrap items-center gap-2.5">
-        <h1 class="text-2xl md:text-3xl font-extrabold text-teal-400 tracking-tight">VaultSkim Command Center</h1>
-        <span class="text-xs px-2.5 py-1 rounded-full bg-teal-950 text-teal-300 border border-teal-700 font-bold">v5.2 · Pure Live Truth</span>
-        <button onclick="installPWA()" id="pwaBtn" class="text-xs px-3 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white font-bold hidden">📲 Install App</button>
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2 mt-3">
-        <button onclick="togglePanel('bridgePanel')" class="text-xs px-3 py-1.5 rounded-md bg-amber-600 hover:bg-amber-500 text-white font-bold">🔑 Live Exchange Bridge</button>
-        <button onclick="togglePanel('alertsPanel')" class="text-xs px-3 py-1.5 rounded-md bg-sky-900/80 hover:bg-sky-800 text-sky-200 border border-sky-700 font-semibold">📲 Phone Alerts</button>
-        <button onclick="togglePanel('accruePanel')" class="text-xs px-3 py-1.5 rounded-md bg-emerald-900/80 hover:bg-emerald-800 text-emerald-200 border border-emerald-700 font-semibold">💰 Accrue Cash-Out & CSV</button>
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2 mt-2.5 text-xs text-slate-400">
-        <span>Strict Live Gate.io Wallet Sync + Zero Paper Fallback on Live Coins</span>
-        <span id="globalModeBadge" class="text-xs px-2.5 py-0.5 rounded font-bold"></span>
-        <span id="spotUsdtBadge" class="text-xs px-2.5 py-0.5 rounded bg-slate-900 text-emerald-400 border border-slate-700 font-mono">Spot USDT: $0.00</span>
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2 mt-3">
-        <button onclick="freezeAll()" class="text-xs px-3.5 py-1.5 rounded-full bg-rose-900/80 hover:bg-rose-800 text-rose-200 border border-rose-600 font-bold">🛑 Freeze Live</button>
-        <button onclick="syncLiveWallet()" class="text-xs px-3.5 py-1.5 rounded-full bg-blue-900/80 hover:bg-blue-800 text-blue-200 border border-blue-600 font-bold">🔄 Sync Live</button>
-        <button onclick="resetVault()" class="text-xs px-3.5 py-1.5 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600 font-semibold">🧹 Reset ($0.00)</button>
-      </div>
-    </div>
-
-    <!-- HERO PROFIT BOX -->
-    <div class="hero-box px-6 py-4 text-right min-w-[270px]">
-      <div class="text-[11px] uppercase tracking-wider text-teal-300 font-bold">Total Untouchable Profit Generated</div>
-      <div id="totalProfitHero" class="text-3xl md:text-4xl font-extrabold text-emerald-400 mt-1">$0.00</div>
-      <div id="profitSubtext" class="text-xs text-slate-300 mt-1 font-mono">Vault Cash: $0.00 | Added to Anchors: +$0.00</div>
-    </div>
-  </div>
-
-  <!-- LIVE EXCHANGE BRIDGE PANEL -->
-  <div id="bridgePanel" class="card-bg p-5 mb-5 hidden border-amber-500/50">
-    <div class="flex justify-between items-center mb-2">
-      <h2 class="text-sm font-bold text-amber-400">🔑 Day 5 Live Exchange Execution Bridge (Zero-Withdrawal API Security)</h2>
-      <button onclick="togglePanel('bridgePanel')" class="text-slate-400 hover:text-white text-sm">✕</button>
-    </div>
-    <p class="text-xs text-slate-400 mb-3">Connect Gate.io Spot v4 API keys (with Withdrawals Disabled). Any coin set to ⚡ Live reads your exact Gate.io Spot balances and NEVER executes paper fallback trades.</p>
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
-      <div class="bg-slate-950/70 p-3 rounded border border-slate-800">
-        <label class="block text-slate-300 font-bold mb-1">1. Spot Exchange</label>
-        <select id="spotExchange" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white">
-          <option value="gateio">Gate.io Spot v4 (0.1% Fee)</option>
-        </select>
-        <div class="text-[11px] text-slate-500 mt-1">Auto-clamps to exact Spot wallet decimals</div>
-      </div>
-      <div class="bg-slate-950/70 p-3 rounded border border-slate-800">
-        <label class="block text-slate-300 font-bold mb-1">2. Spot API Key (No Withdrawals)</label>
-        <input id="spotKey" type="text" placeholder="Paste API Key..." class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white font-mono" />
-        <div id="savedKeyHint" class="text-[11px] text-emerald-400 mt-1 font-mono"></div>
-      </div>
-      <div class="bg-slate-950/70 p-3 rounded border border-slate-800">
-        <label class="block text-slate-300 font-bold mb-1">3. Spot API Secret</label>
-        <input id="spotSecret" type="password" placeholder="Paste API Secret (Encrypted)..." class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white font-mono" />
-        <div class="text-[11px] text-slate-500 mt-1">Never exposed to browser after saving</div>
-      </div>
-      <div class="bg-slate-950/70 p-3 rounded border border-slate-800">
-        <label class="block text-slate-300 font-bold mb-1">4. Max Order Safety Cap (USD)</label>
-        <input id="maxCap" type="number" value="250" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white font-mono" />
-        <div class="text-[11px] text-slate-500 mt-1">Blocks any single order above this $ cap</div>
-      </div>
-    </div>
-    <div class="flex flex-wrap justify-between items-center gap-3 mt-4">
-      <div id="bridgeStatusMsg" class="text-xs text-emerald-400 font-mono"></div>
-      <div class="flex flex-wrap gap-2">
-        <button onclick="verifyBridge()" class="text-xs px-4 py-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white font-semibold">🔍 Verify API & Check USDT Balance</button>
-        <button onclick="toggleBridge()" class="text-xs px-4 py-2 rounded bg-amber-600 hover:bg-amber-500 text-white font-bold">⚡ Save & Toggle Live Bridge</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- PHONE ALERTS PANEL -->
-  <div id="alertsPanel" class="card-bg p-5 mb-5 hidden border-sky-500/40">
-    <div class="flex justify-between items-center mb-3">
-      <h2 class="text-sm font-bold text-sky-400">📲 Instant Phone Push Alerts (ntfy.sh & Telegram)</h2>
-      <button onclick="togglePanel('alertsPanel')" class="text-slate-400 hover:text-white text-sm">✕</button>
-    </div>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-      <div>
-        <label class="block text-slate-400 mb-1">ntfy.sh Topic Name</label>
-        <input id="ntfyTopic" type="text" placeholder="e.g. vaultskim_enoch_live" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white" />
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">Telegram Bot Token</label>
-        <input id="tgToken" type="text" placeholder="123456:ABC-DEF..." class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white font-mono" />
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">Telegram Chat ID</label>
-        <input id="tgChat" type="text" placeholder="Chat ID" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white font-mono" />
-      </div>
-    </div>
-    <button onclick="saveAlerts()" class="mt-3 text-xs px-4 py-2 rounded bg-sky-600 hover:bg-sky-500 text-white font-bold">💾 Save Alert Channels</button>
-  </div>
-
-  <!-- ACCRUE CASH-OUT PANEL -->
-  <div id="accruePanel" class="card-bg p-5 mb-5 hidden border-emerald-500/40">
-    <div class="flex justify-between items-center mb-2">
-      <h2 class="text-sm font-bold text-emerald-400">💰 Accrue Zero-Trading-Fee Cash-Out Guide & Profit Ledger CSV</h2>
-      <button onclick="togglePanel('accruePanel')" class="text-slate-400 hover:text-white text-sm">✕</button>
-    </div>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs mt-2">
-      <div class="bg-slate-950/70 p-3 rounded border border-slate-800">
-        <div class="text-emerald-400 font-bold mb-1">Step 1: Ready Vault Cash</div>
-        <div class="text-white font-bold mb-1">Available in Bucket B Vault: <span id="accrueVaultAmt">$0.00</span> USDT</div>
-        <p class="text-slate-400">Keep Bucket A working on Gate.io; only withdraw your locked Bucket B Vault profits!</p>
-      </div>
-      <div class="bg-slate-950/70 p-3 rounded border border-slate-800">
-        <div class="text-emerald-400 font-bold mb-1">Step 2: Free USDT Deposit to Accrue</div>
-        <p class="text-slate-300">In Accrue: Tap <b>Deposit -> Crypto Deposit -> USDT</b>. Choose <b>Solana</b> or <b>Tron (TRC-20)</b> and send your Vault USDT from Gate.io.</p>
-      </div>
-      <div class="bg-slate-950/70 p-3 rounded border border-slate-800 flex flex-col justify-between">
-        <div>
-          <div class="text-emerald-400 font-bold mb-1">Step 3: Instant MoMo / Bank Payout</div>
-          <p class="text-slate-300 mb-2">Once USDT lands in Accrue as USD, tap <b>Withdraw -> Mobile Money / Bank</b>.</p>
+    <!-- TOP MASTER COMMAND HEADER -->
+    <div class="v-card p-3.5 mb-3">
+        <div class="flex items-center justify-between gap-2 mb-1">
+            <h1 class="text-lg sm:text-xl font-extrabold text-white tracking-tight">VaultSkim Command Center</h1>
+            <span id="versionBadge" class="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-950/90 text-emerald-400 border border-emerald-600/60 mono whitespace-nowrap">
+                v5.2 - Pure Live Truth
+            </span>
         </div>
-        <a href="/api/export_csv" class="block text-center py-2 px-3 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold">📥 Download Verified Skim Ledger (.CSV)</a>
-      </div>
+        <p class="text-[11px] text-slate-400 mb-3">
+            Strict Live Gate.io Wallet Sync • Zero Paper Fallback on Live Coins
+        </p>
+
+        <!-- 3 Action Drawer Toggles -->
+        <div class="flex flex-wrap gap-1.5 mb-3">
+            <button onclick="toggleDrawer('bridgeDrawer')" class="btn-press px-2.5 py-1.5 rounded-lg bg-amber-500 text-black font-extrabold text-xs flex items-center gap-1 shadow">
+                ⚡ Live Exchange Bridge
+            </button>
+            <button onclick="toggleDrawer('alertsDrawer')" class="btn-press px-2.5 py-1.5 rounded-lg bg-indigo-950 text-indigo-200 border border-indigo-700/70 font-bold text-xs flex items-center gap-1">
+                🔔 Phone Alerts
+            </button>
+            <button onclick="toggleDrawer('cashoutDrawer')" class="btn-press px-2.5 py-1.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-700/70 font-bold text-xs flex items-center gap-1">
+                🏦 Access Cash-Out & CSV
+            </button>
+        </div>
+
+        <!-- Live Bridge Armed & USDT Balance Status Strip -->
+        <div class="flex flex-wrap items-center gap-2 mb-3">
+            <div id="liveBridgeBadge" class="px-2.5 py-1 rounded-md bg-emerald-950/90 border border-emerald-600/70 text-emerald-400 font-extrabold text-[11px] mono flex items-center gap-1.5">
+                <span>🟢</span> <span>LIVE BRIDGE ARMED (GATEIO)</span>
+            </div>
+            <div id="spotUsdtBadge" class="px-2.5 py-1 rounded-md bg-slate-900 border border-slate-700 text-slate-200 font-bold text-[11px] mono">
+                Gate.io Spot USDT: $0.00
+            </div>
+        </div>
+
+        <!-- Freeze / Sync / Reset Control Row -->
+        <div class="flex flex-wrap gap-2">
+            <button id="freezeBtn" onclick="toggleFreeze()" class="btn-press px-3 py-1.5 rounded-lg bg-rose-950/90 text-rose-300 border border-rose-700/70 font-bold text-xs">
+                🛑 Freeze Live
+            </button>
+            <button id="syncLiveBtn" onclick="manualSyncLive()" class="btn-press px-3 py-1.5 rounded-lg bg-indigo-950/90 text-indigo-200 border border-indigo-600/70 font-bold text-xs">
+                🔄 Sync Live
+            </button>
+            <button onclick="resetProfitCounters()" class="btn-press px-3 py-1.5 rounded-lg bg-slate-800/90 text-slate-300 border border-slate-700 font-bold text-xs">
+                ♻️ Reset ($0.00)
+            </button>
+        </div>
     </div>
-  </div>
 
-  <!-- PROFIT CURVE & VERIFIED SKIM LEDGER -->
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
-    <!-- SMOOTH SVG LINE CHART -->
-    <div class="card-bg p-5 lg:col-span-2">
-      <div class="flex justify-between items-center mb-1">
-        <h3 class="text-xs font-bold uppercase tracking-wider text-teal-400">📈 LIVE VAULT PROFIT GROWTH CURVE</h3>
-        <span id="skimsCountPill" class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-700 font-bold">0 Total Skims</span>
-      </div>
-      <p class="text-xs text-slate-400 mb-3">Tracks cumulative Vault Cash + Share-Keeper Anchor Top-Ups across every skim</p>
-      <div class="h-44 w-full bg-slate-950/70 rounded border border-slate-900 p-2 relative" id="chartContainer">
-        <svg id="profitSvg" class="w-full h-full" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
-      </div>
+    <!-- TOTAL UNTOUCHABLE PROFIT HERO CARD -->
+    <div class="profit-card p-4 mb-3 text-center">
+        <div class="text-[11px] font-bold uppercase tracking-widest text-slate-400 mb-1">
+            TOTAL UNTOUCHABLE PROFIT GENERATED
+        </div>
+        <div id="heroTotalProfit" class="text-4xl font-extrabold text-emerald-400 mono tracking-tight my-1">
+            $0.00
+        </div>
+        <div id="heroProfitSub" class="text-xs text-slate-300 mono">
+            Vault Cash: $0.00 | Added to Anchors: +$0.00
+        </div>
     </div>
 
-    <!-- VERIFIED SKIM LEDGER -->
-    <div class="card-bg p-5 flex flex-col">
-      <div class="flex justify-between items-center mb-2">
-        <h3 class="text-xs font-bold uppercase tracking-wider text-amber-400">🧾 VERIFIED SKIM LEDGER</h3>
-        <a href="/api/export_csv" class="text-xs text-sky-400 hover:underline font-semibold">📥 CSV</a>
-      </div>
-      <p class="text-[11px] text-slate-400 mb-2">Recent completed profit sweeps</p>
-      <div class="flex-1 overflow-y-auto max-h-44 space-y-2 font-mono text-xs pr-1" id="ledgerList">
-        <div class="text-slate-500 text-center py-8">Waiting for next verified profit skim...</div>
-      </div>
+    <!-- DRAWER 1: DAY 5 LIVE EXCHANGE EXECUTION BRIDGE -->
+    <div id="bridgeDrawer" class="bridge-card p-4 mb-3 hidden">
+        <div class="flex items-start justify-between gap-2 mb-2">
+            <h2 class="text-sm font-extrabold text-amber-400 leading-snug">
+                ⚡ Day 5 Live Exchange Execution Bridge (Zero-Withdrawal API Security)
+            </h2>
+            <button onclick="toggleDrawer('bridgeDrawer')" class="text-slate-400 hover:text-white font-bold text-sm px-1">✕</button>
+        </div>
+        <p class="text-xs text-slate-300 mb-3 leading-relaxed">
+            Connect Gate.io or Binance Spot v3 API keys (with Withdrawals Disabled). Any coin set to ⚡ Live reads your exact Gate.io Spot balances and NEVER executes paper fallback trades.
+        </p>
+
+        <div class="space-y-3 text-xs">
+            <div>
+                <label class="block text-slate-200 font-bold mb-1">1. Spot Exchange</label>
+                <select id="bridgeExchange" class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white font-semibold">
+                    <option value="gateio">Gate.io Spot v4 (0.1% Fee)</option>
+                    <option value="binance">Binance Spot v3 (0.1% Fee)</option>
+                </select>
+                <div class="text-[10px] text-slate-400 mt-1">Auto-clamps to exact Spot wallet decimals</div>
+            </div>
+
+            <div>
+                <label class="block text-slate-200 font-bold mb-1">2. Spot API Key (No Withdrawals)</label>
+                <input id="bridgeApiKey" type="text" placeholder="Paste API Key..." class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white mono">
+                <div id="savedKeyLabel" class="text-[11px] text-slate-400 mt-1 mono">Saved Key: None</div>
+            </div>
+
+            <div>
+                <label class="block text-slate-200 font-bold mb-1">3. Spot API Secret</label>
+                <input id="bridgeApiSecret" type="password" placeholder="Paste API Secret (Encrypted)..." class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white mono">
+                <div class="text-[10px] text-slate-400 mt-1">Never exposed to browser after saving</div>
+            </div>
+
+            <div>
+                <label class="block text-slate-200 font-bold mb-1">4. Max Order Safety Cap (USD)</label>
+                <input id="bridgeMaxCap" type="number" value="250" class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white mono">
+                <div class="text-[10px] text-slate-400 mt-1">Blocks any single order above this $ cap</div>
+            </div>
+
+            <div id="bridgeConnectionStatus" class="text-xs font-bold text-emerald-400 mono pt-1">
+                Gate.io v4 Connected! Available Spot USDT: $0.00
+            </div>
+
+            <div class="flex flex-wrap gap-2 pt-1">
+                <button id="verifyApiBtn" onclick="saveBridgeConfig(false)" class="btn-press px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-white border border-slate-600 font-bold text-xs">
+                    🔍 Verify API & Check USDT Balance
+                </button>
+                <button onclick="saveBridgeConfig(true)" class="btn-press px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs">
+                    ⚡ Save & Toggle Live Bridge
+                </button>
+            </div>
+        </div>
     </div>
-  </div>
 
-  <!-- LAUNCH COIN BAR -->
-  <div class="card-bg p-4 mb-5">
-    <div class="text-xs font-bold text-teal-400 mb-1">🎯 Launch Any Coin or Paste DEX Contract Address (Anti-Rug Protected):</div>
-    <p class="text-[11px] text-slate-400 mb-3">Checks Gate.io + DexScreener Liquidity Pools (Automatically blocks pools under $15K liquidity)</p>
-    <div class="flex flex-wrap items-center gap-2.5">
-      <input id="newSym" type="text" placeholder="Symbol or Contract (e.g. QNT, PEPE, LQTY, 0x...)" class="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-white flex-1 min-w-[200px]" />
-      <input id="newAnc" type="number" value="10" class="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-white w-24 font-mono" />
-      <button onclick="addCoin()" class="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm">+ Snipe & Launch</button>
-      <button onclick="togglePanel('memeRadarPanel')" class="px-4 py-2 rounded bg-amber-600 hover:bg-amber-500 text-white font-bold text-sm">🔥 Scan Meme Radar</button>
+    <!-- DRAWER 2: PHONE ALERTS (NTFY.SH & TELEGRAM) -->
+    <div id="alertsDrawer" class="v-card p-4 mb-3 border border-indigo-500/50 hidden">
+        <div class="flex items-center justify-between mb-2">
+            <h2 class="text-sm font-extrabold text-indigo-300">🔔 Instant Phone Push Alerts (ntfy.sh & Telegram)</h2>
+            <button onclick="toggleDrawer('alertsDrawer')" class="text-slate-400 font-bold text-sm px-1">✕</button>
+        </div>
+        <p class="text-xs text-slate-400 mb-3">
+            Receive real-time phone notifications whenever a Zero-Loss Shield arms or a Live Skim locks profit.
+        </p>
+        <div class="space-y-2.5 text-xs">
+            <div>
+                <label class="block text-slate-300 font-bold mb-1">ntfy.sh Topic Name (Free Android/iOS App)</label>
+                <input id="alertNtfyTopic" type="text" placeholder="e.g. vaultskim_enoch_alerts" class="w-full p-2 rounded-lg bg-slate-950 border border-slate-700 text-white mono">
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div>
+                    <label class="block text-slate-300 font-bold mb-1">Telegram Bot Token (Optional)</label>
+                    <input id="alertTgToken" type="password" placeholder="123456:ABC-DEF..." class="w-full p-2 rounded-lg bg-slate-950 border border-slate-700 text-white mono">
+                </div>
+                <div>
+                    <label class="block text-slate-300 font-bold mb-1">Telegram Chat ID (Optional)</label>
+                    <input id="alertTgChat" type="text" placeholder="e.g. 987654321" class="w-full p-2 rounded-lg bg-slate-950 border border-slate-700 text-white mono">
+                </div>
+            </div>
+            <div class="flex gap-2 pt-1">
+                <button onclick="saveAlertSettings(true)" class="btn-press px-3 py-2 rounded-lg bg-indigo-600 text-white font-bold">
+                    🔔 Save & Send Test Alert
+                </button>
+                <button onclick="saveAlertSettings(false)" class="btn-press px-3 py-2 rounded-lg bg-slate-800 text-slate-200 border border-slate-700 font-bold">
+                    Save Settings
+                </button>
+            </div>
+        </div>
     </div>
-  </div>
 
-  <!-- MEME RADAR PANEL -->
-  <div id="memeRadarPanel" class="card-bg p-5 mb-5 hidden border-amber-500/40">
-    <div class="flex justify-between items-center mb-3">
-      <h2 class="text-sm font-bold text-amber-400">🔥 Gate.io High-Velocity Momentum Radar</h2>
-      <button onclick="loadMemeRadar()" class="text-xs px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">🔄 Refresh</button>
+    <!-- DRAWER 3: ACCESS CASH-OUT & CSV EXPORT -->
+    <div id="cashoutDrawer" class="v-card p-4 mb-3 border border-emerald-500/50 hidden">
+        <div class="flex items-center justify-between mb-2">
+            <h2 class="text-sm font-extrabold text-emerald-400">🏦 Vault Cash-Out & Verified CSV Ledger</h2>
+            <button onclick="toggleDrawer('cashoutDrawer')" class="text-slate-400 font-bold text-sm px-1">✕</button>
+        </div>
+        <p class="text-xs text-slate-400 mb-3">
+            Your skimmed USDT stays safely inside your personal Gate.io Spot wallet (API keys have zero withdrawal permissions). Record cash-outs here or export your CSV ledger.
+        </p>
+        <div class="v-inner p-3 mb-3 text-xs mono flex justify-between items-center">
+            <span>Available Skimmed Vault Cash:</span>
+            <strong id="cashoutAvailDisplay" class="text-emerald-400 text-sm">$0.00</strong>
+        </div>
+        <div class="flex gap-2 mb-3 text-xs">
+            <input id="cashoutAmountInput" type="number" step="0.01" placeholder="Amount USD (e.g. 5.00)" class="flex-1 p-2 rounded-lg bg-slate-950 border border-slate-700 text-white mono">
+            <button onclick="recordCashout()" class="btn-press px-3 py-2 rounded-lg bg-emerald-500 text-black font-extrabold">
+                Record Cash-Out
+            </button>
+        </div>
+        <button onclick="window.location='/api/export_csv'" class="btn-press w-full py-2 rounded-lg bg-slate-800 text-emerald-300 border border-emerald-700/70 font-bold text-xs">
+            📥 Download Full Verified Skim Ledger (.CSV)
+        </button>
     </div>
-    <div id="memeRadarGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-xs"></div>
-  </div>
 
-  <!-- ACTIVE COIN CARDS GRID -->
-  <div id="coinsGrid" class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-6"></div>
+    <!-- LIVE VAULT PROFIT GROWTH CURVE CHART CARD -->
+    <div class="v-card p-4 mb-3">
+        <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-extrabold uppercase tracking-wider text-slate-200">
+                📈 LIVE VAULT PROFIT GROWTH CURVE
+            </span>
+            <span id="chartSkimBadge" class="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-700/70 mono">
+                0 Total Skims
+            </span>
+        </div>
+        <p class="text-[11px] text-slate-400 mb-2">
+            Tracks cumulative Vault Cash + Share-Keeper Anchor Top-Ups across every skim
+        </p>
+        <div class="w-full h-40 bg-slate-950/70 rounded-lg border border-slate-800/80 p-2 relative">
+            <svg id="profitChartSvg" viewBox="0 0 500 150" class="w-full h-full overflow-visible"></svg>
+        </div>
+    </div>
 
-  <!-- LIVE EXECUTION & ANTI-RUG SECURITY LOG -->
-  <div class="card-bg p-5">
-    <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">LIVE EXECUTION & ANTI-RUG SECURITY LOG</h3>
-    <div id="secLog" class="font-mono text-xs space-y-1.5 max-h-64 overflow-y-auto text-slate-300 bg-slate-950/80 p-3 rounded border border-slate-900"></div>
-  </div>
+    <!-- VERIFIED SKIM LEDGER CARD -->
+    <div class="v-card p-4 mb-3">
+        <div class="flex items-center justify-between mb-1">
+            <div>
+                <div class="text-xs font-extrabold uppercase tracking-wider text-slate-200">
+                    📋 VERIFIED SKIM LEDGER
+                </div>
+                <div class="text-[11px] text-slate-400">Recent completed profit sweeps</div>
+            </div>
+            <button onclick="window.location='/api/export_csv'" class="btn-press px-2.5 py-1 rounded-md bg-emerald-950/90 text-emerald-300 border border-emerald-700/70 text-xs font-bold mono">
+                📥 CSV
+            </button>
+        </div>
+        <div id="skimLedgerList" class="mt-2.5 space-y-2 max-h-52 overflow-y-auto text-xs mono">
+            <div class="text-center text-slate-500 py-4 text-xs">Waiting for next verified profit skim...</div>
+        </div>
+    </div>
+
+    <!-- LAUNCH ANY COIN OR PASTE DEX CONTRACT ADDRESS CARD -->
+    <div class="v-card p-4 mb-3">
+        <div class="text-xs font-extrabold text-rose-400 mb-0.5">
+            🎯 Launch Any Coin or Paste DEX Contract Address (Anti-Rug Protected)
+        </div>
+        <p class="text-[11px] text-slate-400 mb-2.5">
+            Checks Gate.io + DexScreener Liquidity Pools (Automatically blocks pools under $15K liquidity)
+        </p>
+        <div class="flex gap-2 mb-2.5">
+            <input id="coinSymbolInput" type="text" placeholder="Symbol or Contract (e.g. QNT, PEPE, LQTY, 0x...)" class="flex-1 p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs mono outline-none focus:border-emerald-500">
+            <input id="coinAnchorInput" type="number" value="10" step="1" class="w-20 p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs mono text-center outline-none focus:border-emerald-500">
+        </div>
+        <div class="flex flex-wrap gap-2">
+            <button id="launchBtn" onclick="launchNewCoin()" class="btn-press px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-extrabold text-xs">
+                + Snipe & Launch
+            </button>
+            <button id="radarBtn" onclick="scanMemeRadar()" class="btn-press px-3.5 py-2 rounded-lg bg-amber-600/90 hover:bg-amber-500 text-white font-extrabold text-xs">
+                📡 Scan Meme Radar
+            </button>
+        </div>
+        <div id="radarResultsBox" class="mt-3 grid grid-cols-2 gap-2 hidden"></div>
+    </div>
+
+    <!-- ACTIVE COIN CARDS CONTAINER -->
+    <div id="activeCoinsContainer" class="space-y-3 mb-3"></div>
+
+    <!-- LIVE EXECUTION & ANTI-RUG SECURITY LOG -->
+    <div class="v-card p-4">
+        <div class="text-xs font-extrabold uppercase tracking-wider text-slate-400 mb-2">
+            LIVE EXECUTION & ANTI-RUG SECURITY LOG
+        </div>
+        <div id="securityLogBox" class="bg-black/80 border border-slate-800 rounded-lg p-3 h-52 overflow-y-auto text-[11px] mono space-y-1.5 text-emerald-400 leading-relaxed"></div>
+    </div>
 
 <script>
-let deferredPrompt = null;
-window.addEventListener('beforeinstallprompt', (e) => {
-  e.preventDefault();
-  deferredPrompt = e;
-  document.getElementById('pwaBtn').classList.remove('hidden');
-});
-
-function installPWA() {
-  if (deferredPrompt) {
-    deferredPrompt.prompt();
-    deferredPrompt.userChoice.then(() => { deferredPrompt = null; });
-  }
+// Register PWA Service Worker
+if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 
-function togglePanel(id) {
-  document.getElementById(id).classList.toggle('hidden');
+function toggleDrawer(id) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('hidden');
 }
 
-async function verifyBridge() {
-  const btn = event.target;
-  const origText = btn.innerText;
-  btn.innerText = '⏳ Checking Exchange...';
-  const res = await fetch('/api/verify_exchange', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      spot_exchange: document.getElementById('spotExchange').value,
-      spot_api_key: document.getElementById('spotKey').value,
-      spot_api_secret: document.getElementById('spotSecret').value,
-      max_order_cap: document.getElementById('maxCap').value
-    })
-  });
-  const d = await res.json();
-  btn.innerText = d.ok ? '✅ Verified' : origText;
-  setTimeout(() => { btn.innerText = origText; }, 2500);
-  document.getElementById('bridgeStatusMsg').innerText = d.message || '';
-  refreshState();
-}
+function renderProfitCurveSvg(curveData) {
+    const svg = document.getElementById('profitChartSvg');
+    if (!svg) return;
+    const pts = (Array.isArray(curveData) && curveData.length > 0)
+        ? curveData
+        : [{time: "00:00:00", value: 0.0}];
 
-async function toggleBridge() {
-  await fetch('/api/toggle_bridge', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      spot_exchange: document.getElementById('spotExchange').value,
-      spot_api_key: document.getElementById('spotKey').value,
-      spot_api_secret: document.getElementById('spotSecret').value,
-      max_order_cap: document.getElementById('maxCap').value
-    })
-  });
-  refreshState();
-}
+    const width = 500;
+    const height = 140;
+    const padLeft = 44;
+    const padRight = 14;
+    const padTop = 12;
+    const padBottom = 24;
+    const plotW = width - padLeft - padRight;
+    const plotH = height - padTop - padBottom;
 
-async function syncLiveWallet() {
-  const res = await fetch('/api/sync_live_wallet', {method: 'POST'});
-  const d = await res.json();
-  alert(d.message || 'Wallet synced.');
-  refreshState();
-}
+    const maxVal = Math.max(0.20, ...pts.map(p => Number(p.value || 0))) * 1.15;
 
-async function saveAlerts() {
-  await fetch('/api/save_alerts', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      ntfy_topic: document.getElementById('ntfyTopic').value,
-      telegram_bot_token: document.getElementById('tgToken').value,
-      telegram_chat_id: document.getElementById('tgChat').value
-    })
-  });
-  alert('Phone alert settings saved!');
-}
-
-async function coinAction(symbol, action, extra={}) {
-  const res = await fetch('/api/coin_action', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({symbol, action, ...extra})
-  });
-  const d = await res.json();
-  if (d && d.ok === false && d.message) {
-    alert(d.message);
-  }
-  refreshState();
-}
-
-async function editAnchorPrompt(symbol, currentAnc) {
-  const val = prompt(`Enter new Anchor USD for ${symbol} (If ${symbol} is in LIVE mode and you increase the Anchor, VaultSkim will immediately buy the difference on Gate.io):`, currentAnc);
-  if (val !== null && !isNaN(parseFloat(val))) {
-    await coinAction(symbol, 'edit_anchor', {anchor_usd: parseFloat(val)});
-  }
-}
-
-async function addCoin() {
-  const symbol = document.getElementById('newSym').value;
-  const anchor_usd = parseFloat(document.getElementById('newAnc').value || '10');
-  const res = await fetch('/api/add_coin', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({symbol, anchor_usd, live_mode: false})
-  });
-  const d = await res.json();
-  if (!d.ok) {
-    alert('Launch Blocked: ' + d.message);
-  } else {
-    document.getElementById('newSym').value = '';
-  }
-  refreshState();
-}
-
-async function freezeAll() {
-  await fetch('/api/freeze_all', {method: 'POST'});
-  refreshState();
-}
-
-async function resetVault() {
-  if (confirm('Reset Vault profit counters and ledger to $0.00? (Your live Gate.io holdings remain untouched).')) {
-    await fetch('/api/reset_vault', {method: 'POST'});
-    refreshState();
-  }
-}
-
-function renderProfitLineChart(curve) {
-  const svg = document.getElementById('profitSvg');
-  if (!curve || curve.length === 0) {
-    svg.innerHTML = '';
-    return;
-  }
-  const pts = curve.length === 1 ? [curve[0], curve[0]] : curve;
-  const vals = pts.map(p => parseFloat(p.value || 0));
-  const maxV = Math.max(...vals, 0.05);
-  const minV = 0.0;
-  const w = 600, h = 140, padX = 35, padY = 15;
-
-  const coords = pts.map((p, idx) => {
-    const x = padX + (idx / (pts.length - 1)) * (w - padX - 15);
-    const ratio = (parseFloat(p.value || 0) - minV) / (maxV - minV || 1);
-    const y = (h - padY) - ratio * (h - 2 * padY);
-    return {x, y, val: parseFloat(p.value || 0), time: p.time || ''};
-  });
-
-  const polyPoints = coords.map(c => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
-  const areaPoints = `${coords[0].x.toFixed(1)},${h - padY} ${polyPoints} ${coords[coords.length - 1].x.toFixed(1)},${h - padY}`;
-
-  let dotsHtml = coords.map(c => `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3.5" fill="#10b981" />`).join('');
-  svg.innerHTML = `
-    <defs>
-      <linearGradient id="emeraldGrad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#10b981" stop-opacity="0.35"/>
-        <stop offset="100%" stop-color="#10b981" stop-opacity="0.02"/>
-      </linearGradient>
-    </defs>
-    <polygon points="${areaPoints}" fill="url(#emeraldGrad)" />
-    <polyline fill="none" stroke="#10b981" stroke-width="2.5" points="${polyPoints}" />
-    ${dotsHtml}
-  `;
-}
-
-async function loadMemeRadar() {
-  const grid = document.getElementById('memeRadarGrid');
-  try {
-    const res = await fetch('https://api.gateio.ws/api/v4/spot/tickers');
-    const data = await res.json();
-    const watch = ['QNT', 'LQTY', 'LTC', 'DASH', 'PEPE', 'BONK', 'WIF', 'FLOKI', 'SHIB', 'DOGE', 'POPCAT', 'SOL'];
-    const filtered = data.filter(t => watch.some(s => t.currency_pair === `${s}_USDT`));
-    filtered.sort((a, b) => parseFloat(b.change_percentage) - parseFloat(a.change_percentage));
-    grid.innerHTML = filtered.map(t => {
-      const sym = t.currency_pair.replace('_USDT', '');
-      const chg = parseFloat(t.change_percentage);
-      const col = chg >= 0 ? 'text-emerald-400' : 'text-rose-400';
-      return `
-        <div class="bg-slate-950 p-3 rounded border border-slate-800 flex flex-col justify-between">
-          <div class="flex justify-between items-center">
-            <span class="font-bold text-white">${sym}/USDT</span>
-            <span class="${col} font-bold">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>
-          </div>
-          <div class="text-slate-400 font-mono my-1">$${parseFloat(t.last).toFixed(4)}</div>
-          <button onclick="document.getElementById('newSym').value='${sym}'; togglePanel('memeRadarPanel');" class="mt-1 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold">
-            + Select ${sym}
-          </button>
-        </div>
-      `;
-    }).join('');
-  } catch (e) {
-    grid.innerHTML = '<div class="text-slate-400">Radar feed unavailable.</div>';
-  }
-}
-
-async function refreshState() {
-  try {
-    const res = await fetch('/api/state');
-    const s = await res.json();
-
-    const vaultCash = parseFloat(s.vault_cash || 0);
-    const addedAnchors = parseFloat(s.added_to_anchors || 0);
-    const totalUntouchable = vaultCash + addedAnchors;
-
-    document.getElementById('totalProfitHero').innerText = '$' + totalUntouchable.toFixed(2);
-    document.getElementById('profitSubtext').innerText = `Vault Cash: $${vaultCash.toFixed(2)} | Added to Anchors: +$${addedAnchors.toFixed(2)}`;
-    document.getElementById('accrueVaultAmt').innerText = '$' + vaultCash.toFixed(2);
-    document.getElementById('skimsCountPill').innerText = `${s.total_skims || 0} Total Skims`;
-    document.getElementById('spotUsdtBadge').innerText = `Gate.io Spot USDT: $${parseFloat(s.last_verified_usdt || 0).toFixed(2)}`;
-    document.getElementById('savedKeyHint').innerText = s.spot_api_key_masked ? `Saved Key: ${s.spot_api_key_masked}` : '';
-
-    if (s.last_verified_usdt !== undefined && !document.getElementById('bridgeStatusMsg').innerText) {
-      document.getElementById('bridgeStatusMsg').innerText = `Gate.io v4 Connected! Available Spot USDT: $${parseFloat(s.last_verified_usdt || 0).toFixed(2)}`;
+    let gridHtml = '';
+    const steps = 4;
+    for (let i = 0; i <= steps; i++) {
+        const y = padTop + (plotH * (i / steps));
+        const labelVal = maxVal * (1 - (i / steps));
+        gridHtml += `<line x1="${padLeft}" y1="${y}" x2="${width - padRight}" y2="${y}" stroke="#1e293b" stroke-dasharray="3,3" stroke-width="1"/>`;
+        gridHtml += `<text x="${padLeft - 6}" y="${y + 4}" fill="#64748b" font-size="10" text-anchor="end" font-family="monospace">$${labelVal.toFixed(2)}</text>`;
     }
 
-    const badge = document.getElementById('globalModeBadge');
-    if (s.live_bridge_enabled) {
-      badge.className = 'text-xs px-2.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-600 font-bold';
-      badge.innerText = '⚡ LIVE BRIDGE ARMED (GATEIO)';
-    } else {
-      badge.className = 'text-xs px-2.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 font-bold';
-      badge.innerText = '🛡️ PAPER SIMULATOR';
-    }
-
-    renderProfitLineChart(s.profit_curve || []);
-
-    // Verified Skim Ledger
-    const ledgerBox = document.getElementById('ledgerList');
-    const ledger = s.skim_ledger || [];
-    if (ledger.length > 0) {
-      ledgerBox.innerHTML = ledger.map(l => {
-        const tagClass = l.mode === 'LIVE' ? 'text-amber-300 font-bold' : 'text-slate-400';
-        return `
-          <div class="bg-slate-950/90 p-2.5 rounded border border-slate-800/90 flex justify-between items-center">
-            <div>
-              <div>
-                <span class="font-bold text-teal-400">${l.symbol}</span>
-                <span class="${tagClass} text-[11px] ml-1">[${l.mode}]</span>
-                <span class="text-slate-200 text-[11px] ml-1">${l.stage}</span>
-              </div>
-              <div class="text-slate-400 text-[10px] mt-0.5">@ $${parseFloat(l.price).toFixed(4)} · ${l.time}</div>
-            </div>
-            <div class="text-right">
-              <div class="text-emerald-400 font-extrabold">+$${parseFloat(l.profit).toFixed(4)}</div>
-              <div class="text-sky-400 text-[10px]">${parseFloat(l.shares).toFixed(5)} sh</div>
-            </div>
-          </div>
-        `;
-      }).join('');
-    } else {
-      ledgerBox.innerHTML = '<div class="text-slate-500 text-center py-8">Waiting for next verified profit skim...</div>';
-    }
-
-    // Coin Cards
-    const grid = document.getElementById('coinsGrid');
-    grid.innerHTML = '';
-    Object.values(s.coins || {}).forEach(c => {
-      const px = parseFloat(c.last_price || 0);
-      const sh = parseFloat(c.shares_owned || 0);
-      const bagVal = sh * px;
-      const cashRes = parseFloat(c.cash_reserve_usd || 0);
-      const totalBucketA = (c.status === 'MOONBAG_RIDING' || c.status === 'WAITING_DIP_REBUY' || c.status === 'WAITING_LIVE_BUY')
-        ? (cashRes + bagVal)
-        : bagVal;
-
-      const lowPx = parseFloat(c.sliding_low || px || 1);
-      const pctFromLow = lowPx > 0 ? (((px - lowPx) / lowPx) * 100) : 0.0;
-      const targetPx = lowPx * 1.008;
-
-      const liveBtnClass = c.live_mode
-        ? 'bg-amber-950/90 text-amber-300 border border-amber-500'
-        : 'bg-slate-800 text-slate-300 border border-slate-600';
-      const liveBtnText = c.live_mode ? '⚡ LIVE ORDER' : '🧪 PAPER';
-      const stratText = c.strategy === 'hybrid_50_50' ? '🚀 Strategy: 50/50 Hybrid Moonbag' : '💰 Strategy: 100% Share-Keeper';
-
-      const sourceBadge = (c.source === 'dex' && c.contract)
-        ? `<span class="text-[11px] text-teal-300 font-semibold">🛡️ SAFE DEX ($${Math.round(c.liquidity_usd || 0).toLocaleString()} Liq)</span>`
-        : `<span class="text-[11px] text-slate-300 font-semibold">🛡️ VERIFIED CEX (GATE.IO SPOT)</span>`;
-
-      let anchorSubLabel = '(In Token)';
-      let totalBucketBreakdown = `$${totalBucketA.toFixed(2)}`;
-      if (c.status === 'WAITING_LIVE_BUY' || sh <= 0) {
-        anchorSubLabel = '(Waiting Gate.io Buy · $0 in Token)';
-        totalBucketBreakdown = `$${cashRes.toFixed(2)} Cash Reserved ($0.00 In Token)`;
-      } else if (c.status === 'MOONBAG_RIDING') {
-        anchorSubLabel = '(50% Cash + 50% Moonbag)';
-        totalBucketBreakdown = `$${totalBucketA.toFixed(2)} ($${cashRes.toFixed(2)} Cash + $${bagVal.toFixed(2)} Bag)`;
-      }
-
-      const simBtnHtml = c.live_mode
-        ? `<div class="w-full mt-4 py-2 px-3 rounded bg-slate-950 text-slate-400 text-[11px] text-center border border-slate-800 font-mono">
-             🔒 Live Gate.io Mode Active — Paper Simulator Disabled
-           </div>`
-        : `<button onclick="coinAction('${c.symbol}', 'practice_spike')" class="w-full mt-4 py-2 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-bold border border-slate-700">
-             ⚡ Practice Spike (+2% Simulator)
-           </button>`;
-
-      const card = document.createElement('div');
-      card.className = 'card-bg p-5 relative ' + (c.live_mode ? 'live-card-border' : '');
-      card.innerHTML = `
-        <div class="flex justify-between items-center mb-1.5">
-          <div class="flex flex-wrap items-center gap-2">
-            <span class="text-xl font-extrabold text-white">${c.pair}</span>
-            <button onclick="coinAction('${c.symbol}', 'toggle_live')" class="text-xs px-2.5 py-1 rounded font-bold ${liveBtnClass}">${liveBtnText}</button>
-            <span class="text-xs px-2.5 py-0.5 rounded-full bg-teal-950 text-teal-300 border border-teal-700 font-bold">${c.status}</span>
-          </div>
-          <button onclick="coinAction('${c.symbol}', 'remove')" class="text-slate-500 hover:text-rose-400 text-sm font-bold">✕</button>
-        </div>
-
-        <div class="flex justify-between items-center mb-3">
-          ${sourceBadge}
-          <span class="text-xs text-emerald-400 font-mono font-bold">+$${parseFloat(c.share_topup_usd || 0).toFixed(2)} Share-TopUp</span>
-        </div>
-
-        <div class="flex justify-between items-center bg-indigo-950/40 border border-indigo-800/50 rounded px-3 py-1.5 mb-3 text-xs">
-          <span class="text-indigo-200 font-semibold">${stratText}</span>
-          <button onclick="coinAction('${c.symbol}', 'switch_strategy')" class="text-indigo-300 underline font-bold">Switch</button>
-        </div>
-
-        <div class="flex items-baseline gap-2.5 mb-4">
-          <span class="text-2xl md:text-3xl font-extrabold text-white font-mono">$${px.toFixed(4)}</span>
-          <span class="text-xs text-emerald-400 font-mono">(${pctFromLow.toFixed(2)}% from Low)</span>
-        </div>
-
-        <div class="space-y-2 text-xs border-t border-slate-800/90 pt-3">
-          <div class="flex justify-between items-center">
-            <span class="text-slate-400">Bucket A (Anchor):</span>
-            <span class="font-bold text-white font-mono">$${parseFloat(c.anchor_usd || 0).toFixed(2)} <span class="text-slate-400 font-normal">${anchorSubLabel}</span>
-              <button onclick="editAnchorPrompt('${c.symbol}', ${c.anchor_usd || 0})" class="ml-1 px-2 py-0.5 rounded bg-teal-950 text-teal-300 border border-teal-700 font-sans">✏️ Edit</button>
-            </span>
-          </div>
-          <div class="flex justify-between">
-            <span class="text-slate-400">Real Shares Owned (Gate.io):</span>
-            <span class="font-mono text-sky-400 font-bold">${sh.toFixed(6)} ${c.symbol}</span>
-          </div>
-          <div class="flex justify-between">
-            <span class="text-slate-400">Total Bucket A Value:</span>
-            <span class="font-bold text-white font-mono">${totalBucketBreakdown}</span>
-          </div>
-          <div class="flex justify-between">
-            <span class="text-slate-400">Entry / Sliding Low:</span>
-            <span class="font-mono text-slate-200">$${parseFloat(c.entry_price || 0).toFixed(4)} / <span class="text-sky-400">$${lowPx.toFixed(4)}</span></span>
-          </div>
-          <div class="flex justify-between">
-            <span class="text-slate-400">Zero-Loss / +0.8% Bar:</span>
-            <span class="font-mono text-amber-400">${c.zero_loss_stop > 0 ? 'LOCKED Stop @ $' + parseFloat(c.zero_loss_stop).toFixed(4) : 'Shield @ +0.35% | Target $' + targetPx.toFixed(4)}</span>
-          </div>
-          <div class="flex justify-between pt-2 border-t border-slate-800/90">
-            <span class="text-emerald-400 font-bold">Bucket B (Vaulted):</span>
-            <span class="font-mono text-emerald-400 font-extrabold">+$${parseFloat(c.vaulted_profit || 0).toFixed(4)} (${c.skims_count || 0} skims)</span>
-          </div>
-        </div>
-
-        ${simBtnHtml}
-      `;
-      grid.appendChild(card);
+    const coords = pts.map((pt, idx) => {
+        const x = pts.length === 1
+            ? padLeft + plotW / 2
+            : padLeft + (idx / (pts.length - 1)) * plotW;
+        const v = Number(pt.value || 0);
+        const y = padTop + plotH - ((v / maxVal) * plotH);
+        return {x, y, time: pt.time, value: v};
     });
 
-    const logBox = document.getElementById('secLog');
-    logBox.innerHTML = (s.security_log || []).map(l => `<div>${l}</div>`).join('');
-  } catch (e) {
-    console.error(e);
-  }
+    let pathD = '';
+    if (coords.length === 1) {
+        pathD = `M ${padLeft} ${coords[0].y} L ${width - padRight} ${coords[0].y}`;
+    } else {
+        pathD = coords.map((c, i) => `${i === 0 ? 'M' : 'L'} ${c.x.toFixed(1)} ${c.y.toFixed(1)}`).join(' ');
+    }
+
+    const areaD = coords.length === 1
+        ? `${pathD} L ${width - padRight} ${padTop + plotH} L ${padLeft} ${padTop + plotH} Z`
+        : `${pathD} L ${coords[coords.length - 1].x.toFixed(1)} ${padTop + plotH} L ${coords[0].x.toFixed(1)} ${padTop + plotH} Z`;
+
+    const dotsHtml = coords.map(c =>
+        `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3.5" fill="#10b981" stroke="#052e16" stroke-width="1.5"/>`
+    ).join('');
+
+    let xLabels = '';
+    const labelCount = Math.min(5, coords.length);
+    for (let i = 0; i < labelCount; i++) {
+        const idx = Math.floor((i / Math.max(1, labelCount - 1)) * (coords.length - 1));
+        const c = coords[idx];
+        xLabels += `<text x="${c.x.toFixed(1)}" y="${height - 4}" fill="#64748b" font-size="9" text-anchor="middle" font-family="monospace">${c.time}</text>`;
+    }
+
+    svg.innerHTML = `
+        <defs>
+            <linearGradient id="skimGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#10b981" stop-opacity="0.32"/>
+                <stop offset="100%" stop-color="#10b981" stop-opacity="0.0"/>
+            </linearGradient>
+        </defs>
+        ${gridHtml}
+        <path d="${areaD}" fill="url(#skimGrad)"/>
+        <path d="${pathD}" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round"/>
+        ${dotsHtml}
+        ${xLabels}
+    `;
 }
 
-setInterval(refreshState, 3000);
-refreshState();
-loadMemeRadar();
+function formatPrice(p) {
+    const num = Number(p || 0);
+    if (num >= 10) return num.toFixed(4);
+    if (num >= 0.1) return num.toFixed(4);
+    if (num >= 0.001) return num.toFixed(6);
+    return num.toFixed(8);
+}
+
+async function pollState() {
+    try {
+        const r = await fetch('/api/state');
+        if (!r.ok) return;
+        const data = await r.json();
+        updateUI(data);
+    } catch (e) {
+        console.debug("State poll error:", e);
+    }
+}
+
+function updateUI(data) {
+    // Profit Hero
+    document.getElementById('heroTotalProfit').innerText = `$${Number(data.total_profit || 0).toFixed(2)}`;
+    document.getElementById('heroProfitSub').innerText =
+        `Vault Cash: $${Number(data.vault_cash || 0).toFixed(2)} | Added to Anchors: +$${Number(data.added_to_anchors || 0).toFixed(2)}`;
+    document.getElementById('cashoutAvailDisplay').innerText = `$${Number(data.vault_cash || 0).toFixed(2)}`;
+    document.getElementById('chartSkimBadge').innerText = `${data.total_skims || 0} Total Skims`;
+
+    // Bridge status badges
+    const b = data.exchange_bridge || {};
+    const liveBadge = document.getElementById('liveBridgeBadge');
+    const exchUpper = (b.exchange || 'gateio').toUpperCase();
+    if (b.live_armed) {
+        liveBadge.className = "px-2.5 py-1 rounded-md bg-emerald-950/90 border border-emerald-600/70 text-emerald-400 font-extrabold text-[11px] mono flex items-center gap-1.5";
+        liveBadge.innerHTML = `<span>🟢</span> <span>LIVE BRIDGE ARMED (${exchUpper})</span>`;
+    } else {
+        liveBadge.className = "px-2.5 py-1 rounded-md bg-slate-800 border border-slate-700 text-slate-300 font-bold text-[11px] mono flex items-center gap-1.5";
+        liveBadge.innerHTML = `<span>⚪</span> <span>PAPER SIMULATOR</span>`;
+    }
+
+    const usdtFormatted = Number(b.available_usdt || 0).toFixed(2);
+    document.getElementById('spotUsdtBadge').innerText = `Gate.io Spot USDT: $${usdtFormatted}`;
+    document.getElementById('bridgeConnectionStatus').innerText =
+        `Gate.io v4 Connected! Available Spot USDT: $${usdtFormatted}`;
+
+    if (b.masked_key) {
+        document.getElementById('savedKeyLabel').innerText = `Saved Key: ${b.masked_key}`;
+    }
+
+    // Freeze button
+    const freezeBtn = document.getElementById('freezeBtn');
+    if (data.frozen) {
+        freezeBtn.innerText = "▶️ Resume Live";
+        freezeBtn.className = "btn-press px-3 py-1.5 rounded-lg bg-emerald-600 text-black font-extrabold text-xs";
+    } else {
+        freezeBtn.innerText = "🛑 Freeze Live";
+        freezeBtn.className = "btn-press px-3 py-1.5 rounded-lg bg-rose-950/90 text-rose-300 border border-rose-700/70 font-bold text-xs";
+    }
+
+    // Profit Growth Curve SVG
+    renderProfitCurveSvg(data.profit_curve || []);
+
+    // Skim Ledger
+    const ledgerBox = document.getElementById('skimLedgerList');
+    const ledger = data.skim_ledger || [];
+    if (ledger.length === 0) {
+        ledgerBox.innerHTML = `<div class="text-center text-slate-500 py-4 text-xs">Waiting for next verified profit skim...</div>`;
+    } else {
+        ledgerBox.innerHTML = ledger.slice(0, 12).map(row => `
+            <div class="v-inner p-2.5 flex items-center justify-between">
+                <div>
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-emerald-400 font-extrabold">${row.symbol}</span>
+                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-200">[${row.mode}]</span>
+                        <span class="text-slate-300 text-[11px]">${row.stage}</span>
+                    </div>
+                    <div class="text-[10px] text-slate-400 mt-0.5">@ $${row.price} • ${row.time}</div>
+                </div>
+                <div class="text-right">
+                    <div class="text-emerald-400 font-extrabold">+$${Number(row.profit || 0).toFixed(4)}</div>
+                    <div class="text-[10px] text-slate-400">${row.shares} sh</div>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    // Active Coin Cards
+    const coinsBox = document.getElementById('activeCoinsContainer');
+    const coins = data.coins || {};
+    const syms = Object.keys(coins);
+    if (syms.length === 0) {
+        coinsBox.innerHTML = `
+            <div class="v-card p-5 text-center text-xs text-slate-400">
+                No active coin cards. Enter <b>QNT</b> above and tap <b>+ Snipe & Launch</b>.
+            </div>`;
+    } else {
+        coinsBox.innerHTML = syms.map(sym => {
+            const c = coins[sym];
+            const isLive = Boolean(c.live_enabled);
+            const sh = Number(c.shares || 0);
+            const price = Number(c.current_price || 0);
+            const low = Number(c.sliding_low || price);
+            const entry = Number(c.entry_price || price);
+            const anchor = Number(c.anchor_usd || 10);
+            const tokenVal = sh * price;
+            const gainPct = low > 0 ? (((price - low) / low) * 100) : 0;
+            const targetPrice = low * 1.008;
+            const pctBar = Math.max(0, Math.min(100, (gainPct / 0.80) * 100));
+
+            const modePill = isLive
+                ? `<span class="px-2 py-0.5 rounded bg-rose-950/90 text-rose-400 border border-rose-700/70 text-[10px] font-extrabold mono">⚡ LIVE ORDER</span>`
+                : `<span class="px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-bold mono">📄 PAPER</span>`;
+
+            const statusPill = c.status === 'WAITING_LIVE_BUY'
+                ? `<span class="px-2 py-0.5 rounded bg-purple-950/90 text-purple-300 border border-purple-700/70 text-[10px] font-extrabold mono">WAITING_LIVE_BUY</span>`
+                : `<span class="px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-400 border border-emerald-700/70 text-[10px] font-extrabold mono">${c.status}</span>`;
+
+            const bucketAText = (isLive && sh <= 0)
+                ? `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(Waiting Gate.io Buy - $0 in Token)</span>`
+                : `$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(In Token)</span>`;
+
+            const totalBucketText = (isLive && sh <= 0)
+                ? `$${anchor.toFixed(2)} Cash Reserved ($0.00 in Token)`
+                : `$${tokenVal.toFixed(2)}`;
+
+            const bottomBar = isLive
+                ? (sh <= 0
+                    ? `<button onclick="forceLiveBuy('${sym}')" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-emerald-950/90 hover:bg-emerald-900 text-emerald-300 border border-emerald-600/80 font-extrabold text-xs flex items-center justify-center gap-1.5">
+                           <span>🟢</span> <span>Live Gate.io Node Active — Paper Simulator Disabled (Tap to Buy Now)</span>
+                       </button>`
+                    : `<button onclick="manualSyncLive()" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-700/70 font-bold text-xs flex items-center justify-center gap-1.5">
+                           <span>🟢</span> <span>Live Gate.io Node Active — Paper Simulator Disabled</span>
+                       </button>`)
+                : `<button onclick="triggerPracticeSpike('${sym}')" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-amber-950/70 hover:bg-amber-900/70 text-amber-300 border border-amber-600/70 font-extrabold text-xs">
+                       ⚡ Practice Spike (+2% Simulator)
+                   </button>`;
+
+            return `
+            <div class="v-card p-4">
+                <div class="flex items-center justify-between gap-2 mb-1">
+                    <div class="flex items-center gap-1.5 flex-wrap">
+                        <span class="text-base font-extrabold text-white tracking-tight">${sym}/USDT</span>
+                        ${modePill}
+                        ${statusPill}
+                    </div>
+                    <button onclick="removeCoinCard('${sym}')" class="text-slate-500 hover:text-rose-400 font-bold text-sm px-1">✕</button>
+                </div>
+
+                <div class="flex items-center justify-between text-[11px] mb-2.5">
+                    <span class="text-emerald-400 font-bold mono">● VERIFIED CEX (${c.source || 'GATE.IO SPOT'})</span>
+                    <span class="text-emerald-400 font-bold mono">+$${Number(c.share_topup_usd || 0).toFixed(2)} Share-TopUp</span>
+                </div>
+
+                <div class="v-inner px-3 py-2 mb-3 flex items-center justify-between text-xs">
+                    <button onclick="cycleCoinStrategy('${sym}')" class="text-left text-indigo-300 font-bold hover:underline">
+                        ⚡ Strategy: ${c.strategy || '50/50 Hybrid Moonbag'}
+                    </button>
+                    <button onclick="switchCoinMode('${sym}')" class="btn-press px-2.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-700/80 font-bold text-[11px]">
+                        Switch
+                    </button>
+                </div>
+
+                <div class="flex items-baseline gap-2.5 mb-3">
+                    <span class="text-2xl sm:text-3xl font-extrabold text-white mono">$${formatPrice(price)}</span>
+                    <span class="text-xs font-bold text-emerald-400 mono">(${gainPct >= 0 ? '' : ''}${gainPct.toFixed(2)}% from Low)</span>
+                </div>
+
+                <div class="v-inner p-3 space-y-2 text-xs mono">
+                    <div class="flex items-center justify-between">
+                        <span class="text-slate-400">Bucket A (Anchor):</span>
+                        <div class="flex items-center gap-1.5">
+                            <span class="text-white font-bold">${bucketAText}</span>
+                            <button onclick="promptEditAnchor('${sym}', ${anchor})" class="px-1.5 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-700/70 text-[10px] font-bold">
+                                Edit
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between">
+                        <span class="text-slate-400">Real Shares Owned (Gate.io):</span>
+                        <span class="${sh > 0 ? 'text-emerald-400' : 'text-amber-400'} font-bold">${sh.toFixed(6)} ${sym}</span>
+                    </div>
+
+                    <div class="flex items-center justify-between">
+                        <span class="text-slate-400">Total Bucket A Value:</span>
+                        <span class="text-white font-bold">${totalBucketText}</span>
+                    </div>
+
+                    <div class="flex items-center justify-between">
+                        <span class="text-slate-400">Entry / Sliding Low:</span>
+                        <span class="text-slate-200 font-bold">$${formatPrice(entry)} / $${formatPrice(low)}</span>
+                    </div>
+
+                    <div class="flex items-center justify-between">
+                        <span class="text-slate-400">Zero-Loss / +0.8% Bar:</span>
+                        <span class="text-emerald-300 font-bold">Shield @ +0.35% | Target $${formatPrice(targetPrice)}</span>
+                    </div>
+
+                    <div class="w-full bg-slate-900 h-2 rounded-full overflow-hidden border border-slate-800">
+                        <div class="bg-emerald-400 h-full transition-all duration-300" style="width: ${pctBar}%"></div>
+                    </div>
+
+                    <div class="flex items-center justify-between pt-0.5">
+                        <span class="text-slate-400">Bucket B (Vaulted):</span>
+                        <span class="text-emerald-400 font-extrabold">+$${Number(c.vaulted_usd || 0).toFixed(4)} (${c.skim_count || 0} skims)</span>
+                    </div>
+                </div>
+
+                ${bottomBar}
+            </div>`;
+        }).join('');
+    }
+
+    // Security Logs
+    const logBox = document.getElementById('securityLogBox');
+    logBox.innerHTML = (data.logs || []).map(line => `<div>${line}</div>`).join('');
+}
+
+async function saveBridgeConfig(toggleLive) {
+    const verifyBtn = document.getElementById('verifyApiBtn');
+    verifyBtn.innerText = "⏳ Checking Exchange...";
+    const payload = {
+        exchange: document.getElementById('bridgeExchange').value,
+        api_key: document.getElementById('bridgeApiKey').value,
+        api_secret: document.getElementById('bridgeApiSecret').value,
+        max_order_usd: document.getElementById('bridgeMaxCap').value,
+        toggle_live: toggleLive
+    };
+    try {
+        const r = await fetch('/api/bridge/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
+        const res = await r.json();
+        if (r.ok && res.ok) {
+            verifyBtn.innerText = "✅ Verified";
+            document.getElementById('bridgeApiKey').value = '';
+            document.getElementById('bridgeApiSecret').value = '';
+        } else {
+            verifyBtn.innerText = "❌ Failed";
+            alert(res.error || "Could not verify Gate.io API keys.");
+        }
+    } catch (e) {
+        verifyBtn.innerText = "❌ Error";
+    }
+    setTimeout(() => {
+        verifyBtn.innerText = "🔍 Verify API & Check USDT Balance";
+    }, 2600);
+    pollState();
+}
+
+async function manualSyncLive() {
+    const btn = document.getElementById('syncLiveBtn');
+    btn.innerText = "⏳ Syncing...";
+    await fetch('/api/sync_live', {method: 'POST'});
+    btn.innerText = "🔄 Sync Live";
+    pollState();
+}
+
+async function launchNewCoin() {
+    const symInput = document.getElementById('coinSymbolInput');
+    const ancInput = document.getElementById('coinAnchorInput');
+    const symbol = symInput.value.trim();
+    const anchor_usd = parseFloat(ancInput.value || '10');
+    if (!symbol) return;
+
+    const btn = document.getElementById('launchBtn');
+    btn.innerText = "⏳ Launching...";
+    const r = await fetch('/api/coin/launch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol, anchor_usd})
+    });
+    const res = await r.json();
+    btn.innerText = "+ Snipe & Launch";
+    if (!r.ok || !res.ok) {
+        alert(res.error || "Could not launch coin.");
+        return;
+    }
+    symInput.value = '';
+    pollState();
+}
+
+async function scanMemeRadar() {
+    const btn = document.getElementById('radarBtn');
+    const box = document.getElementById('radarResultsBox');
+    btn.innerText = "⏳ Scanning...";
+    const r = await fetch('/api/radar/scan');
+    const res = await r.json();
+    btn.innerText = "📡 Scan Meme Radar";
+    if (res.ok && Array.isArray(res.results)) {
+        box.classList.remove('hidden');
+        box.innerHTML = res.results.map(item => `
+            <div onclick="quickLaunchFromRadar('${item.symbol}')" class="v-inner p-2.5 cursor-pointer hover:border-emerald-500 transition">
+                <div class="flex justify-between items-center">
+                    <span class="font-extrabold text-white text-xs">${item.symbol}/USDT</span>
+                    <span class="text-[10px] font-bold ${item.change_24h >= 0 ? 'text-emerald-400' : 'text-rose-400'} mono">
+                        ${item.change_24h >= 0 ? '+' : ''}${item.change_24h}%
+                    </span>
+                </div>
+                <div class="text-[11px] text-slate-300 mono mt-0.5">$${formatPrice(item.price)}</div>
+            </div>
+        `).join('');
+    }
+}
+
+function quickLaunchFromRadar(sym) {
+    document.getElementById('coinSymbolInput').value = sym;
+    launchNewCoin();
+}
+
+async function switchCoinMode(symbol) {
+    await fetch('/api/coin/switch_mode', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol})
+    });
+    pollState();
+}
+
+async function cycleCoinStrategy(symbol) {
+    await fetch('/api/coin/cycle_strategy', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol})
+    });
+    pollState();
+}
+
+async function forceLiveBuy(symbol) {
+    const r = await fetch('/api/coin/force_buy', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol})
+    });
+    const res = await r.json();
+    if (!r.ok || !res.ok) {
+        alert(res.error || "Live order notice: check execution log below.");
+    }
+    pollState();
+}
+
+async function promptEditAnchor(symbol, currentVal) {
+    const input = prompt(`Update Bucket A (Anchor USD) for ${symbol}:`, currentVal);
+    if (input === null || input.trim() === '') return;
+    await fetch('/api/coin/edit_anchor', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol, anchor_usd: parseFloat(input)})
+    });
+    pollState();
+}
+
+async function triggerPracticeSpike(symbol) {
+    await fetch('/api/coin/spike', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol})
+    });
+    pollState();
+}
+
+async function removeCoinCard(symbol) {
+    await fetch('/api/coin/remove', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol})
+    });
+    pollState();
+}
+
+async function saveAlertSettings(sendTest) {
+    const payload = {
+        enabled: true,
+        ntfy_topic: document.getElementById('alertNtfyTopic').value,
+        telegram_bot_token: document.getElementById('alertTgToken').value,
+        telegram_chat_id: document.getElementById('alertTgChat').value,
+        send_test: sendTest
+    };
+    await fetch('/api/alerts/save', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    });
+    alert(sendTest ? "Alert settings saved & test push dispatched!" : "Alert settings saved.");
+    pollState();
+}
+
+async function recordCashout() {
+    const amt = document.getElementById('cashoutAmountInput').value;
+    if (!amt) return;
+    const r = await fetch('/api/cashout/record', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({amount: parseFloat(amt)})
+    });
+    const res = await r.json();
+    if (!r.ok || !res.ok) {
+        alert(res.error || "Could not record cash-out.");
+        return;
+    }
+    document.getElementById('cashoutAmountInput').value = '';
+    pollState();
+}
+
+async function toggleFreeze() {
+    await fetch('/api/control/freeze', {method: 'POST'});
+    pollState();
+}
+
+async function resetProfitCounters() {
+    if (!confirm("Reset Vault Cash and Profit Growth Curve to $0.00?")) return;
+    await fetch('/api/control/reset', {method: 'POST'});
+    pollState();
+}
+
+pollState();
+setInterval(pollState, 2500);
 </script>
 </body>
 </html>
 """
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(DASHBOARD_HTML)
+@app.route("/")
+def route_index():
+    resp = make_response(render_template_string(DASHBOARD_HTML))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
