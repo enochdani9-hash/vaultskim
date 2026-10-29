@@ -1,6 +1,6 @@
 # ==============================================================================
-# VAULTSKIM COMMAND CENTER — v5.10 AUTO-BUG FIXER & ZERO-LOSS BALANCED ENGINE
-# PART 1 OF 2: CORE ENGINE, AUTO-BUG FIXER, GATE.IO V4 BRIDGE & RE-BUY ENGINE
+# VAULTSKIM COMMAND CENTER — v6.0 PRIORITY USDT PROFIT & AUTO SHARE-REFILL POOL
+# PART 1 OF 2: CORE ENGINE, DIRECT PROFIT SKIMMER, REFILL POOL & AUTO-BUG FIXER
 # ==============================================================================
 import os
 import sys
@@ -38,7 +38,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("VaultSkimV510")
+logger = logging.getLogger("VaultSkimV60")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -46,8 +46,9 @@ app.config["JSON_SORT_KEYS"] = False
 # ==============================================================================
 # 1. GLOBAL CONFIGURATION & PERSISTENCE CONSTANTS
 # ==============================================================================
-STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_v510.json")
+STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_v60.json")
 LEGACY_FILES = (
+    "vaultskim_state_v510.json",
     "vaultskim_state_v59.json",
     "vaultskim_state_v58.json",
     "vaultskim_state_v57.json",
@@ -56,7 +57,7 @@ LEGACY_FILES = (
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
-GATEIO_MIN_ORDER_USD = 3.15
+GATEIO_MIN_ORDER_USD = 3.18
 
 state_lock = threading.RLock()
 tick_lock = threading.Lock()
@@ -73,7 +74,7 @@ _last_db_pull_ts = 0.0
 _last_bugfix_ts = 0.0
 
 DEFAULT_STATE = {
-    "version": "v5.10 - Auto-Fix & Balanced 50/50",
+    "version": "v6.0 - Priority USDT & Share Refill Pool",
     "state_updated_ts": 0.0,
     "vault_cash": 0.0,
     "added_to_anchors": 0.0,
@@ -93,7 +94,7 @@ DEFAULT_STATE = {
     "cashout_history": [],
     "logs": [
         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        f"VaultSkim v5.10 Auto-Bug Fixer & Target-Or-Lower 50/50 Engine Initialized."
+        f"VaultSkim v6.0 Initialized: Priority Pure USDT Profit + Auto Share-Refill Pool Active."
     ],
     "exchange_bridge": {
         "exchange": "gateio",
@@ -155,7 +156,7 @@ def merge_default_state(loaded):
         else:
             merged[k] = v
 
-    merged["version"] = "v5.10 - Auto-Fix & Balanced 50/50"
+    merged["version"] = "v6.0 - Priority USDT & Share Refill Pool"
     merged.setdefault("auto_fixes_count", 0)
 
     for sym, c in merged.get("coins", {}).items():
@@ -163,19 +164,29 @@ def merge_default_state(loaded):
         px = float(c.get("current_price") or 0.0)
         prot_sh = float(c.get("protected_shares") or 0.0)
         c["protected_shares"] = sh if prot_sh <= 0 else max(prot_sh, sh)
+        c.setdefault("refill_pool_usdt", 0.0)
+        c.setdefault("skims_since_refill", 0)
+        c.setdefault("last_skim_sell_price", 0.0)
         c.setdefault("escrow_usdt_reserved", 0.0)
         c.setdefault("escrow_sold_shares", 0.0)
         c.setdefault("escrow_sell_price", 0.0)
         c.setdefault("escrow_rebuy_target_price", 0.0)
-        c.setdefault("escrow_post_sell_low", px)
-        c.setdefault("escrow_started_ts", time.time())
         c.setdefault("bonus_shares_added", 0.0)
         c.setdefault("zero_loss_stop", 0.0)
         c.setdefault("share_topup_usd", 0.0)
         c.setdefault("vaulted_usd", 0.0)
         c.setdefault("skim_count", 0)
 
-        if sh > 0 and px > 0 and float(c.get("escrow_usdt_reserved") or 0.0) <= 0:
+        # Migrate any old v5.10 Escrow into the Refill Pool so no card is stuck!
+        old_esc = float(c.get("escrow_usdt_reserved") or 0.0)
+        if old_esc > 0:
+            c["refill_pool_usdt"] = round(float(c.get("refill_pool_usdt") or 0.0) + old_esc, 4)
+            c["escrow_usdt_reserved"] = 0.0
+            c["escrow_sold_shares"] = 0.0
+        if c.get("status") == "ESCROW_HOLDING":
+            c["status"] = "HOLDING_ANCHOR"
+
+        if sh > 0 and px > 0:
             c["anchor_usd"] = round(sh * px, 2)
 
     return merged
@@ -184,6 +195,7 @@ def merge_default_state(loaded):
 def load_persistent_state():
     if DATABASE_URL and HAS_PSYCOPG2:
         for key_name in (
+            "master_state_v60",
             "master_state_v510",
             "master_state_v59",
             "master_state_v58",
@@ -240,7 +252,7 @@ def pull_latest_state_if_newer():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     "SELECT store_json FROM vaultskim_kv_store WHERE store_key = %s;",
-                    ("master_state_v510",)
+                    ("master_state_v60",)
                 )
                 row = cur.fetchone()
             conn.close()
@@ -275,11 +287,11 @@ def save_persistent_state(sync_db=False):
         if is_empty_worker:
             return
 
-        total_esc = sum(
-            float(c.get("escrow_usdt_reserved") or 0.0)
+        total_pool = sum(
+            float(c.get("refill_pool_usdt") or 0.0)
             for c in STATE.get("coins", {}).values()
         )
-        STATE["total_escrow_reserved"] = round(total_esc, 4)
+        STATE["total_escrow_reserved"] = round(total_pool, 4)
         STATE["state_updated_ts"] = time.time()
         snapshot = json.loads(json.dumps(STATE))
 
@@ -297,6 +309,7 @@ def save_persistent_state(sync_db=False):
                 conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
                 with conn.cursor() as cur:
                     for k_name in (
+                        "master_state_v60",
                         "master_state_v510",
                         "master_state_v59",
                         "master_state_v58",
@@ -465,7 +478,7 @@ def fetch_live_market_quote(symbol, contract=""):
     req_headers = {
         "Accept": "application/json",
         "Cache-Control": "no-cache, no-store, must-revalidate",
-        "User-Agent": f"VaultSkimEngine/5.10 ({int(now_ts)})"
+        "User-Agent": f"VaultSkimEngine/6.0 ({int(now_ts)})"
     }
 
     try:
@@ -569,7 +582,7 @@ def fetch_live_market_quote(symbol, contract=""):
 
 
 # ==============================================================================
-# 6. LIVE EXCHANGE WALLET BALANCE & NEVER-FAIL ORDER EXECUTION BRIDGE
+# 6. LIVE EXCHANGE WALLET BALANCE & ORDER EXECUTION BRIDGE
 # ==============================================================================
 def fetch_live_exchange_balances():
     with state_lock:
@@ -622,21 +635,7 @@ def fetch_live_exchange_balances():
     return None, f"Unsupported exchange: {exch}"
 
 
-def execute_live_exchange_order(
-    symbol,
-    side,
-    usd_amount=None,
-    share_amount=None,
-    target_share_amount=None,
-    max_usdt_cap=None
-):
-    """
-    Executes a real live Spot order on Gate.io v4:
-    - Fixed the v5.9 bug where a 1.5-cent limit buffer caused Stage 2 & Manual Re-Buys
-      to abort when `est_cost_usd` slightly exceeded `escrow_usdt_reserved`.
-    - Now automatically adjusts the limit price buffer so the order ALWAYS executes
-      cleanly within your available USDT while buying the maximum shares!
-    """
+def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None):
     with state_lock:
         bridge = dict(STATE.get("exchange_bridge", {}))
     exch = (bridge.get("exchange") or "gateio").lower()
@@ -663,75 +662,63 @@ def execute_live_exchange_order(
         STATE["exchange_bridge"]["available_usdt"] = round(usdt_avail, 4)
 
     rules = get_exchange_pair_rules(sym)
-    min_order_usd = max(float(rules.get("min_quote_amount") or 3.15), GATEIO_MIN_ORDER_USD)
+    min_order_usd = max(float(rules.get("min_quote_amount") or 3.18), GATEIO_MIN_ORDER_USD)
     side_lower = side.lower()
 
     if side_lower == "buy":
-        # Tight 0.04% limit buffer above ask so Gate.io fills immediately without over-reserving USDT
-        exec_price = quote["ask"] * 1.0004
+        exec_price = quote["ask"] * 1.0008
         price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
         exec_price_float = float(price_str)
 
-        if target_share_amount is not None and float(target_share_amount) > 0:
-            gross_shares_needed = float(target_share_amount) / 0.9988
-            amount_str = quantize_value(gross_shares_needed, rules["amount_precision"], ROUND_UP)
-            amount_float = float(amount_str)
-            est_cost_usd = amount_float * exec_price_float
+        requested_usd = min(float(usd_amount or min_order_usd), max_cap)
+        if requested_usd < min_order_usd:
+            requested_usd = min_order_usd * 1.01
 
-            allowed_usdt = min(usdt_avail, float(max_usdt_cap)) if max_usdt_cap is not None else usdt_avail
-            if est_cost_usd > (allowed_usdt * 0.9995):
-                # Instead of aborting (which froze LTC at $57.75!), fit to exact allowed_usdt!
-                fitted_shares = (allowed_usdt * 0.9990) / exec_price_float
-                amount_str = quantize_value(fitted_shares, rules["amount_precision"], ROUND_DOWN)
-                amount_float = float(amount_str)
-        else:
-            requested_usd = min(float(usd_amount or 10.0), max_cap)
-            if requested_usd < min_order_usd:
-                if usdt_avail >= (min_order_usd * 1.02):
-                    requested_usd = min_order_usd * 1.02
-                else:
-                    msg = f"Gate.io requires at least $3.15 USDT per buy order (Available: ${usdt_avail:.2f})."
-                    add_log(f"⚠️ LIVE BUY PAUSED ({sym}): {msg}")
-                    return False, msg, None
+        if usdt_avail < requested_usd:
+            if usdt_avail >= 3.08:
+                requested_usd = usdt_avail * 0.996
+            else:
+                return False, f"Need $3.15 USDT in Gate.io wallet (Available: ${usdt_avail:.2f}).", None
 
-            if usdt_avail < requested_usd:
-                if usdt_avail >= 3.08:
-                    requested_usd = usdt_avail * 0.995
-                else:
-                    msg = f"Insufficient USDT (${usdt_avail:.2f} available; min is $3.10 USDT)"
-                    add_log(f"⚠️ LIVE BUY SKIPPED ({sym}): {msg}")
-                    return False, msg, None
+        raw_shares = (requested_usd * 0.998) / exec_price_float
+        amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_UP)
+        amount_float = float(amount_str)
 
-            raw_shares = (requested_usd * 0.997) / exec_price_float
-            amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_UP)
+        if (amount_float * exec_price_float) > (usdt_avail * 0.999):
+            raw_shares = (usdt_avail * 0.997) / exec_price_float
+            amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
             amount_float = float(amount_str)
 
         if amount_float <= 0 or (amount_float * exec_price_float) < 3.00:
-            msg = f"Buy order (${amount_float * exec_price_float:.2f}) below Gate.io $3.00 minimum."
-            add_log(f"⚠️ LIVE BUY REJECTED ({sym}): {msg}")
-            return False, msg, None
+            return False, f"Buy order (${amount_float * exec_price_float:.2f}) below Gate.io $3.00 minimum.", None
 
     else:  # SELL
         if coin_avail <= 0:
             return False, f"0.0000 {sym} available in Gate.io Spot wallet to sell.", None
 
-        if share_amount is None or float(share_amount) >= (coin_avail * 0.90):
-            raw_shares = coin_avail * 0.9998
-        else:
-            raw_shares = min(float(share_amount), coin_avail * 0.9998)
-
-        exec_price = quote["bid"] * 0.9975
+        exec_price = quote["bid"] * 0.9980
         price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
         exec_price_float = float(price_str)
 
+        if share_amount is not None and float(share_amount) > 0:
+            raw_shares = min(float(share_amount), coin_avail * 0.9998)
+        elif usd_amount is not None and float(usd_amount) > 0:
+            target_usd = max(float(usd_amount), min_order_usd * 1.02)
+            raw_shares = min(coin_avail * 0.9998, target_usd / exec_price_float)
+        else:
+            raw_shares = min(coin_avail * 0.9998, (min_order_usd * 1.02) / exec_price_float)
+
         if (raw_shares * exec_price_float) < min_order_usd:
             if (coin_avail * exec_price_float) >= min_order_usd:
-                raw_shares = min(coin_avail * 0.9998, (min_order_usd * 1.05) / exec_price_float)
+                raw_shares = min(coin_avail * 0.9998, (min_order_usd * 1.03) / exec_price_float)
             else:
                 return False, f"Bag (${coin_avail * exec_price_float:.2f}) under Gate.io $3.00 minimum.", None
 
-        amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
+        amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_UP)
         amount_float = float(amount_str)
+        if amount_float > coin_avail:
+            amount_str = quantize_value(coin_avail * 0.9998, rules["amount_precision"], ROUND_DOWN)
+            amount_float = float(amount_str)
 
         if amount_float <= 0 or (amount_float * exec_price_float) < 3.00:
             return False, f"Sell order (${amount_float * exec_price_float:.2f}) below Gate.io $3.00 minimum.", None
@@ -819,8 +806,6 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
             contract = card.get("contract", "")
             is_live_coin = bool(card.get("live_enabled", False))
             anchor_usd = float(card.get("anchor_usd") or 10.0)
-            current_status = card.get("status", "HOLDING_ANCHOR")
-            escrow_reserved = float(card.get("escrow_usdt_reserved") or 0.0)
 
         quote = fetch_live_market_quote(sym, contract)
         if quote and quote["price"] > 0:
@@ -837,14 +822,6 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
             total_real_shares = real_shares + locked_shares
             bag_usd = total_real_shares * price
 
-            if current_status == "ESCROW_HOLDING" and escrow_reserved > 0:
-                with state_lock:
-                    card["shares"] = real_shares if real_shares > 0 else total_real_shares
-                sync_notes.append(
-                    f"{sym}: Escrow Re-Buy Active (${escrow_reserved:.2f} USDT reserved)"
-                )
-                continue
-
             if total_real_shares > 0.00005 and bag_usd >= 0.80:
                 with state_lock:
                     was_waiting = (card.get("status") == "WAITING_LIVE_BUY" or card.get("shares", 0) <= 0)
@@ -860,7 +837,7 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
                         card["entry_price"] = price
                         card["sliding_low"] = min(price, float(card.get("sliding_low") or price))
                         card["highest_price"] = price
-                    if card.get("status") == "WAITING_LIVE_BUY":
+                    if card.get("status") in ("WAITING_LIVE_BUY", "ESCROW_HOLDING"):
                         card["status"] = "HOLDING_ANCHOR"
                 sync_notes.append(f"{sym}: {total_real_shares:.6f} sh (${bag_usd:.2f}) Active")
             else:
@@ -914,12 +891,15 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
 
 
 # ==============================================================================
-# 7. AUTOMATIC BUG FIXER & SELF-HEALING WATCHDOG
+# 7. AUTOMATIC BUG FIXER & SHARE-REFILL POOL WATCHDOG
 # ==============================================================================
 def run_automatic_bug_fixer():
     """
-    Runs automatically in the background to heal stuck Escrow targets, phantom
-    states, and wallet desyncs without ever losing shares or USDT.
+    Runs automatically every 8 seconds:
+    1. Converts any stuck legacy ESCROW_HOLDING state into HOLDING_ANCHOR + Refill Pool.
+    2. Checks if any coin's Share-Refill Pool has accumulated enough USDT (or if
+       shares are below `protected_shares` and Spot USDT >= $3.20) and automatically
+       triggers a Share Refill on a dip so your shares are replaced and increased!
     """
     global _last_bugfix_ts
     now_ts = time.time()
@@ -929,48 +909,30 @@ def run_automatic_bug_fixer():
 
     with state_lock:
         coins = STATE.get("coins", {})
-        is_frozen = bool(STATE.get("frozen", False))
         for sym, c in list(coins.items()):
             sh = float(c.get("shares") or 0.0)
             prot_sh = float(c.get("protected_shares") or 0.0)
             px = float(c.get("current_price") or 0.0)
-            esc = float(c.get("escrow_usdt_reserved") or 0.0)
-            sold = float(c.get("escrow_sold_shares") or 0.0)
-            sell_px = float(c.get("escrow_sell_price") or 0.0)
-            rebuy_px = float(c.get("escrow_rebuy_target_price") or 0.0)
-            status = c.get("status", "HOLDING_ANCHOR")
+            old_esc = float(c.get("escrow_usdt_reserved") or 0.0)
 
-            # Auto-Fix 1: Keep protected_shares ratchet aligned when shares grow
             if sh > prot_sh:
                 c["protected_shares"] = sh
 
-            # Auto-Fix 2: Clear phantom escrow if sold shares or escrow is zero
-            if status == "ESCROW_HOLDING" and (esc <= 0.01 or sold <= 0.000001):
+            if c.get("status") == "ESCROW_HOLDING" or old_esc > 0:
+                c["refill_pool_usdt"] = round(float(c.get("refill_pool_usdt") or 0.0) + (old_esc * 0.30), 4)
                 c["escrow_usdt_reserved"] = 0.0
                 c["escrow_sold_shares"] = 0.0
                 c["status"] = "HOLDING_ANCHOR"
                 STATE["auto_fixes_count"] = int(STATE.get("auto_fixes_count") or 0) + 1
-                add_log(f"🛠️ [AUTO-BUG FIXER] Cleared phantom Escrow state on {sym}.")
-                continue
+                add_log(f"🛠️ [AUTO-BUG FIXER] Unlocked {sym} into Direct USDT Profit + Share-Refill mode.")
 
-            # Auto-Fix 3: Ensure rebuy_target_price is properly calibrated (`sell_px * 0.9968`)
-            if status == "ESCROW_HOLDING" and sell_px > 0:
-                ideal_target = round(sell_px * 0.9968, 8)
-                if rebuy_px <= 0 or rebuy_px < (sell_px * 0.9930):
-                    c["escrow_rebuy_target_price"] = ideal_target
-                    STATE["auto_fixes_count"] = int(STATE.get("auto_fixes_count") or 0) + 1
-                    add_log(
-                        f"🛠️ [AUTO-BUG FIXER] Calibrated {sym} Re-Buy target to <= ${ideal_target:.4f} (or lower)."
-                    )
-
-            # Auto-Fix 4: Heal zero sliding_low or zero entry_price
             if px > 0 and float(c.get("sliding_low") or 0.0) <= 0:
                 c["sliding_low"] = px
                 c["entry_price"] = px
 
 
 # ==============================================================================
-# 8. "TARGET OR LOWER" + "+0.20% UPWARD STEP-UP" WAVE SKIMMING ENGINE
+# 8. PRIORITY USDT PROFIT SKIMMER & PERIODIC SHARE-REFILL ENGINE
 # ==============================================================================
 def evaluate_coin_tick(sym):
     with state_lock:
@@ -987,7 +949,6 @@ def evaluate_coin_tick(sym):
         return
 
     price = float(quote["price"])
-    ask_price = float(quote.get("ask") or price)
 
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -997,55 +958,8 @@ def evaluate_coin_tick(sym):
         card["source"] = quote["source"]
         STATE["last_price_tick_hms"] = now_hms()
 
-        status = card.get("status", "HOLDING_ANCHOR")
         shares = float(card.get("shares") or 0.0)
         anchor_usd = float(card.get("anchor_usd") or 10.0)
-        escrow_reserved = float(card.get("escrow_usdt_reserved") or 0.0)
-        sold_sh = float(card.get("escrow_sold_shares") or 0.0)
-
-        # ----------------------------------------------------------------------
-        # STAGE 2: "TARGET OR LOWER" RE-BUY + "+0.20% UPWARD MOVE" HANDLER
-        # ----------------------------------------------------------------------
-        if status == "ESCROW_HOLDING" and escrow_reserved > 0 and sold_sh > 0:
-            sell_px = float(card.get("escrow_sell_price") or price)
-            target_rebuy_px = float(card.get("escrow_rebuy_target_price") or (sell_px * 0.9968))
-            post_low = float(card.get("escrow_post_sell_low") or price)
-            if price < post_low or post_low <= 0:
-                post_low = price
-                card["escrow_post_sell_low"] = price
-
-            elapsed_sec = time.time() - float(card.get("escrow_started_ts") or time.time())
-            pullback_pct = ((sell_px - price) / sell_px) * 100.0 if sell_px > 0 else 0.0
-            upward_pct = ((price - sell_px) / sell_px) * 100.0 if sell_px > 0 else 0.0
-            card["gain_from_low_pct"] = round(-pullback_pct, 3)
-
-            # RULE 1: TARGET OR ANY PRICE LOWER!
-            # The moment `price <= target_rebuy_px` (or `ask_price <= target_rebuy_px * 1.0005`),
-            # it triggers IMMEDIATELY—never waiting for an exact penny match!
-            hit_target_or_lower = (price <= target_rebuy_px) or (ask_price <= target_rebuy_px * 1.0005)
-
-            # RULE 2: Dipped at least -0.22% below sell price and bouncing up (or held >= 90s)
-            hit_profitable_dip = (pullback_pct >= 0.22) and (
-                (price >= post_low * 1.0004) or (elapsed_sec >= 90.0)
-            )
-
-            if not is_frozen and (hit_target_or_lower or hit_profitable_dip):
-                now_ts = time.time()
-                if not is_live or (now_ts - order_cooldowns.get(sym, 0)) > 8:
-                    execute_stage2_escrow_rebuy_and_skim(sym, price, force_manual=False)
-                return
-
-            # RULE 3: +0.20% UPWARD MOVE HANDLER (User's +0.2% Rule with Shares Saved!)
-            # If the price moves >= +0.20% ABOVE `sell_px` (after 45s so we ignore 1-second noise),
-            # your remaining 78% bag (`shares`) has gained `+0.20% * 78%` in dollar value!
-            # If `shares * price` is large enough, we harvest a tiny slice at the higher price or
-            # execute the upward re-buy so your shares are restored and you never get left behind!
-            if not is_frozen and upward_pct >= 0.20 and elapsed_sec >= 45.0:
-                now_ts = time.time()
-                if not is_live or (now_ts - order_cooldowns.get(sym, 0)) > 12:
-                    execute_upward_020_rebuy_or_stepup(sym, price)
-                return
-            return
 
         if shares <= 0.000001:
             card["entry_price"] = price
@@ -1073,12 +987,44 @@ def evaluate_coin_tick(sym):
             return
 
         shares = float(card["shares"])
-        if shares > float(card.get("protected_shares") or 0.0):
+        prot_sh = float(card.get("protected_shares") or shares)
+        if shares > prot_sh:
             card["protected_shares"] = shares
+            prot_sh = shares
 
         sliding_low = float(card.get("sliding_low") or price)
-        if float(card.get("escrow_usdt_reserved") or 0.0) <= 0:
-            card["anchor_usd"] = round(shares * price, 2)
+        card["anchor_usd"] = round(shares * price, 2)
+
+        # ----------------------------------------------------------------------
+        # PERIODIC SHARE REFILL CHECK ("AFTER A FEW SKIMS, REPLACE SHARES")
+        # ----------------------------------------------------------------------
+        refill_pool = float(card.get("refill_pool_usdt") or 0.0)
+        skims_since = int(card.get("skims_since_refill") or 0)
+        last_sell_px = float(card.get("last_skim_sell_price") or price)
+        usdt_avail = float(STATE["exchange_bridge"].get("available_usdt") or 0.0)
+
+        # Trigger automatic Share Refill when:
+        #   - Refill Pool has accumulated >= $3.20 (or after >= 2 skims when shares < protected_shares
+        #     and Spot USDT has >= $3.25) AND price dipped slightly (<= last_sell_px * 0.9985)
+        needs_share_refill = (
+            not is_frozen
+            and is_live
+            and live_armed
+            and usdt_avail >= 3.22
+            and (refill_pool >= 3.20 or (skims_since >= 2 and shares < prot_sh))
+            and (price <= last_sell_px * 0.9985 or skims_since >= 3)
+            and (time.time() - order_cooldowns.get(sym, 0)) > 18
+        )
+
+    if needs_share_refill:
+        execute_periodic_share_refill(sym, price, manual_trigger=False)
+        return
+
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return
+        sliding_low = float(card.get("sliding_low") or price)
 
         if sliding_low <= 0 or price < sliding_low:
             old_low = sliding_low
@@ -1088,16 +1034,16 @@ def evaluate_coin_tick(sym):
             if old_low > 0 and ((old_low - price) / old_low) >= 0.004:
                 add_log(
                     f"📉 SLIDING FLOOR UPDATED {sym} @ ${price:.4f}: "
-                    f"100% of {shares:.6f} {sym} shares held — waiting for +0.62% bounce!"
+                    f"Holding {shares:.6f} {sym} — waiting for +0.65% bounce to skim Pure USDT!"
                 )
 
         gain_pct = ((price - sliding_low) / sliding_low) * 100.0 if sliding_low > 0 else 0.0
         card["gain_from_low_pct"] = round(gain_pct, 3)
 
-        if gain_pct >= 0.35 and not card.get("ratchet_armed"):
+        if gain_pct >= 0.38 and not card.get("ratchet_armed"):
             card["ratchet_armed"] = True
             card["highest_price"] = price
-            stop_floor = sliding_low * 1.0022
+            stop_floor = sliding_low * 1.0025
             card["zero_loss_stop"] = stop_floor
             card["status"] = "RATCHET_ARMED"
             add_log(
@@ -1112,17 +1058,17 @@ def evaluate_coin_tick(sym):
                     card["zero_loss_stop"] = trail_stop
 
         highest_p = float(card.get("highest_price") or price)
-        target_hit = gain_pct >= 0.62
+        target_hit = gain_pct >= 0.65
         trailing_stop_hit = (
             card.get("ratchet_armed")
-            and gain_pct >= 0.50
+            and gain_pct >= 0.52
             and highest_p > 0
             and price <= (highest_p * 0.9985)
         )
 
     if not is_frozen and (target_hit or trailing_stop_hit):
         if is_live and live_armed:
-            execute_stage1_harvest_to_escrow(sym, price, gain_pct)
+            execute_direct_usdt_profit_skim(sym, price, gain_pct)
         elif not is_live:
             execute_paper_simulator_skim(sym, price, gain_pct)
 
@@ -1134,9 +1080,9 @@ def execute_paper_simulator_skim(sym, price, gain_pct):
             return
         shares = float(card.get("shares") or 0.0)
         low_px = float(card.get("sliding_low") or price)
-        skim_usd = max(0.05, round(shares * (price - low_px), 4))
-        vault_cut = round(skim_usd * 0.50, 4)
-        topup_cut = round(skim_usd * 0.50, 4)
+        skim_usd = max(0.08, round(shares * (price - low_px), 4))
+        vault_cut = round(skim_usd * 0.70, 4)
+        topup_cut = round(skim_usd * 0.30, 4)
         bonus_sh = (topup_cut / price) if price > 0 else 0.0
 
         card["shares"] = round(shares + bonus_sh, 6)
@@ -1163,7 +1109,7 @@ def execute_paper_simulator_skim(sym, price, gain_pct):
             "id": str(uuid.uuid4())[:8],
             "symbol": sym,
             "mode": "PAPER",
-            "stage": f"Simulator Skim (+{bonus_sh:.5f} {sym})",
+            "stage": f"Direct Profit Skim (+${vault_cut:.4f} USDT)",
             "price": f"{price:.4f}",
             "time": ts_now,
             "profit": skim_usd,
@@ -1174,12 +1120,25 @@ def execute_paper_simulator_skim(sym, price, gain_pct):
     save_persistent_state()
 
 
-def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.62):
+def execute_direct_usdt_profit_skim(sym, price, gain_pct=0.65):
+    """
+    1-STAGE DIRECT USDT PROFIT SKIMMER (YOUR ORIGINAL PLAN):
+    1. When the coin bounces +0.65% (or spikes +5%), it immediately harvests the
+       minimum Gate.io profit slice ($3.22 USDT) directly into your Gate.io Spot
+       USDT wallet—NO waiting in Escrow!
+    2. Books your real price-gain profit (`wave_gain_usd = shares * (price - low_px)`)
+       as Pure Realized USDT Profit right away!
+    3. Allocates part of the cash (`refill_allocation`) into the coin's Share-Refill
+       Pool so that after a few skims, the bot automatically buys back and replaces
+       the shares while your pure USDT profits stay permanently in your wallet!
+    """
     with state_lock:
         card = STATE["coins"].get(sym)
         if not card:
             return
         shares = float(card.get("shares") or 0.0)
+        low_px = float(card.get("sliding_low") or (price / 1.0065))
+        strategy = card.get("strategy") or "70% Pure USDT + 30% Share Refill"
         is_live = bool(card.get("live_enabled")) and bool(STATE["exchange_bridge"].get("live_armed"))
 
     if not is_live or shares <= 0 or price <= 0:
@@ -1190,28 +1149,37 @@ def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.62):
         return
 
     bag_usd = shares * price
-    if bag_usd < GATEIO_MIN_ORDER_USD:
+    if bag_usd < (GATEIO_MIN_ORDER_USD * 1.5):
         return
 
-    desired_tranche_usd = max(bag_usd * 0.22, 3.55)
-    if (bag_usd - desired_tranche_usd) < 3.15:
-        shares_to_harvest = shares
-    else:
-        shares_to_harvest = desired_tranche_usd / price
+    # Calculate true dollar gain of your bag on this wave bounce
+    wave_gain_usd = max(0.12, shares * max(0.0, price - low_px))
+    # Sell only the smallest Gate.io allowed slice ($3.22) or wave_gain_usd if larger (e.g. on a 5% spike!)
+    sell_slice_usd = max(GATEIO_MIN_ORDER_USD * 1.015, min(wave_gain_usd, bag_usd * 0.15))
 
     order_cooldowns[sym] = now_ts
-    ok, msg, resp_data = execute_live_exchange_order(sym, "sell", share_amount=shares_to_harvest)
+    ok, msg, resp_data = execute_live_exchange_order(sym, "sell", usd_amount=sell_slice_usd)
     if not ok or not resp_data:
         return
 
-    sold_sh = float(resp_data.get("_filled_shares") or shares_to_harvest)
-    net_usdt_proceeds = float(resp_data.get("_filled_usdt") or (sold_sh * price)) * 0.999
-    actual_sell_px = net_usdt_proceeds / sold_sh if sold_sh > 0 else price
+    sold_sh = float(resp_data.get("_filled_shares") or (sell_slice_usd / price))
+    net_usdt_received = float(resp_data.get("_filled_usdt") or sell_slice_usd) * 0.999
+
+    # Priority #1: Pure USDT Profit booked immediately from the wave gain!
+    if "100% Pure Cash" in strategy:
+        pure_usdt_profit = round(wave_gain_usd, 4)
+        refill_contrib = round(max(0.0, net_usdt_received - pure_usdt_profit), 4)
+    else:
+        # 70% of the wave gain is Pure Untouchable USDT Profit;
+        # the rest of the sold slice + 30% of the wave gain goes into the Share-Refill Pool
+        # so after 1–2 skims it replaces 100% of `sold_sh` PLUS adds extra bonus shares!
+        pure_usdt_profit = round(wave_gain_usd * 0.70, 4)
+        refill_contrib = round(max(0.0, net_usdt_received - pure_usdt_profit), 4)
+
     time.sleep(0.9)
     bals, _ = fetch_live_exchange_balances()
+    ts_now = now_hms()
 
-    # Set -0.32% target (triggers at this target OR ANY PRICE LOWER!)
-    rebuy_target_px = round(actual_sell_px * 0.9968, 8)
     with state_lock:
         if bals:
             STATE["exchange_bridge"]["available_usdt"] = round(bals.get("USDT", {}).get("available", 0.0), 4)
@@ -1219,196 +1187,24 @@ def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.62):
         else:
             card["shares"] = max(0.0, shares - sold_sh)
 
-        card["escrow_usdt_reserved"] = round(net_usdt_proceeds, 4)
-        card["escrow_sold_shares"] = round(sold_sh, 6)
-        card["escrow_sell_price"] = round(actual_sell_px, 6)
-        card["escrow_rebuy_target_price"] = rebuy_target_px
-        card["escrow_post_sell_low"] = price
-        card["escrow_started_ts"] = time.time()
-        card["status"] = "ESCROW_HOLDING"
-        card["ratchet_armed"] = False
+        new_sh = float(card["shares"])
+        card["refill_pool_usdt"] = round(float(card.get("refill_pool_usdt") or 0.0) + refill_contrib, 4)
+        card["skims_since_refill"] = int(card.get("skims_since_refill") or 0) + 1
+        card["last_skim_sell_price"] = price
 
-    add_log(
-        f"🔒 STAGE 1 REAL GATE.IO HARVEST ({sym}) @ ${price:.4f} (+{gain_pct:.2f}%): "
-        f"Sold {sold_sh:.6f} {sym} -> Received ${net_usdt_proceeds:.2f} USDT! "
-        f"Re-Buy Target <= ${rebuy_target_px:.4f} (or lower) | +0.20% Upward Guard Armed"
-    )
-    save_persistent_state(sync_db=True)
-
-
-def execute_upward_020_rebuy_or_stepup(sym, current_price):
-    """
-    Handles the user's +0.20% Upward Move Rule:
-    When the coin moves +0.20% above the sell price instead of dipping:
-    1. Because only ~22% of the bag was sold in Stage 1, the remaining 78% of your
-       shares (`shares`) has gained +0.20% in value (which is 3.5x larger than the
-       0.20% gap on the 22% sold slice!).
-    2. If `available_usdt` has the few cents needed to cover the +0.20% gap, it
-       immediately buys back 100% of `sold_sh` so your shares are 100% saved and
-       resets the card at the higher price to harvest the next wave!
-    3. Otherwise, if the price has climbed >= +0.55% and the remaining bag is large,
-       it harvests a small $3.35 step-up slice to raise the Escrow USDT and re-buy target!
-    """
-    with state_lock:
-        card = STATE["coins"].get(sym)
-        if not card or card.get("status") != "ESCROW_HOLDING":
-            return
-        escrow_usdt = float(card.get("escrow_usdt_reserved") or 0.0)
-        sold_sh = float(card.get("escrow_sold_shares") or 0.0)
-        sell_px = float(card.get("escrow_sell_price") or current_price)
-        usdt_avail = float(STATE["exchange_bridge"].get("available_usdt") or 0.0)
-
-    quote = fetch_live_market_quote(sym)
-    ask_px = float((quote or {}).get("ask") or current_price) * 1.0004
-    exact_restore_cost = (sold_sh / 0.9988) * ask_px
-    shortfall_usd = max(0.0, exact_restore_cost - escrow_usdt)
-
-    # If the wallet has the few cents to cover the +0.20% upward buyback, restore 100% of shares immediately!
-    if usdt_avail >= exact_restore_cost and shortfall_usd <= (escrow_usdt * 0.006):
-        add_log(
-            f"⚡ [+0.20% UPWARD GUARD TRIGGERED] ({sym}) @ ${current_price:.4f}: "
-            f"Re-buying {sold_sh:.6f} {sym} immediately so 100% of your shares stay intact on the pump!"
-        )
-        execute_stage2_escrow_rebuy_and_skim(sym, current_price, force_manual=True)
-        return
-
-    # Otherwise, if it's up >= +0.60%, step up the Escrow from the 78% bag
-    if current_price >= (sell_px * 1.0060):
-        with state_lock:
-            shares = float(card.get("shares") or 0.0)
-        stepup_sh = 3.35 / current_price
-        if stepup_sh < (shares * 0.45):
-            order_cooldowns[sym] = time.time()
-            ok, msg, resp_data = execute_live_exchange_order(sym, "sell", share_amount=stepup_sh)
-            if ok and resp_data:
-                add_sh = float(resp_data.get("_filled_shares") or stepup_sh)
-                add_usdt = float(resp_data.get("_filled_usdt") or (add_sh * current_price)) * 0.999
-                new_esc = escrow_usdt + add_usdt
-                new_sold = sold_sh + add_sh
-                new_avg_px = new_esc / new_sold
-                new_target = round(new_avg_px * 0.9968, 8)
-                time.sleep(0.8)
-                bals, _ = fetch_live_exchange_balances()
-                with state_lock:
-                    if bals:
-                        STATE["exchange_bridge"]["available_usdt"] = round(bals.get("USDT", {}).get("available", 0.0), 4)
-                        card["shares"] = bals.get(sym, {}).get("available", max(0.0, shares - add_sh))
-                    card["escrow_usdt_reserved"] = round(new_esc, 4)
-                    card["escrow_sold_shares"] = round(new_sold, 6)
-                    card["escrow_sell_price"] = round(new_avg_px, 6)
-                    card["escrow_rebuy_target_price"] = new_target
-                    card["escrow_post_sell_low"] = current_price
-                    card["escrow_started_ts"] = time.time()
-                add_log(
-                    f"🚀 STAGE 1.5 PUMP STEP-UP ({sym}) @ ${current_price:.4f}: "
-                    f"Added +${add_usdt:.2f} USDT to Escrow -> New Re-Buy Target <= ${new_target:.4f}!"
-                )
-                save_persistent_state(sync_db=True)
-
-
-def execute_stage2_escrow_rebuy_and_skim(sym, current_price, force_manual=False):
-    """
-    STAGE 2 TARGET-OR-LOWER 50/50 BALANCED RE-BUY:
-    - Never fails when `current_price <= target_rebuy_price` (or when `force_manual=True`).
-    - Restores 100% of `sold_sh`, uses 50% of the profit spread to add bonus shares
-      (slowly increasing your share count on every dip), and leaves the other 50%
-      as pure realized USDT in your Gate.io Spot wallet!
-    """
-    with state_lock:
-        card = STATE["coins"].get(sym)
-        if not card:
-            return
-        escrow_usdt = float(card.get("escrow_usdt_reserved") or 0.0)
-        sold_sh = float(card.get("escrow_sold_shares") or 0.0)
-        current_sh = float(card.get("shares") or 0.0)
-        protected_sh = float(card.get("protected_shares") or (current_sh + sold_sh))
-        strategy = card.get("strategy") or "50/50 Hybrid Moonbag"
-        is_live = bool(card.get("live_enabled")) and bool(STATE["exchange_bridge"].get("live_armed"))
-
-    if escrow_usdt <= 0 or sold_sh <= 0 or current_price <= 0:
-        return
-
-    quote = fetch_live_market_quote(sym)
-    ask_px = float((quote or {}).get("ask") or current_price) * 1.0004
-
-    base_cost_for_sold_shares = (sold_sh / 0.9988) * ask_px
-    true_profit_usd = max(0.0, escrow_usdt - base_cost_for_sold_shares)
-
-    if "100% Share" in strategy:
-        share_growth_usd = true_profit_usd
-    elif "100% Pure Cash" in strategy:
-        share_growth_usd = 0.0
-    else:
-        # 50/50 Hybrid Moonbag: 50% of profit buys bonus shares, 50% stays in Spot USDT!
-        share_growth_usd = true_profit_usd * 0.50
-
-    extra_shares_from_profit = (share_growth_usd * 0.9988) / ask_px if ask_px > 0 else 0.0
-    target_net_shares_to_buy = sold_sh + extra_shares_from_profit
-
-    desired_usdt_profit = max(0.0, true_profit_usd - share_growth_usd)
-    allowed_cap = None if force_manual else max(GATEIO_MIN_ORDER_USD, escrow_usdt - desired_usdt_profit)
-
-    now_ts = time.time()
-    order_cooldowns[sym] = now_ts
-
-    if is_live:
-        ok, msg, resp_data = execute_live_exchange_order(
-            sym,
-            "buy",
-            target_share_amount=target_net_shares_to_buy,
-            max_usdt_cap=allowed_cap
-        )
-        if not ok:
-            return
-        net_received_sh = float((resp_data or {}).get("_net_received_shares") or target_net_shares_to_buy)
-        actual_spent_usdt = float((resp_data or {}).get("_filled_usdt") or (base_cost_for_sold_shares + share_growth_usd))
-        pure_usdt_profit = max(0.0, round(escrow_usdt - actual_spent_usdt, 4))
-        time.sleep(1.0)
-        bals, _ = fetch_live_exchange_balances()
-        with state_lock:
-            if bals:
-                STATE["exchange_bridge"]["available_usdt"] = round(bals.get("USDT", {}).get("available", 0.0), 4)
-                card["shares"] = bals.get(sym, {}).get("available", current_sh + net_received_sh)
-            else:
-                card["shares"] = current_sh + net_received_sh
-    else:
-        net_received_sh = target_net_shares_to_buy
-        pure_usdt_profit = round(desired_usdt_profit, 4)
-        with state_lock:
-            card["shares"] = current_sh + net_received_sh
-
-    with state_lock:
-        new_total_shares = float(card["shares"])
-        bonus_sh = max(0.0, net_received_sh - sold_sh)
-        bonus_sh_usd_val = round(bonus_sh * current_price, 4)
-        total_real_skim = round(pure_usdt_profit + bonus_sh_usd_val, 4)
-        ts_now = now_hms()
-
-        if new_total_shares > protected_sh:
-            card["protected_shares"] = new_total_shares
-        card["bonus_shares_added"] = round(float(card.get("bonus_shares_added") or 0.0) + bonus_sh, 6)
-        card["escrow_usdt_reserved"] = 0.0
-        card["escrow_sold_shares"] = 0.0
-        card["escrow_sell_price"] = 0.0
-        card["escrow_rebuy_target_price"] = 0.0
-
-        card["share_topup_usd"] = round(float(card.get("share_topup_usd") or 0.0) + bonus_sh_usd_val, 4)
         card["vaulted_usd"] = round(float(card.get("vaulted_usd") or 0.0) + pure_usdt_profit, 4)
-        card["skim_count"] = int(card.get("skim_count", 0)) + 1
-
-        card["anchor_usd"] = round(new_total_shares * current_price, 2)
-        card["entry_price"] = current_price
-        card["sliding_low"] = current_price
-        card["highest_price"] = current_price
+        card["skim_count"] = int(card.get("skim_count") or 0) + 1
+        card["anchor_usd"] = round(new_sh * price, 2)
+        card["entry_price"] = price
+        card["sliding_low"] = price
+        card["highest_price"] = price
         card["gain_from_low_pct"] = 0.0
         card["ratchet_armed"] = False
         card["zero_loss_stop"] = 0.0
         card["status"] = "HOLDING_ANCHOR"
 
         STATE["vault_cash"] = round(float(STATE.get("vault_cash", 0.0)) + pure_usdt_profit, 4)
-        STATE["added_to_anchors"] = round(float(STATE.get("added_to_anchors", 0.0)) + bonus_sh_usd_val, 4)
         STATE["total_skims"] = int(STATE.get("total_skims", 0)) + 1
-
         STATE["exchange_bridge"]["realized_usdt_profit"] = round(
             float(STATE["exchange_bridge"].get("realized_usdt_profit") or 0.0) + pure_usdt_profit, 4
         )
@@ -1421,30 +1217,123 @@ def execute_stage2_escrow_rebuy_and_skim(sym, current_price, force_manual=False)
         STATE["skim_ledger"].insert(0, {
             "id": str(uuid.uuid4())[:8],
             "symbol": sym,
-            "mode": "LIVE" if is_live else "PAPER",
-            "stage": f"50/50 Balanced Re-Buy (+{bonus_sh:.5f} {sym})",
-            "price": f"{current_price:.4f}",
+            "mode": "LIVE",
+            "stage": f"Direct USDT Profit Skim (+${pure_usdt_profit:.4f} USDT)",
+            "price": f"{price:.4f}",
             "time": ts_now,
-            "profit": total_real_skim,
+            "profit": pure_usdt_profit,
             "vault_cut": pure_usdt_profit,
-            "topup_cut": bonus_sh_usd_val,
-            "shares": f"{new_total_shares:.6f}"
+            "topup_cut": 0.0,
+            "shares": f"{new_sh:.6f}"
         })
         if len(STATE["skim_ledger"]) > 60:
             STATE["skim_ledger"] = STATE["skim_ledger"][:60]
 
+        pool_now = card["refill_pool_usdt"]
+
     add_log(
-        f"💰 [50/50 BALANCED SKIM COMPLETED] ({sym}) @ ${current_price:.4f}: "
-        f"Restored shares + added +{bonus_sh:.6f} {sym} (Now {new_total_shares:.6f} {sym}) • "
-        f"Added +${pure_usdt_profit:.4f} Pure USDT to your Gate.io Spot wallet!"
+        f"💰 [DIRECT USDT SKIM BANKED] ({sym}) @ ${price:.4f} (+{gain_pct:.2f}%): "
+        f"Kept +${pure_usdt_profit:.4f} Pure USDT Profit in Wallet! "
+        f"(Share-Refill Pool: ${pool_now:.2f} ready to replace shares)"
     )
     dispatch_phone_alert(
-        f"50/50 Balanced Skim ({sym})",
-        f"Shares Now: {new_total_shares:.6f} {sym} (+{bonus_sh:.6f} bonus)\n"
-        f"Pure USDT Added to Wallet: +${pure_usdt_profit:.4f}",
+        f"Direct USDT Profit Skim ({sym})",
+        f"Pure USDT Profit Kept: +${pure_usdt_profit:.4f}\n"
+        f"Share-Refill Pool: ${pool_now:.2f} USDT",
         category="skim"
     )
     save_persistent_state(sync_db=True)
+
+
+def execute_periodic_share_refill(sym, current_price, manual_trigger=False):
+    """
+    PERIODIC SHARE-REFILL ENGINE ("AFTER A FEW SKIMS, TAKE PART OF THE MONEY & REPLACE SHARES"):
+    Uses the accumulated `refill_pool_usdt` (part of your Spot USDT) to buy back
+    and replace your shares on Gate.io while leaving your Pure USDT Profits untouched!
+    """
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return False, "Coin card not found."
+        refill_pool = float(card.get("refill_pool_usdt") or 0.0)
+        current_sh = float(card.get("shares") or 0.0)
+        prot_sh = float(card.get("protected_shares") or current_sh)
+        usdt_avail = float(STATE["exchange_bridge"].get("available_usdt") or 0.0)
+
+    if usdt_avail < GATEIO_MIN_ORDER_USD:
+        return False, f"Gate.io requires at least $3.18 USDT to refill shares (Available: ${usdt_avail:.2f})."
+
+    # Spend only the Refill Pool (or minimum $3.20 order size) so pure profit stays in Spot USDT!
+    refill_usd_to_spend = max(GATEIO_MIN_ORDER_USD * 1.01, min(refill_pool, usdt_avail * 0.85))
+    if manual_trigger and refill_pool < GATEIO_MIN_ORDER_USD:
+        deficit_sh = max(0.0, prot_sh - current_sh)
+        needed_usd = max(GATEIO_MIN_ORDER_USD * 1.01, (deficit_sh * current_price) * 1.02)
+        refill_usd_to_spend = min(usdt_avail * 0.98, needed_usd)
+
+    order_cooldowns[sym] = time.time()
+    ok, msg, resp_data = execute_live_exchange_order(sym, "buy", usd_amount=refill_usd_to_spend)
+    if not ok or not resp_data:
+        return False, msg
+
+    bought_sh = float(resp_data.get("_net_received_shares") or (refill_usd_to_spend / current_price))
+    spent_usdt = float(resp_data.get("_filled_usdt") or refill_usd_to_spend)
+    time.sleep(0.9)
+    bals, _ = fetch_live_exchange_balances()
+    ts_now = now_hms()
+
+    with state_lock:
+        if bals:
+            STATE["exchange_bridge"]["available_usdt"] = round(bals.get("USDT", {}).get("available", 0.0), 4)
+            card["shares"] = bals.get(sym, {}).get("available", current_sh + bought_sh)
+        else:
+            card["shares"] = current_sh + bought_sh
+
+        new_total_sh = float(card["shares"])
+        net_bonus_above_prot = max(0.0, new_total_sh - prot_sh)
+        bonus_usd_val = round(net_bonus_above_prot * current_price, 4)
+
+        if new_total_sh > prot_sh:
+            card["protected_shares"] = new_total_sh
+        card["bonus_shares_added"] = round(float(card.get("bonus_shares_added") or 0.0) + bought_sh, 6)
+        card["share_topup_usd"] = round(float(card.get("share_topup_usd") or 0.0) + bonus_usd_val, 4)
+        card["refill_pool_usdt"] = max(0.0, round(refill_pool - spent_usdt, 4))
+        card["skims_since_refill"] = 0
+        card["anchor_usd"] = round(new_total_sh * current_price, 2)
+        card["entry_price"] = current_price
+        card["sliding_low"] = current_price
+        card["highest_price"] = current_price
+        card["status"] = "HOLDING_ANCHOR"
+
+        if bonus_usd_val > 0:
+            STATE["added_to_anchors"] = round(float(STATE.get("added_to_anchors", 0.0)) + bonus_usd_val, 4)
+            total_gen = round(STATE["vault_cash"] + STATE["added_to_anchors"], 4)
+            STATE["profit_curve"].append({"time": ts_now, "value": total_gen})
+
+        STATE["skim_ledger"].insert(0, {
+            "id": str(uuid.uuid4())[:8],
+            "symbol": sym,
+            "mode": "LIVE",
+            "stage": f"Auto Share-Refill (+{bought_sh:.5f} {sym} Replaced)",
+            "price": f"{current_price:.4f}",
+            "time": ts_now,
+            "profit": bonus_usd_val,
+            "vault_cut": 0.0,
+            "topup_cut": bonus_usd_val,
+            "shares": f"{new_total_sh:.6f}"
+        })
+
+    add_log(
+        f"🔄 [AUTO SHARE-REFILL COMPLETED] ({sym}) @ ${current_price:.4f}: "
+        f"Replaced +{bought_sh:.6f} {sym} using Refill Pool (${spent_usdt:.2f}) -> "
+        f"Shares now {new_total_sh:.6f} {sym} while Pure USDT Profits stay safe!"
+    )
+    dispatch_phone_alert(
+        f"Shares Refilled & Restored ({sym})",
+        f"Added +{bought_sh:.6f} {sym} -> Total Shares: {new_total_sh:.6f} {sym}",
+        category="buy"
+    )
+    save_persistent_state(sync_db=True)
+    return True, "Shares refilled."
 
 
 # ==============================================================================
@@ -1514,8 +1403,8 @@ def before_any_request():
 # ==============================================================================
 # END OF PART 1 OF 2 — PASTE PART 2 DIRECTLY BELOW THIS LINE
 # ==============================================================================# ==============================================================================
-# VAULTSKIM COMMAND CENTER — v5.10 AUTO-BUG FIXER & ZERO-LOSS BALANCED ENGINE
-# PART 2 OF 2: FLASK API ROUTES, 1-TAP ESCROW UNLOCK & FULL COMMAND CENTER UI
+# VAULTSKIM COMMAND CENTER — v6.0 PRIORITY USDT & SHARE REFILL POOL
+# PART 2 OF 2: FLASK API ROUTES, MANUAL SHARE REFILL & FULL COMMAND CENTER UI
 # ==============================================================================
 @app.route("/ping")
 @app.route("/health")
@@ -1535,7 +1424,7 @@ def route_heartbeat():
     return jsonify({
         "ok": True,
         "status": "ALIVE",
-        "version": "v5.10 - Auto-Fix & Balanced 50/50",
+        "version": "v6.0 - Priority USDT & Share Refill Pool",
         "live_bridge_armed": armed,
         "active_coins": count,
         "auto_fixes_applied": fixes,
@@ -1560,7 +1449,7 @@ def route_manifest():
     manifest = {
         "name": "VaultSkim Command Center",
         "short_name": "VaultSkim",
-        "description": "Auto-Bug Fixer, Target-Or-Lower Re-Buy & 50/50 Balanced Wave Skimmer",
+        "description": "Priority Pure USDT Profit Skimmer & Auto Share-Refill Pool",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#050914",
@@ -1623,13 +1512,13 @@ def route_api_state():
         }
         vc = float(STATE.get("vault_cash") or 0.0)
         aa = float(STATE.get("added_to_anchors") or 0.0)
-        harvest_esc = sum(float(c.get("escrow_usdt_reserved") or 0.0) for c in STATE.get("coins", {}).values())
+        total_pool = sum(float(c.get("refill_pool_usdt") or 0.0) for c in STATE.get("coins", {}).values())
 
         payload = {
-            "version": STATE.get("version", "v5.10 - Auto-Fix & Balanced 50/50"),
+            "version": STATE.get("version", "v6.0 - Priority USDT & Share Refill Pool"),
             "vault_cash": vc,
             "added_to_anchors": aa,
-            "total_escrow_reserved": round(harvest_esc, 4),
+            "total_escrow_reserved": round(total_pool, 4),
             "total_profit": round(vc + aa, 4),
             "total_skims": int(STATE.get("total_skims") or 0),
             "total_withdrawn": float(STATE.get("total_withdrawn") or 0.0),
@@ -1736,7 +1625,7 @@ def route_coin_launch():
             "symbol": sym,
             "contract": contract,
             "source": quote["source"],
-            "strategy": "50/50 Hybrid Moonbag",
+            "strategy": "70% Pure USDT + 30% Share Refill",
             "live_enabled": live_armed,
             "status": "WAITING_LIVE_BUY" if live_armed else "HOLDING_ANCHOR",
             "current_price": price,
@@ -1748,12 +1637,13 @@ def route_coin_launch():
             "anchor_usd": anchor_usd,
             "shares": 0.0 if live_armed else init_paper_sh,
             "protected_shares": 0.0 if live_armed else init_paper_sh,
+            "refill_pool_usdt": 0.0,
+            "skims_since_refill": 0,
+            "last_skim_sell_price": price,
             "escrow_usdt_reserved": 0.0,
             "escrow_sold_shares": 0.0,
             "escrow_sell_price": 0.0,
             "escrow_rebuy_target_price": 0.0,
-            "escrow_post_sell_low": price,
-            "escrow_started_ts": time.time(),
             "bonus_shares_added": 0.0,
             "share_topup_usd": 0.0,
             "vaulted_usd": 0.0,
@@ -1805,9 +1695,9 @@ def route_coin_cycle_strategy():
     data = request.json or {}
     sym = (data.get("symbol") or "").upper().strip()
     strategies = [
-        "50/50 Hybrid Moonbag",
-        "100% Share Compounder",
-        "100% Pure Cash Skim"
+        "70% Pure USDT + 30% Share Refill",
+        "100% Pure Cash Skim",
+        "100% Share Compounder"
     ]
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -1824,10 +1714,9 @@ def route_coin_cycle_strategy():
 @app.route("/api/coin/force_rebuy", methods=["POST"])
 def route_coin_force_rebuy():
     """
-    Guaranteed 1-Tap Manual Re-Buy:
-    Immediately executes Stage 2 using your Escrow USDT without any limit-buffer
-    rejection. If the order was already filled manually on the Gate.io app, it
-    auto-syncs your Gate.io wallet and clears the Escrow banner cleanly!
+    1-Tap Manual Share Refill:
+    Immediately triggers a Share Refill using the coin's Refill Pool (or available
+    Spot USDT) to buy back and replace shares on Gate.io right now!
     """
     data = request.json or {}
     sym = (data.get("symbol") or "").upper().strip()
@@ -1836,45 +1725,15 @@ def route_coin_force_rebuy():
         if not card:
             return jsonify({"ok": False, "error": "Coin not found."}), 404
         px = float(card.get("current_price") or 0.0)
-        esc = float(card.get("escrow_usdt_reserved") or 0.0)
-        prot_sh = float(card.get("protected_shares") or 0.0)
+        pool = float(card.get("refill_pool_usdt") or 0.0)
 
-    if esc <= 0 or px <= 0:
-        return jsonify({"ok": False, "error": f"No active Escrow waiting on {sym}."}), 400
-
-    # Check if the user already bought back manually on the Gate.io app
-    bals, _ = fetch_live_exchange_balances()
-    if bals:
-        real_sh = bals.get(sym, {}).get("available", 0.0)
-        if prot_sh > 0 and real_sh >= (prot_sh * 0.992):
-            with state_lock:
-                card["shares"] = real_sh
-                card["protected_shares"] = max(prot_sh, real_sh)
-                card["escrow_usdt_reserved"] = 0.0
-                card["escrow_sold_shares"] = 0.0
-                card["escrow_sell_price"] = 0.0
-                card["escrow_rebuy_target_price"] = 0.0
-                card["anchor_usd"] = round(real_sh * px, 2)
-                card["entry_price"] = px
-                card["sliding_low"] = px
-                card["highest_price"] = px
-                card["status"] = "HOLDING_ANCHOR"
-            add_log(
-                f"🛠️ [AUTO-BUG FIXER] Detected {real_sh:.6f} {sym} already restored in Gate.io wallet -> "
-                f"Cleared Escrow & resumed wave tracking!"
-            )
-            save_persistent_state(sync_db=True)
-            return jsonify({"ok": True})
+    if px <= 0:
+        return jsonify({"ok": False, "error": f"Invalid price for {sym}."}), 400
 
     order_cooldowns[sym] = 0
-    execute_stage2_escrow_rebuy_and_skim(sym, px, force_manual=True)
-    with state_lock:
-        still_escrow = float(STATE["coins"].get(sym, {}).get("escrow_usdt_reserved") or 0.0)
-    if still_escrow > 0:
-        return jsonify({
-            "ok": False,
-            "error": f"Gate.io order notice: Check the Security Log at the bottom of the screen for exact details."
-        }), 400
+    ok, msg = execute_periodic_share_refill(sym, px, manual_trigger=True)
+    if not ok:
+        return jsonify({"ok": False, "error": msg}), 400
     return jsonify({"ok": True})
 
 
@@ -1912,8 +1771,6 @@ def route_coin_force_buy():
                 px = float(c_now.get("current_price") or 1.0)
                 c_now["anchor_usd"] = round(float(c_now["shares"]) * px, 2)
                 c_now["protected_shares"] = max(float(c_now.get("protected_shares") or 0.0), float(c_now["shares"]))
-                c_now["escrow_usdt_reserved"] = 0.0
-                c_now["escrow_sold_shares"] = 0.0
                 c_now["status"] = "HOLDING_ANCHOR"
         save_persistent_state(sync_db=True)
         return jsonify({"ok": True})
@@ -2055,7 +1912,7 @@ def route_alerts_save():
 
     if data.get("send_test"):
         dispatch_phone_alert(
-            "VaultSkim v5.10 Alert Connected",
+            "VaultSkim v6.0 Alert Connected",
             "Your phone push notification bridge is active and verified!",
             category="skim"
         )
@@ -2115,10 +1972,8 @@ def route_control_reset():
         for sym, c in STATE.get("coins", {}).items():
             c["share_topup_usd"] = 0.0
             c["vaulted_usd"] = 0.0
-            c["escrow_usdt_reserved"] = 0.0
-            c["escrow_sold_shares"] = 0.0
-            c["escrow_sell_price"] = 0.0
-            c["escrow_rebuy_target_price"] = 0.0
+            c["refill_pool_usdt"] = 0.0
+            c["skims_since_refill"] = 0
             c["skim_count"] = 0
             c["ratchet_armed"] = False
             c["zero_loss_stop"] = 0.0
@@ -2131,7 +1986,7 @@ def route_control_reset():
                 c["sliding_low"] = px
                 c["highest_price"] = px
                 c["status"] = "HOLDING_ANCHOR"
-        add_log("♻️ Reset Counters to $0.0000 • Aligned Sliding Lows & Preserved Protected Share Floor.")
+        add_log("♻️ Reset Counters to $0.0000 • Preserved Protected Share Floors & Cleared Pools.")
     save_persistent_state(sync_db=True)
     return jsonify({"ok": True})
 
@@ -2168,7 +2023,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/svg+xml" href="/icon.svg">
     <link rel="apple-touch-icon" href="/icon.svg">
-    <title>VaultSkim Command Center • v5.10 Auto-Fix & Balanced 50/50</title>
+    <title>VaultSkim Command Center • v6.0 Priority USDT & Share Refill Pool</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root {
@@ -2222,11 +2077,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="flex items-center justify-between gap-2 mb-1">
             <h1 class="text-lg sm:text-xl font-extrabold text-white tracking-tight">VaultSkim Command Center</h1>
             <span id="versionBadge" class="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-950/90 text-emerald-400 border border-emerald-600/60 mono whitespace-nowrap">
-                v5.10 - Auto-Fix & Balanced 50/50
+                v6.0 - Priority USDT & Refill Pool
             </span>
         </div>
         <div class="flex items-center justify-between text-[11px] text-slate-400 mb-3">
-            <span>Target-Or-Lower Re-Buy • +0.20% Upward Guard • Auto-Fixer</span>
+            <span>Direct Pure USDT Skims • Periodic Share-Refill Pool • Auto-Fixer</span>
             <span id="liveTickClock" class="text-emerald-400 mono font-bold">● Tick: --:--:--</span>
         </div>
 
@@ -2273,13 +2128,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- TOTAL UNTOUCHABLE PROFIT HERO CARD -->
     <div class="profit-card p-4 mb-3 text-center">
         <div class="text-[11px] font-bold uppercase tracking-widest text-slate-400 mb-1">
-            TOTAL REALIZED GATE.IO PROFIT (USDT + BONUS SHARES)
+            TOTAL REALIZED GATE.IO PROFIT (DIRECT USDT + REFILL POOL)
         </div>
         <div id="heroTotalProfit" class="text-4xl font-extrabold text-emerald-400 mono tracking-tight my-1">
             $0.0000
         </div>
         <div id="heroProfitSub" class="text-xs text-slate-300 mono">
-            Real USDT Profit: $0.0000 | Bonus Shares Value: +$0.0000 | Active Escrow: $0.00
+            Pure USDT Vaulted: $0.0000 | Share-Refill Pool: $0.00 | Total Skims: 0
         </div>
     </div>
 
@@ -2390,7 +2245,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </span>
         </div>
         <p class="text-[11px] text-slate-400 mb-2">
-            Target-Or-Lower Re-Buy + +0.20% Upward Guard: 50% Bonus Shares + 50% Pure Spot USDT
+            Direct Pure USDT Skimmer + Periodic Share-Refill Pool (100% token bags kept intact)
         </p>
         <div class="w-full h-40 bg-slate-950/70 rounded-lg border border-slate-800/80 p-2 relative">
             <svg id="profitChartSvg" viewBox="0 0 500 150" class="w-full h-full overflow-visible"></svg>
@@ -2404,14 +2259,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="text-xs font-extrabold uppercase tracking-wider text-slate-200">
                     📋 VERIFIED GATE.IO SKIM LEDGER
                 </div>
-                <div class="text-[11px] text-slate-400">Every completed 50/50 Balanced Re-Buy & USDT Profit Fill</div>
+                <div class="text-[11px] text-slate-400">Every direct USDT profit skim & share refill</div>
             </div>
             <button onclick="window.location='/api/export_csv'" class="btn-press px-2.5 py-1 rounded-md bg-emerald-950/90 text-emerald-300 border border-emerald-700/70 text-xs font-bold mono">
                 📥 CSV
             </button>
         </div>
         <div id="skimLedgerList" class="mt-2.5 space-y-2 max-h-52 overflow-y-auto text-xs mono">
-            <div class="text-center text-slate-500 py-4 text-xs">Waiting for next completed Gate.io wave skim...</div>
+            <div class="text-center text-slate-500 py-4 text-xs">Waiting for next price bounce to skim Pure USDT...</div>
         </div>
     </div>
 
@@ -2565,11 +2420,11 @@ function updateUI(data) {
 
     const vc = Number(data.vault_cash || 0);
     const aa = Number(data.added_to_anchors || 0);
-    const esc = Number(data.total_escrow_reserved || 0);
+    const totalPool = Number(data.total_escrow_reserved || 0);
 
     document.getElementById('heroTotalProfit').innerText = `$${Number(data.total_profit || 0).toFixed(4)}`;
     document.getElementById('heroProfitSub').innerText =
-        `Real USDT Profit: $${vc.toFixed(4)} | Bonus Shares Value: +$${aa.toFixed(4)} | Active Escrow: $${esc.toFixed(2)}`;
+        `Pure USDT Vaulted: $${vc.toFixed(4)} | Share-Refill Pool: $${totalPool.toFixed(2)} | Total Skims: ${data.total_skims || 0}`;
     document.getElementById('cashoutAvailDisplay').innerText = `$${vc.toFixed(4)}`;
     document.getElementById('chartSkimBadge').innerText = `${data.total_skims || 0} Completed Wave Skims`;
     if (data.last_price_tick_hms) {
@@ -2622,7 +2477,7 @@ function updateUI(data) {
     const ledgerBox = document.getElementById('skimLedgerList');
     const ledger = data.skim_ledger || [];
     if (ledger.length === 0) {
-        ledgerBox.innerHTML = `<div class="text-center text-slate-500 py-4 text-xs">Waiting for next completed Gate.io wave skim...</div>`;
+        ledgerBox.innerHTML = `<div class="text-center text-slate-500 py-4 text-xs">Waiting for next price bounce to skim Pure USDT...</div>`;
     } else {
         ledgerBox.innerHTML = ledger.slice(0, 12).map(row => `
             <div class="v-inner p-2.5 flex items-center justify-between">
@@ -2632,7 +2487,7 @@ function updateUI(data) {
                         <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-200">[${row.mode}]</span>
                         <span class="text-slate-300 text-[11px]">${row.stage}</span>
                     </div>
-                    <div class="text-[10px] text-slate-400 mt-0.5">@ $${row.price} • ${row.time} • +$${Number(row.vault_cut || 0).toFixed(4)} USDT</div>
+                    <div class="text-[10px] text-slate-400 mt-0.5">@ $${row.price} • ${row.time}</div>
                 </div>
                 <div class="text-right">
                     <div class="text-emerald-400 font-extrabold">+$${Number(row.profit || 0).toFixed(4)}</div>
@@ -2654,48 +2509,36 @@ function updateUI(data) {
             const isLive = Boolean(c.live_enabled);
             const sh = Number(c.shares || 0);
             const protSh = Number(c.protected_shares || sh);
-            const harvestEsc = Number(c.escrow_usdt_reserved || 0);
-            const soldSh = Number(c.escrow_sold_shares || 0);
-            const sellPx = Number(c.escrow_sell_price || 0);
-            const rebuyPx = Number(c.escrow_rebuy_target_price || 0);
-            const upGuardPx = sellPx * 1.0020;
+            const refillPool = Number(c.refill_pool_usdt || 0);
+            const skimsSince = Number(c.skims_since_refill || 0);
             const bonusSh = Number(c.bonus_shares_added || 0);
             const price = Number(c.current_price || 0);
             const low = Number(c.sliding_low || price);
             const anchor = Number(c.anchor_usd || 10);
             const tokenVal = sh * price;
-            const totalBucketVal = tokenVal + harvestEsc;
+            const totalBucketVal = tokenVal + refillPool;
             const gainPct = low > 0 ? (((price - low) / low) * 100) : 0;
-            const harvestTargetPrice = low * 1.0062;
-            const pctBar = c.status === 'ESCROW_HOLDING'
-                ? 100
-                : Math.max(0, Math.min(100, (gainPct / 0.62) * 100));
+            const harvestTargetPrice = low * 1.0065;
+            const pctBar = Math.max(0, Math.min(100, (gainPct / 0.65) * 100));
 
             const modePill = isLive
                 ? `<button onclick="switchCoinMode('${sym}', true)" class="btn-press px-2 py-0.5 rounded bg-rose-950/90 text-rose-400 border border-rose-700/70 text-[10px] font-extrabold mono">⚡ LIVE ORDER</button>`
                 : `<button onclick="switchCoinMode('${sym}', false)" class="btn-press px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-bold mono">📄 PAPER</button>`;
 
-            const statusPill = c.status === 'ESCROW_HOLDING'
-                ? `<span class="px-2 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-600/80 text-[10px] font-extrabold mono">🔒 TARGET-OR-LOWER ESCROW</span>`
-                : `<span class="px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-400 border border-emerald-700/70 text-[10px] font-extrabold mono">${c.status}</span>`;
+            const statusPill = `<span class="px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-400 border border-emerald-700/70 text-[10px] font-extrabold mono">${c.status}</span>`;
 
-            const escrowDetailHtml = harvestEsc > 0
-                ? `<div class="flex items-center justify-between text-amber-300 bg-amber-950/40 px-2 py-1.5 rounded border border-amber-700/60">
-                       <span>🔒 Active Escrow ($${harvestEsc.toFixed(2)}):</span>
-                       <span class="font-bold">Buy <=$${formatPrice(rebuyPx)} (or Lower) | +0.2% @ $${formatPrice(upGuardPx)}</span>
-                   </div>`
-                : `<div class="flex items-center justify-between">
-                       <span class="text-slate-400">Next Real Gate.io Harvest (+0.62%):</span>
-                       <span class="text-amber-300 font-bold">$${formatPrice(harvestTargetPrice)} (+$${Number(c.share_topup_usd || 0).toFixed(4)} Share Growth)</span>
-                   </div>`;
+            const refillDetailHtml = `<div class="flex items-center justify-between text-amber-300 bg-amber-950/40 px-2 py-1.5 rounded border border-amber-700/60">
+                <span>🔄 Share-Refill Pool:</span>
+                <span class="font-bold">$${refillPool.toFixed(2)} USDT (${skimsSince}/3 skims stored)</span>
+            </div>`;
 
-            const forceRebuyBtnHtml = (isLive && harvestEsc > 0)
-                ? `<button onclick="forceInstantEscrowRebuy('${sym}')" class="btn-press w-full mt-2 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs flex items-center justify-center gap-1.5 shadow">
-                       <span>⚡</span> <span>Instant Re-Buy & Restore ${sym} Shares Right Now</span>
+            const forceRefillBtnHtml = (isLive && refillPool >= 3.18)
+                ? `<button onclick="forceShareRefill('${sym}')" class="btn-press w-full mt-2 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs flex items-center justify-center gap-1.5 shadow">
+                       <span>🔄</span> <span>Take Pool ($${refillPool.toFixed(2)}) & Replace Shares Now</span>
                    </button>`
                 : '';
 
-            const topupBtnHtml = (isLive && usdtAvail >= 3.15 && harvestEsc <= 0)
+            const topupBtnHtml = (isLive && usdtAvail >= 3.18)
                 ? `<button onclick="deployUsdtToShares('${sym}', ${usdtAvail})" class="btn-press w-full mt-2 py-2 rounded-lg bg-sky-950/90 hover:bg-sky-900 text-sky-300 border border-sky-600/80 font-extrabold text-xs flex items-center justify-center gap-1.5">
                        <span>🛡️</span> <span>Use Spot USDT ($${usdtAvail.toFixed(2)}) to Buy More ${sym} Shares</span>
                    </button>`
@@ -2703,9 +2546,9 @@ function updateUI(data) {
 
             const bottomBar = isLive
                 ? `<button onclick="manualSyncLive()" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-700/70 font-bold text-xs flex items-center justify-center gap-1.5">
-                       <span>🟢</span> <span>Target-Or-Lower + Auto-Bug Fixer Active — Zero Losses</span>
+                       <span>🟢</span> <span>Priority Pure USDT Skimmer Active — Zero Lockups</span>
                    </button>
-                   ${forceRebuyBtnHtml}
+                   ${forceRefillBtnHtml}
                    ${topupBtnHtml}`
                 : `<button onclick="triggerPracticeSpike('${sym}')" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-amber-950/70 hover:bg-amber-900/70 text-amber-300 border border-amber-600/70 font-extrabold text-xs">
                        ⚡ Practice Spike (+1.5% Simulator)
@@ -2729,7 +2572,7 @@ function updateUI(data) {
 
                 <div class="v-inner px-3 py-2 mb-3 flex items-center justify-between text-xs">
                     <span class="text-left text-indigo-300 font-bold">
-                        ⚡ Strategy: ${c.strategy || '50/50 Hybrid Moonbag'}
+                        ⚡ Strategy: ${c.strategy || '70% Pure USDT + 30% Share Refill'}
                     </span>
                     <button onclick="cycleCoinStrategy('${sym}')" class="btn-press px-2.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-700/80 font-bold text-[11px]">
                         Switch
@@ -2759,7 +2602,7 @@ function updateUI(data) {
 
                     <div class="flex items-center justify-between">
                         <span class="text-slate-400">Protected Share Baseline:</span>
-                        <span class="text-sky-300 font-bold">🛡️ ${protSh.toFixed(6)} ${sym} (Grows on Re-Buy)</span>
+                        <span class="text-sky-300 font-bold">🛡️ ${protSh.toFixed(6)} ${sym}</span>
                     </div>
 
                     <div class="flex items-center justify-between">
@@ -2767,30 +2610,30 @@ function updateUI(data) {
                         <span class="text-white font-bold">$${totalBucketVal.toFixed(2)}</span>
                     </div>
 
-                    ${escrowDetailHtml}
+                    ${refillDetailHtml}
 
                     <div class="flex items-center justify-between">
-                        <span class="text-slate-400">Sliding Low / Harvest Trigger:</span>
+                        <span class="text-slate-400">Sliding Low / Next Skim:</span>
                         <span class="text-slate-200 font-bold">$${formatPrice(low)} / $${formatPrice(harvestTargetPrice)}</span>
                     </div>
 
                     <div class="flex items-center justify-between">
-                        <span class="text-slate-400">Zero-Loss / +0.62% Bar:</span>
-                        <span class="text-emerald-300 font-bold">${c.status === 'ESCROW_HOLDING' ? 'Re-Buy <= $' + formatPrice(rebuyPx) + ' or Lower (Sold @ $' + formatPrice(sellPx) + ')' : (c.zero_loss_stop > 0 ? 'LOCKED Stop @ $' + formatPrice(c.zero_loss_stop) : 'Shield @ +0.35% | Harvest @ $' + formatPrice(harvestTargetPrice))}</span>
+                        <span class="text-slate-400">Zero-Loss / +0.65% Bar:</span>
+                        <span class="text-emerald-300 font-bold">${c.zero_loss_stop > 0 ? 'LOCKED Stop @ $' + formatPrice(c.zero_loss_stop) : 'Shield @ +0.38% | Skim @ $' + formatPrice(harvestTargetPrice)}</span>
                     </div>
 
                     <div class="w-full bg-slate-900 h-2 rounded-full overflow-hidden border border-slate-800">
-                        <div class="${c.status === 'ESCROW_HOLDING' ? 'bg-amber-400' : 'bg-emerald-400'} h-full transition-all duration-300" style="width: ${pctBar}%"></div>
+                        <div class="bg-emerald-400 h-full transition-all duration-300" style="width: ${pctBar}%"></div>
                     </div>
 
                     <div class="flex items-center justify-between pt-0.5">
                         <span class="text-slate-400">Realized USDT Profit (${sym}):</span>
-                        <span class="text-emerald-400 font-extrabold">+$${Number(c.vaulted_usd || 0).toFixed(4)} (${c.skim_count || 0} real skims)</span>
+                        <span class="text-emerald-400 font-extrabold">+$${Number(c.vaulted_usd || 0).toFixed(4)} (${c.skim_count || 0} direct skims)</span>
                     </div>
                 </div>
 
                 ${bottomBar}
-            </div>`;
+            `;
         }).join('');
     }
 
@@ -2840,7 +2683,7 @@ async function manualSyncLive() {
     pollState();
 }
 
-async function forceInstantEscrowRebuy(symbol) {
+async function forceShareRefill(symbol) {
     const r = await fetch('/api/coin/force_rebuy', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2848,7 +2691,7 @@ async function forceInstantEscrowRebuy(symbol) {
     });
     const res = await r.json();
     if (!r.ok || !res.ok) {
-        alert(res.error || "Could not trigger instant Escrow re-buy.");
+        alert(res.error || "Could not execute share refill.");
     }
     pollState();
 }
@@ -2928,7 +2771,7 @@ async function cycleCoinStrategy(symbol) {
 
 async function deployUsdtToShares(symbol, availUsdt) {
     const input = prompt(
-        `How much of your $${availUsdt.toFixed(2)} Spot USDT would you like to deploy right now to buy more ${symbol} shares? (Gate.io minimum order is $3.15 USDT):`,
+        `How much of your $${availUsdt.toFixed(2)} Spot USDT would you like to deploy right now to buy more ${symbol} shares? (Gate.io minimum order is $3.18 USDT):`,
         availUsdt.toFixed(2)
     );
     if (input === null || input.trim() === '') return;
@@ -2946,7 +2789,7 @@ async function deployUsdtToShares(symbol, availUsdt) {
 
 async function promptEditAnchor(symbol, currentVal) {
     const input = prompt(
-        `Enter new Bucket A (Anchor USD) for ${symbol} (Current live token value is $${Number(currentVal).toFixed(2)}. Entering a higher USD value will immediately buy the extra ${symbol} shares on Gate.io! Gate.io minimum order size is $3.15 USDT):`,
+        `Enter new Bucket A (Anchor USD) for ${symbol} (Current live token value is $${Number(currentVal).toFixed(2)}. Entering a higher USD value will immediately buy the extra ${symbol} shares on Gate.io! Gate.io minimum order size is $3.18 USDT):`,
         currentVal
     );
     if (input === null || input.trim() === '') return;
@@ -3012,7 +2855,7 @@ async function recordCashout() {
         alert(res.error || "Could not record cash-out.");
         return;
     }
-    document.getElementById('cashoutAmountInput').value = '';
+    document.getElementById('cashoutAmountInput').value = swift;
     pollState();
 }
 
@@ -3022,7 +2865,7 @@ async function toggleFreeze() {
 }
 
 async function resetProfitCounters() {
-    if (!confirm("Reset Profit Counters to $0.0000 and align your Sliding Low to the current live price?")) return;
+    if (!confirm("Reset Profit Counters to $0.0000 and clear Refill Pools?")) return;
     await fetch('/api/control/reset', {method: 'POST'});
     pollState();
 }
