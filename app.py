@@ -1,17 +1,6 @@
 # ==============================================================================
-# VAULTSKIM COMMAND CENTER — v5.7 REAL GATE.IO WAVE-COMPOUNDER & USDT SKIMMER
-# PART 1 OF 2: CORE ENGINE, ATOMIC DB SYNC, GATE.IO V4 BRIDGE & REAL WAVE SKIM
-# ==============================================================================
-# Fixes in v5.7:
-#   1. ZERO "AIR SKIMMING": Removed fake cents-escrow paper counters in Live Mode.
-#      Profit is ONLY booked when a real Gate.io order executes and fills.
-#   2. WORKS AT CURRENT PRICE (NO $202 STALL): Harvests a working tranche on any
-#      +0.65% bounce off the live Sliding Low (e.g. $195.07 -> $196.34), locks
-#      the real USDT in Escrow Reserve, and on a -0.42% pullback buys back 100%
-#      of the sold shares PLUS extra Bonus Shares while leaving the remaining
-#      real USDT profit inside your Gate.io Spot USDT balance!
-#   3. MULTI-WORKER ANTI-FLICKER SYNC: Eliminates the $0.0000 screen flicker
-#      across Gunicorn workers by syncing state safely before reads/writes.
+# VAULTSKIM COMMAND CENTER — v5.8 SHARE-DRIVEN RE-BUY & DYNAMIC ESCROW ENGINE
+# PART 1 OF 2: CORE ENGINE, DB SYNC, GATE.IO V4 BRIDGE & EXACT SHARE RE-BUY
 # ==============================================================================
 import os
 import sys
@@ -24,7 +13,7 @@ import hashlib
 import logging
 import threading
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 from urllib.parse import urlencode
 
 import requests
@@ -49,7 +38,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("VaultSkimV57")
+logger = logging.getLogger("VaultSkimV58")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -57,19 +46,18 @@ app.config["JSON_SORT_KEYS"] = False
 # ==============================================================================
 # 1. GLOBAL CONFIGURATION & PERSISTENCE CONSTANTS
 # ==============================================================================
-STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_v57.json")
-LEGACY_STATE_FILE = "vaultskim_state_v52.json"
+STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_v58.json")
+LEGACY_FILES = ("vaultskim_state_v57.json", "vaultskim_state_v52.json")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
-# Gate.io enforces a strict $3.00 USDT minimum order notional on Spot pairs
 GATEIO_MIN_ORDER_USD = 3.15
 
 state_lock = threading.RLock()
 tick_lock = threading.Lock()
-order_cooldowns = {}          # symbol -> timestamp of last live order attempt
-pair_rules_cache = {}         # pair -> precision & minimum order rules
-price_cache = {}              # symbol -> {price, ask, bid, source, ts}
+order_cooldowns = {}
+pair_rules_cache = {}
+price_cache = {}
 
 _worker_pid = None
 _engine_thread = None
@@ -79,11 +67,11 @@ _last_wallet_sync_ts = 0.0
 _last_db_pull_ts = 0.0
 
 DEFAULT_STATE = {
-    "version": "v5.7 - Real Gate.io Wave-Compounder",
+    "version": "v5.8 - Share-Driven Dynamic Wave",
     "state_updated_ts": 0.0,
-    "vault_cash": 0.0,               # 100% Realized USDT profit in Gate.io Spot wallet
-    "added_to_anchors": 0.0,         # 100% Realized USD value of Bonus Shares bought on Gate.io
-    "total_escrow_reserved": 0.0,    # Real Gate.io USDT currently waiting to re-buy shares on dip
+    "vault_cash": 0.0,
+    "added_to_anchors": 0.0,
+    "total_escrow_reserved": 0.0,
     "total_skims": 0,
     "total_withdrawn": 0.0,
     "frozen": False,
@@ -98,7 +86,7 @@ DEFAULT_STATE = {
     "cashout_history": [],
     "logs": [
         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        f"VaultSkim v5.7 Real Gate.io Wave-Compounder & USDT Skimmer Initialized."
+        f"VaultSkim v5.8 Share-Driven Re-Buy & Dynamic Escrow Engine Initialized."
     ],
     "exchange_bridge": {
         "exchange": "gateio",
@@ -126,7 +114,7 @@ DEFAULT_STATE = {
 
 
 # ==============================================================================
-# 2. ATOMIC MULTI-WORKER DATABASE & FILE PERSISTENCE LAYER (ZERO FLICKER)
+# 2. MULTI-WORKER DATABASE & FILE PERSISTENCE LAYER
 # ==============================================================================
 def init_db():
     if not DATABASE_URL or not HAS_PSYCOPG2:
@@ -143,10 +131,9 @@ def init_db():
             """)
         conn.commit()
         conn.close()
-        logger.info("Neon PostgreSQL persistence table verified.")
         return True
     except Exception as e:
-        logger.warning(f"PostgreSQL init skipped, using JSON file fallback: {e}")
+        logger.warning(f"PostgreSQL init fallback: {e}")
         return False
 
 
@@ -155,52 +142,35 @@ def merge_default_state(loaded):
     if not isinstance(loaded, dict):
         return merged
 
-    # If upgrading from v5.6 where fake Cents-Escrow skims inflated counters,
-    # automatically clean out the imaginary cents-escrow counters once on upgrade!
-    was_old_version = loaded.get("version") != "v5.7 - Real Gate.io Wave-Compounder"
-
     for k, v in loaded.items():
         if isinstance(v, dict) and k in merged and isinstance(merged[k], dict) and k != "coins":
             merged[k].update(v)
         else:
             merged[k] = v
 
-    merged["version"] = "v5.7 - Real Gate.io Wave-Compounder"
-
-    if was_old_version:
-        merged["vault_cash"] = 0.0
-        merged["added_to_anchors"] = 0.0
-        merged["total_escrow_reserved"] = 0.0
-        merged["total_skims"] = 0
-        merged["skim_ledger"] = []
-        merged["profit_curve"] = [{"time": datetime.now(timezone.utc).strftime("%H:%M:%S"), "value": 0.0}]
+    merged["version"] = "v5.8 - Share-Driven Dynamic Wave"
 
     for sym, c in merged.get("coins", {}).items():
         sh = float(c.get("shares") or 0.0)
         px = float(c.get("current_price") or 0.0)
-        c.setdefault("protected_shares", sh)
-        if float(c.get("protected_shares") or 0.0) <= 0 and sh > 0:
-            c["protected_shares"] = sh
+        prot_sh = float(c.get("protected_shares") or 0.0)
+        c["protected_shares"] = sh if prot_sh <= 0 else max(prot_sh, sh)
         c.setdefault("escrow_usdt_reserved", 0.0)
         c.setdefault("escrow_sold_shares", 0.0)
         c.setdefault("escrow_sell_price", 0.0)
         c.setdefault("escrow_rebuy_target_price", 0.0)
+        c.setdefault("escrow_post_sell_low", px)
+        c.setdefault("escrow_started_ts", time.time() - 180.0)
         c.setdefault("bonus_shares_added", 0.0)
         c.setdefault("zero_loss_stop", 0.0)
         c.setdefault("share_topup_usd", 0.0)
         c.setdefault("vaulted_usd", 0.0)
         c.setdefault("skim_count", 0)
 
-        if was_old_version:
-            c["cents_escrow_usd"] = 0.0
-            c["share_topup_usd"] = 0.0
-            c["vaulted_usd"] = 0.0
-            c["skim_count"] = 0
-            if float(c.get("escrow_usdt_reserved") or 0.0) <= 0 and px > 0:
-                c["entry_price"] = px
-                c["sliding_low"] = px
-                c["highest_price"] = px
-                c["status"] = "HOLDING_ANCHOR"
+        # Tighten any existing v5.7 escrow target from -0.42% to -0.28% so it doesn't hang
+        sell_px = float(c.get("escrow_sell_price") or 0.0)
+        if c.get("status") == "ESCROW_HOLDING" and sell_px > 0:
+            c["escrow_rebuy_target_price"] = round(sell_px * 0.9972, 8)
 
         if sh > 0 and px > 0 and float(c.get("escrow_usdt_reserved") or 0.0) <= 0:
             c["anchor_usd"] = round(sh * px, 2)
@@ -209,9 +179,8 @@ def merge_default_state(loaded):
 
 
 def load_persistent_state():
-    # 1. Try Neon PostgreSQL v5.7 key first, then legacy v5.2 key
     if DATABASE_URL and HAS_PSYCOPG2:
-        for key_name in ("master_state_v57", "master_state_v52"):
+        for key_name in ("master_state_v58", "master_state_v57", "master_state_v52"):
             try:
                 conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -230,33 +199,27 @@ def load_persistent_state():
                     ):
                         return merge_default_state(loaded)
             except Exception as e:
-                logger.warning(f"PostgreSQL load fallback ({key_name}): {e}")
+                logger.warning(f"PG load fallback ({key_name}): {e}")
 
-    # 2. Try local JSON files
-    for fpath in (STATE_FILE, LEGACY_STATE_FILE):
+    for fpath in (STATE_FILE,) + LEGACY_FILES:
         if os.path.exists(fpath):
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                     if isinstance(loaded, dict):
                         return merge_default_state(loaded)
-            except Exception as e:
-                logger.warning(f"JSON state file load error ({fpath}): {e}")
+            except Exception:
+                pass
 
     return json.loads(json.dumps(DEFAULT_STATE))
 
 
 def pull_latest_state_if_newer():
-    """
-    Prevents multi-worker Gunicorn state flicker ($0.0000 flash) by pulling
-    the latest state from PostgreSQL/disk if another worker updated it or if
-    this worker has an empty coin list.
-    """
     global STATE, _last_db_pull_ts
     now_ts = time.time()
     with state_lock:
-        local_Empty = (len(STATE.get("coins", {})) == 0 and not STATE.get("exchange_bridge", {}).get("api_key"))
-        if not local_Empty and (now_ts - _last_db_pull_ts) < 3.0:
+        local_empty = (len(STATE.get("coins", {})) == 0 and not STATE.get("exchange_bridge", {}).get("api_key"))
+        if not local_empty and (now_ts - _last_db_pull_ts) < 3.0:
             return
         _last_db_pull_ts = now_ts
         local_ts = float(STATE.get("state_updated_ts") or 0.0)
@@ -268,7 +231,7 @@ def pull_latest_state_if_newer():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     "SELECT store_json FROM vaultskim_kv_store WHERE store_key = %s;",
-                    ("master_state_v57",)
+                    ("master_state_v58",)
                 )
                 row = cur.fetchone()
             conn.close()
@@ -289,13 +252,12 @@ def pull_latest_state_if_newer():
         remote_ts = float(loaded.get("state_updated_ts") or 0.0)
         remote_has_data = bool(loaded.get("coins") or loaded.get("exchange_bridge", {}).get("api_key"))
         with state_lock:
-            if (local_Empty and remote_has_data) or (remote_ts > local_ts + 0.5):
+            if (local_empty and remote_has_data) or (remote_ts > local_ts + 0.5):
                 STATE = merge_default_state(loaded)
 
 
 def save_persistent_state(sync_db=False):
     with state_lock:
-        # Guard against an uninitialized worker accidentally overwriting active state
         is_empty_worker = (
             len(STATE.get("coins", {})) == 0
             and not STATE.get("exchange_bridge", {}).get("api_key")
@@ -317,15 +279,15 @@ def save_persistent_state(sync_db=False):
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2)
         os.replace(tmp_file, STATE_FILE)
-    except Exception as e:
-        logger.warning(f"Local JSON save error: {e}")
+    except Exception:
+        pass
 
     if DATABASE_URL and HAS_PSYCOPG2:
         def _pg_write(data_obj):
             try:
                 conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
                 with conn.cursor() as cur:
-                    for k_name in ("master_state_v57", "master_state_v52"):
+                    for k_name in ("master_state_v58", "master_state_v57", "master_state_v52"):
                         cur.execute("""
                             INSERT INTO vaultskim_kv_store (store_key, store_json, updated_at)
                             VALUES (%s, %s, CURRENT_TIMESTAMP)
@@ -335,8 +297,8 @@ def save_persistent_state(sync_db=False):
                         """, (k_name, json.dumps(data_obj)))
                 conn.commit()
                 conn.close()
-            except Exception as ex:
-                logger.debug(f"PG save error: {ex}")
+            except Exception:
+                pass
 
         if sync_db:
             _pg_write(snapshot)
@@ -350,7 +312,7 @@ save_persistent_state(sync_db=True)
 
 
 # ==============================================================================
-# 3. LOGGING & MULTI-CHANNEL PHONE ALERT ENGINE (NTFY.SH + TELEGRAM)
+# 3. LOGGING & PHONE ALERTS
 # ==============================================================================
 def now_hms():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -367,7 +329,6 @@ def add_log(message):
 def dispatch_phone_alert(title, message, category="skim"):
     with state_lock:
         alerts = dict(STATE.get("alerts", {}))
-
     if not alerts.get("enabled"):
         return
     if category == "skim" and not alerts.get("alert_on_skim", True):
@@ -384,37 +345,28 @@ def dispatch_phone_alert(title, message, category="skim"):
                 requests.post(
                     f"https://ntfy.sh/{topic}",
                     data=message.encode("utf-8"),
-                    headers={
-                        "Title": title,
-                        "Priority": "high",
-                        "Tags": "chart_with_upwards_trend,moneybag"
-                    },
+                    headers={"Title": title, "Priority": "high", "Tags": "chart_with_upwards_trend,moneybag"},
                     timeout=5
                 )
-            except Exception as e:
-                logger.debug(f"ntfy alert error: {e}")
-
+            except Exception:
+                pass
         tg_token = (alerts.get("telegram_bot_token") or "").strip()
         tg_chat = (alerts.get("telegram_chat_id") or "").strip()
         if tg_token and tg_chat:
             try:
                 requests.post(
                     f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                    json={
-                        "chat_id": tg_chat,
-                        "text": f"*{title}*\n{message}",
-                        "parse_mode": "Markdown"
-                    },
+                    json={"chat_id": tg_chat, "text": f"*{title}*\n{message}", "parse_mode": "Markdown"},
                     timeout=5
                 )
-            except Exception as e:
-                logger.debug(f"Telegram alert error: {e}")
+            except Exception:
+                pass
 
     threading.Thread(target=_send, daemon=True).start()
 
 
 # ==============================================================================
-# 4. CRYPTOGRAPHIC SIGNING & PRECISION HELPERS (GATE.IO V4 & BINANCE V3)
+# 4. CRYPTOGRAPHIC SIGNING & PRECISION HELPERS
 # ==============================================================================
 def quantize_value(val, decimals, mode=ROUND_DOWN):
     try:
@@ -427,17 +379,13 @@ def quantize_value(val, decimals, mode=ROUND_DOWN):
 
 def gateio_v4_sign(api_key, api_secret, method, url_path, query_string="", body_str=""):
     ts = str(int(time.time()))
-    m = hashlib.sha512()
-    m.update((body_str or "").encode("utf-8"))
-    body_hash = m.hexdigest()
-
+    body_hash = hashlib.sha512((body_str or "").encode("utf-8")).hexdigest()
     sign_string = f"{method.upper()}\n{url_path}\n{query_string}\n{body_hash}\n{ts}"
     signature = hmac.new(
         api_secret.strip().encode("utf-8"),
         sign_string.encode("utf-8"),
         hashlib.sha512
     ).hexdigest()
-
     return {
         "KEY": api_key.strip(),
         "Timestamp": ts,
@@ -461,7 +409,6 @@ def get_exchange_pair_rules(symbol):
     sym = symbol.upper().strip()
     pair = f"{sym}_USDT"
     now_ts = time.time()
-
     if pair in pair_rules_cache and (now_ts - pair_rules_cache[pair]["ts"]) < 3600:
         return pair_rules_cache[pair]
 
@@ -473,12 +420,8 @@ def get_exchange_pair_rules(symbol):
         "fee_rate": 0.001,
         "ts": now_ts
     }
-
     try:
-        r = requests.get(
-            f"https://api.gateio.ws/api/v4/spot/currency_pairs/{pair}",
-            timeout=5
-        )
+        r = requests.get(f"https://api.gateio.ws/api/v4/spot/currency_pairs/{pair}", timeout=5)
         if r.status_code == 200:
             data = r.json()
             raw_min_q = float(data.get("min_quote_amount") or 3.0)
@@ -492,15 +435,14 @@ def get_exchange_pair_rules(symbol):
             }
             pair_rules_cache[pair] = rules
             return rules
-    except Exception as e:
-        logger.debug(f"Pair rules lookup fallback for {pair}: {e}")
-
+    except Exception:
+        pass
     pair_rules_cache[pair] = default_rules
     return default_rules
 
 
 # ==============================================================================
-# 5. MULTI-SOURCE REAL-TIME MARKET PRICE & DEX ANTI-RUG SCANNER (CACHE-BUSTED)
+# 5. MULTI-SOURCE REAL-TIME MARKET PRICE & DEX ANTI-RUG SCANNER
 # ==============================================================================
 def fetch_live_market_quote(symbol, contract=""):
     sym = symbol.upper().strip().replace("/USDT", "").replace("_USDT", "")
@@ -508,11 +450,9 @@ def fetch_live_market_quote(symbol, contract=""):
     req_headers = {
         "Accept": "application/json",
         "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "User-Agent": f"VaultSkimEngine/5.7 ({int(now_ts)})"
+        "User-Agent": f"VaultSkimEngine/5.8 ({int(now_ts)})"
     }
 
-    # 1. Primary: Gate.io Spot v4 Ticker (cache-busted)
     try:
         r = requests.get(
             "https://api.gateio.ws/api/v4/spot/tickers",
@@ -529,14 +469,13 @@ def fetch_live_market_quote(symbol, contract=""):
                 bid_p = float(t_obj.get("highest_bid") or last_p)
                 if ask_p > 0 and bid_p > 0 and (last_p < bid_p or last_p > ask_p):
                     last_p = round((ask_p + bid_p) / 2.0, 6)
-                change_24h = float(t_obj.get("change_percentage") or 0.0)
                 vol_24h = float(t_obj.get("quote_volume") or 0.0)
                 if last_p > 0:
                     res = {
                         "price": last_p,
                         "ask": ask_p if ask_p > 0 else last_p,
                         "bid": bid_p if bid_p > 0 else last_p,
-                        "change_24h": change_24h,
+                        "change_24h": float(t_obj.get("change_percentage") or 0.0),
                         "volume_24h": vol_24h,
                         "liquidity_usd": max(vol_24h, 100000.0),
                         "source": "GATE.IO SPOT",
@@ -545,10 +484,9 @@ def fetch_live_market_quote(symbol, contract=""):
                     }
                     price_cache[sym] = res
                     return res
-    except Exception as e:
-        logger.debug(f"Gate.io ticker fetch notice for {sym}: {e}")
+    except Exception:
+        pass
 
-    # 2. Secondary: Binance Spot v3 Book Ticker
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/ticker/bookTicker",
@@ -578,7 +516,6 @@ def fetch_live_market_quote(symbol, contract=""):
     except Exception:
         pass
 
-    # 3. Tertiary: DexScreener Anti-Rug Pool Scanner
     lookup = contract.strip() if contract and len(contract.strip()) > 15 else sym
     try:
         url = (
@@ -590,10 +527,7 @@ def fetch_live_market_quote(symbol, contract=""):
         if r.status_code == 200:
             pairs = r.json().get("pairs") or []
             if pairs:
-                best_pair = max(
-                    pairs,
-                    key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0)
-                )
+                best_pair = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0))
                 p_usd = float(best_pair.get("priceUsd") or 0.0)
                 liq_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0.0)
                 chain_id = (best_pair.get("chainId") or "DEX").upper()
@@ -620,16 +554,14 @@ def fetch_live_market_quote(symbol, contract=""):
 
 
 # ==============================================================================
-# 6. LIVE EXCHANGE WALLET BALANCE & ORDER EXECUTION BRIDGE
+# 6. LIVE EXCHANGE WALLET BALANCE & SHARE-DRIVEN ORDER EXECUTION
 # ==============================================================================
 def fetch_live_exchange_balances():
     with state_lock:
         bridge = dict(STATE.get("exchange_bridge", {}))
-
     exch = (bridge.get("exchange") or "gateio").lower()
     api_key = (bridge.get("api_key") or "").strip()
     api_secret = (bridge.get("api_secret") or "").strip()
-
     if not api_key or not api_secret:
         return None, "Missing Spot API Key or Secret."
 
@@ -639,17 +571,12 @@ def fetch_live_exchange_balances():
         try:
             r = requests.get(f"https://api.gateio.ws{url_path}", headers=headers, timeout=8)
             if r.status_code == 200:
-                accounts = r.json()
                 bal_map = {}
-                for item in accounts:
+                for item in r.json():
                     curr = (item.get("currency") or "").upper()
                     avail = float(item.get("available") or 0.0)
                     locked = float(item.get("locked") or 0.0)
-                    bal_map[curr] = {
-                        "available": avail,
-                        "locked": locked,
-                        "total": avail + locked
-                    }
+                    bal_map[curr] = {"available": avail, "locked": locked, "total": avail + locked}
                 return bal_map, None
             return None, f"Gate.io API ({r.status_code}): {r.text}"
         except Exception as e:
@@ -658,26 +585,20 @@ def fetch_live_exchange_balances():
     elif exch == "binance":
         params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
         signed_q = binance_v3_sign(api_secret, params)
-        headers = {"X-MBX-APIKEY": api_key}
         try:
             r = requests.get(
                 f"https://api.binance.com/api/v3/account?{signed_q}",
-                headers=headers,
+                headers={"X-MBX-APIKEY": api_key},
                 timeout=8
             )
             if r.status_code == 200:
-                balances = r.json().get("balances") or []
                 bal_map = {}
-                for b in balances:
+                for b in r.json().get("balances") or []:
                     curr = (b.get("asset") or "").upper()
                     avail = float(b.get("free") or 0.0)
                     locked = float(b.get("locked") or 0.0)
                     if avail > 0 or locked > 0 or curr == "USDT":
-                        bal_map[curr] = {
-                            "available": avail,
-                            "locked": locked,
-                            "total": avail + locked
-                        }
+                        bal_map[curr] = {"available": avail, "locked": locked, "total": avail + locked}
                 return bal_map, None
             return None, f"Binance API ({r.status_code}): {r.text}"
         except Exception as e:
@@ -686,15 +607,15 @@ def fetch_live_exchange_balances():
     return None, f"Unsupported exchange: {exch}"
 
 
-def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None):
+def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None, target_share_amount=None):
     """
     Executes a real live Spot order on Gate.io v4:
-    - Enforces Gate.io's $3.15 minimum notional on both BUY and SELL.
-    - Returns exact `_filled_shares` and `_filled_usdt` from Gate.io's fill response.
+    - When `target_share_amount` is passed on a BUY (Stage 2 Re-Buy), it buys the EXACT
+      share count needed (dividing by 0.9988 and rounding UP with ROUND_UP so Gate.io's
+      0.1% spot fee never shaves your share count below your Protected Share Baseline!).
     """
     with state_lock:
         bridge = dict(STATE.get("exchange_bridge", {}))
-
     exch = (bridge.get("exchange") or "gateio").lower()
     api_key = (bridge.get("api_key") or "").strip()
     api_secret = (bridge.get("api_secret") or "").strip()
@@ -723,41 +644,46 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
     side_lower = side.lower()
 
     if side_lower == "buy":
-        requested_usd = min(float(usd_amount or 10.0), max_cap)
-        if requested_usd < min_order_usd:
-            if usdt_avail >= (min_order_usd * 1.02):
-                requested_usd = min_order_usd * 1.02
-            else:
-                msg = (
-                    f"Gate.io requires at least $3.10 USDT per buy order "
-                    f"(Your available Spot USDT is ${usdt_avail:.2f})."
-                )
-                add_log(f"⚠️ LIVE BUY PAUSED ({sym}): {msg}")
-                return False, msg, None
-
-        if usdt_avail < requested_usd:
-            if usdt_avail >= 3.08:
-                requested_usd = usdt_avail * 0.992
-            else:
-                msg = f"Insufficient USDT (${usdt_avail:.2f} available; Gate.io minimum order is $3.10 USDT)"
-                add_log(f"⚠️ LIVE BUY SKIPPED ({sym}): {msg}")
-                return False, msg, None
-
-        exec_price = quote["ask"] * 1.0035
+        exec_price = quote["ask"] * 1.0030
         price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
         exec_price_float = float(price_str)
 
-        raw_shares = (requested_usd * 0.994) / exec_price_float
-        amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
-        amount_float = float(amount_str)
+        if target_share_amount is not None and float(target_share_amount) > 0:
+            # SHARE-COUNT DRIVEN RE-BUY: Pre-pay Gate.io 0.1% token fee and ROUND_UP
+            gross_shares_needed = float(target_share_amount) / 0.9988
+            amount_str = quantize_value(gross_shares_needed, rules["amount_precision"], ROUND_UP)
+            amount_float = float(amount_str)
+            est_cost_usd = amount_float * exec_price_float
 
-        if (amount_float * exec_price_float) < 3.04 and usdt_avail >= 3.25:
-            step = 10 ** (-int(rules["amount_precision"]))
-            amount_str = quantize_value(raw_shares + step, rules["amount_precision"], ROUND_DOWN)
+            # Clamp only if estimated limit cost exceeds total available USDT in wallet
+            if est_cost_usd > (usdt_avail * 0.998):
+                max_affordable_sh = (usdt_avail * 0.996) / exec_price_float
+                amount_str = quantize_value(max_affordable_sh, rules["amount_precision"], ROUND_DOWN)
+                amount_float = float(amount_str)
+        else:
+            requested_usd = min(float(usd_amount or 10.0), max_cap)
+            if requested_usd < min_order_usd:
+                if usdt_avail >= (min_order_usd * 1.02):
+                    requested_usd = min_order_usd * 1.02
+                else:
+                    msg = f"Gate.io requires at least $3.15 USDT per buy order (Available: ${usdt_avail:.2f})."
+                    add_log(f"⚠️ LIVE BUY PAUSED ({sym}): {msg}")
+                    return False, msg, None
+
+            if usdt_avail < requested_usd:
+                if usdt_avail >= 3.08:
+                    requested_usd = usdt_avail * 0.995
+                else:
+                    msg = f"Insufficient USDT (${usdt_avail:.2f} available; min is $3.10 USDT)"
+                    add_log(f"⚠️ LIVE BUY SKIPPED ({sym}): {msg}")
+                    return False, msg, None
+
+            raw_shares = (requested_usd * 0.996) / exec_price_float
+            amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_UP)
             amount_float = float(amount_str)
 
         if amount_float <= 0 or (amount_float * exec_price_float) < 3.00:
-            msg = f"Order value (${amount_float * exec_price_float:.2f}) is below Gate.io minimum ($3.00 USDT)."
+            msg = f"Buy order (${amount_float * exec_price_float:.2f}) below Gate.io $3.00 minimum."
             add_log(f"⚠️ LIVE BUY REJECTED ({sym}): {msg}")
             return False, msg, None
 
@@ -778,7 +704,7 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
             if (coin_avail * exec_price_float) >= min_order_usd:
                 raw_shares = min(coin_avail * 0.9998, (min_order_usd * 1.05) / exec_price_float)
             else:
-                return False, f"Bag (${coin_avail * exec_price_float:.2f}) is under Gate.io $3.00 minimum.", None
+                return False, f"Bag (${coin_avail * exec_price_float:.2f}) under Gate.io $3.00 minimum.", None
 
         amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_DOWN)
         amount_float = float(amount_str)
@@ -801,12 +727,7 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
         headers = gateio_v4_sign(api_key, api_secret, "POST", url_path, "", body_str)
 
         try:
-            r = requests.post(
-                f"https://api.gateio.ws{url_path}",
-                headers=headers,
-                data=body_str,
-                timeout=8
-            )
+            r = requests.post(f"https://api.gateio.ws{url_path}", headers=headers, data=body_str, timeout=8)
             if r.status_code in (200, 201):
                 resp_data = r.json()
                 left_amt = float(resp_data.get("left") or 0.0)
@@ -817,12 +738,7 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
                     order_payload["time_in_force"] = "gtc"
                     body_str = json.dumps(order_payload)
                     headers = gateio_v4_sign(api_key, api_secret, "POST", url_path, "", body_str)
-                    r_gtc = requests.post(
-                        f"https://api.gateio.ws{url_path}",
-                        headers=headers,
-                        data=body_str,
-                        timeout=8
-                    )
+                    r_gtc = requests.post(f"https://api.gateio.ws{url_path}", headers=headers, data=body_str, timeout=8)
                     if r_gtc.status_code in (200, 201):
                         resp_data = r_gtc.json()
                         time.sleep(1.0)
@@ -899,8 +815,7 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
                 with state_lock:
                     card["shares"] = real_shares if real_shares > 0 else total_real_shares
                 sync_notes.append(
-                    f"{sym}: Escrow Re-Buy Active (${escrow_reserved:.2f} USDT reserved for "
-                    f"{float(card.get('escrow_sold_shares') or 0):.5f} {sym})"
+                    f"{sym}: Escrow Re-Buy Active (${escrow_reserved:.2f} USDT reserved)"
                 )
                 continue
 
@@ -914,8 +829,6 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
                         card["protected_shares"] = card["shares"]
 
                     card["anchor_usd"] = round(card["shares"] * price, 2)
-                    # Fix stuck $202 entry price: if entry_price is > 1.5% away from current live price
-                    # and no escrow is open, align entry_price to current live market regime!
                     old_entry = float(card.get("entry_price") or 0.0)
                     if was_waiting or old_entry <= 0 or abs(old_entry - price) / price > 0.015:
                         card["entry_price"] = price
@@ -924,7 +837,6 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
                     if card.get("status") == "WAITING_LIVE_BUY":
                         card["status"] = "HOLDING_ANCHOR"
                 sync_notes.append(f"{sym}: {total_real_shares:.6f} sh (${bag_usd:.2f}) Active")
-
             else:
                 with state_lock:
                     card["shares"] = 0.0
@@ -936,7 +848,6 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
 
                 now_ts = time.time()
                 last_attempt = order_cooldowns.get(sym, 0)
-
                 if (
                     auto_buy_waiting
                     and live_armed
@@ -946,18 +857,14 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
                 ):
                     order_cooldowns[sym] = now_ts
                     buy_usd = min(anchor_usd, usdt_avail * 0.985)
-                    add_log(
-                        f"🚀 AUTO-DEPLOYING LIVE ANCHOR ({sym}): "
-                        f"Buying ${buy_usd:.2f} of {sym}/USDT on Gate.io Spot..."
-                    )
+                    add_log(f"🚀 AUTO-DEPLOYING LIVE ANCHOR ({sym}): Buying ${buy_usd:.2f} on Gate.io...")
                     ok, msg, _ = execute_live_exchange_order(sym, "buy", usd_amount=buy_usd)
                     if ok:
                         time.sleep(1.1)
                         updated_bals, _ = fetch_live_exchange_balances()
                         if updated_bals:
-                            balances = updated_bals
-                            usdt_avail = balances.get("USDT", {}).get("available", usdt_avail)
-                            new_sh = balances.get(sym, {}).get("available", 0.0)
+                            usdt_avail = updated_bals.get("USDT", {}).get("available", usdt_avail)
+                            new_sh = updated_bals.get(sym, {}).get("available", 0.0)
                             with state_lock:
                                 STATE["exchange_bridge"]["available_usdt"] = round(usdt_avail, 4)
                                 if new_sh > 0:
@@ -970,14 +877,8 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
                                     card["status"] = "HOLDING_ANCHOR"
                             if new_sh > 0:
                                 sync_notes.append(f"{sym}: Bought {new_sh:.5f} sh @ ${price:.4f}")
-                                dispatch_phone_alert(
-                                    f"VaultSkim Live Buy: {sym}",
-                                    f"Bought {new_sh:.5f} {sym} @ ${price:.4f} on Gate.io!",
-                                    category="buy"
-                                )
                                 continue
-
-                sync_notes.append(f"{sym}: 0.0000 sh on Gate.io -> Ready for Live Buy")
+                sync_notes.append(f"{sym}: 0.0000 sh -> Ready for Live Buy")
 
     if verbose:
         summary_str = " | ".join(sync_notes) if sync_notes else "All cards aligned"
@@ -987,22 +888,9 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
 
 
 # ==============================================================================
-# 7. REAL GATE.IO 2-STAGE WAVE-COMPOUNDER & USDT PROFIT SKIMMING ENGINE
+# 7. SMART DYNAMIC RE-BUY & SHARE-DRIVEN WAVE SKIMMING ENGINE
 # ==============================================================================
 def evaluate_coin_tick(sym):
-    """
-    Runs every 2.5 seconds per coin:
-    - ZERO "AIR SKIMMING": Never logs fake profit without a real Gate.io trade!
-    - STAGE 1 (BOUNCE HARVEST): When price bounces >= +0.65% above `sliding_low`
-      (or trails -0.15% after arming Ratchet Shield at +0.50%), executes a REAL
-      Gate.io SELL order on a working wave tranche (~22% of QNT or >= $3.40 on LTC).
-      The real USDT received is locked in `escrow_usdt_reserved`.
-    - STAGE 2 (PULLBACK SHARE-GROWTH RE-BUY + USDT SKIM): When price pulls back
-      -0.42% below `escrow_sell_price` (or if runaway protection triggers), executes
-      a REAL Gate.io BUY order that buys back 100% of `escrow_sold_shares` PLUS extra
-      Bonus Shares, while leaving the remaining real USDT profit unspent inside your
-      Gate.io Spot USDT wallet!
-    """
     with state_lock:
         card = STATE["coins"].get(sym)
         if not card:
@@ -1032,23 +920,35 @@ def evaluate_coin_tick(sym):
         escrow_reserved = float(card.get("escrow_usdt_reserved") or 0.0)
 
         # ----------------------------------------------------------------------
-        # STAGE 2: ESCROW_HOLDING -> RESTORE SHARES + GROW BONUS SHARES + KEEP USDT
+        # STAGE 2: SMART DYNAMIC RE-BUY WINDOW (NEVER HANGS WAITING ALL DAY!)
         # ----------------------------------------------------------------------
         if status == "ESCROW_HOLDING" and escrow_reserved > 0:
             sell_px = float(card.get("escrow_sell_price") or price)
-            target_rebuy_px = float(card.get("escrow_rebuy_target_price") or (sell_px * 0.9958))
+            target_rebuy_px = float(card.get("escrow_rebuy_target_price") or (sell_px * 0.9972))
+            post_low = float(card.get("escrow_post_sell_low") or price)
+            if price < post_low or post_low <= 0:
+                post_low = price
+                card["escrow_post_sell_low"] = price
+
+            elapsed_sec = time.time() - float(card.get("escrow_started_ts") or (time.time() - 180.0))
             pullback_pct = ((sell_px - price) / sell_px) * 100.0 if sell_px > 0 else 0.0
             card["gain_from_low_pct"] = round(-pullback_pct, 3)
 
-            if not is_frozen and price <= target_rebuy_px:
+            # Trigger A: Standard -0.28% pullback hit (price <= target_rebuy_px)
+            hit_standard_dip = price <= target_rebuy_px
+            # Trigger B: Dipped >= -0.18% below sell_px and started bouncing back up +0.08%
+            hit_bounce_off_dip = (pullback_pct >= 0.16) and (price >= post_low * 1.0007)
+            # Trigger C: Hanging for >= 150s (2.5 mins) and price is below sell_px * 0.9988
+            hit_time_stepup = (elapsed_sec >= 150.0) and (price <= sell_px * 0.9988)
+            # Trigger D: Runaway upward move (+0.22% above sell_px after 90s) -> restore shares so we don't get left behind!
+            hit_upward_rescue = (elapsed_sec >= 90.0) and (price >= sell_px * 1.0022)
+
+            if not is_frozen and (hit_standard_dip or hit_bounce_off_dip or hit_time_stepup or hit_upward_rescue):
                 now_ts = time.time()
                 if not is_live or (now_ts - order_cooldowns.get(sym, 0)) > 10:
                     execute_stage2_escrow_rebuy_and_skim(sym, price)
             return
 
-        # ----------------------------------------------------------------------
-        # INITIAL BUY CHECK (WAITING_LIVE_BUY)
-        # ----------------------------------------------------------------------
         if shares <= 0.000001:
             card["entry_price"] = price
             card["sliding_low"] = price
@@ -1082,7 +982,6 @@ def evaluate_coin_tick(sym):
         if float(card.get("escrow_usdt_reserved") or 0.0) <= 0:
             card["anchor_usd"] = round(shares * price, 2)
 
-        # Layer 1: Sliding Floor Update on dips (Zero shares sold on a dip!)
         if sliding_low <= 0 or price < sliding_low:
             old_low = sliding_low
             sliding_low = price
@@ -1091,13 +990,12 @@ def evaluate_coin_tick(sym):
             if old_low > 0 and ((old_low - price) / old_low) >= 0.004:
                 add_log(
                     f"📉 SLIDING FLOOR UPDATED {sym} @ ${price:.4f}: "
-                    f"100% of {shares:.6f} {sym} shares held — waiting for +0.65% bounce to harvest!"
+                    f"100% of {shares:.6f} {sym} shares held — waiting for +0.62% bounce!"
                 )
 
         gain_pct = ((price - sliding_low) / sliding_low) * 100.0 if sliding_low > 0 else 0.0
         card["gain_from_low_pct"] = round(gain_pct, 3)
 
-        # Arm Zero-Loss Ratchet Shield at +0.35% bounce from sliding low
         if gain_pct >= 0.35 and not card.get("ratchet_armed"):
             card["ratchet_armed"] = True
             card["highest_price"] = price
@@ -1105,8 +1003,7 @@ def evaluate_coin_tick(sym):
             card["zero_loss_stop"] = stop_floor
             card["status"] = "RATCHET_ARMED"
             add_log(
-                f"🛡️ ZERO-LOSS SHIELD ARMED {sym} @ ${price:.4f} (+{gain_pct:.2f}% from low): "
-                f"Preparing real Gate.io Wave Harvest at +0.65%!"
+                f"🛡️ ZERO-LOSS SHIELD ARMED {sym} @ ${price:.4f} (+{gain_pct:.2f}% from low)"
             )
 
         if card.get("ratchet_armed"):
@@ -1117,13 +1014,10 @@ def evaluate_coin_tick(sym):
                     card["zero_loss_stop"] = trail_stop
 
         highest_p = float(card.get("highest_price") or price)
-
-        # Trigger 1: Clean +0.65% bounce from sliding_low
-        target_hit = gain_pct >= 0.65
-        # Trigger 2: Ratchet Trailing Stop after reaching >= +0.52% bounce
+        target_hit = gain_pct >= 0.62
         trailing_stop_hit = (
             card.get("ratchet_armed")
-            and gain_pct >= 0.52
+            and gain_pct >= 0.50
             and highest_p > 0
             and price <= (highest_p * 0.9985)
         )
@@ -1136,30 +1030,17 @@ def evaluate_coin_tick(sym):
 
 
 def execute_paper_simulator_skim(sym, price, gain_pct):
-    """
-    Paper Simulator Skim (ONLY runs on cards explicitly set to PAPER mode):
-    Grows paper shares slightly and logs paper profit. Never runs on LIVE Gate.io cards!
-    """
     with state_lock:
         card = STATE["coins"].get(sym)
         if not card or card.get("live_enabled"):
             return
         shares = float(card.get("shares") or 0.0)
         low_px = float(card.get("sliding_low") or price)
-        strategy = card.get("strategy") or "50/50 Hybrid Moonbag"
-
         skim_usd = max(0.05, round(shares * (price - low_px), 4))
-        if "100% Share" in strategy:
-            vault_cut = 0.0
-            topup_cut = skim_usd
-        elif "100% Pure Cash" in strategy:
-            vault_cut = skim_usd
-            topup_cut = 0.0
-        else:
-            vault_cut = round(skim_usd * 0.50, 4)
-            topup_cut = round(skim_usd * 0.50, 4)
-
+        vault_cut = round(skim_usd * 0.50, 4)
+        topup_cut = round(skim_usd * 0.50, 4)
         bonus_sh = (topup_cut / price) if price > 0 else 0.0
+
         card["shares"] = round(shares + bonus_sh, 6)
         card["protected_shares"] = card["shares"]
         card["bonus_shares_added"] = round(float(card.get("bonus_shares_added") or 0.0) + bonus_sh, 6)
@@ -1195,15 +1076,7 @@ def execute_paper_simulator_skim(sym, price, gain_pct):
     save_persistent_state()
 
 
-def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.65):
-    """
-    STAGE 1 OF REAL GATE.IO USDT & SHARE-GROWTH ENGINE:
-    Sells a 22% working wave tranche on Gate.io (e.g. ~$40 on QNT, or ~$3.60 on LTC)
-    when the coin bounces +0.65% off its sliding low.
-    - The real USDT proceeds land immediately in your Gate.io Spot USDT wallet.
-    - They are locked in `escrow_usdt_reserved` to buy back MORE shares than sold
-      as soon as the price pulls back -0.42%!
-    """
+def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.62):
     with state_lock:
         card = STATE["coins"].get(sym)
         if not card:
@@ -1222,7 +1095,6 @@ def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.65):
     if bag_usd < GATEIO_MIN_ORDER_USD:
         return
 
-    # Working Tranche: 22% of bag on large coins (e.g. ~$41 on $185 QNT) or min $3.50 on small coins (LTC)
     desired_tranche_usd = max(bag_usd * 0.22, 3.50)
     if (bag_usd - desired_tranche_usd) < 3.15:
         shares_to_harvest = shares
@@ -1235,13 +1107,12 @@ def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.65):
         return
 
     sold_sh = float(resp_data.get("_filled_shares") or shares_to_harvest)
-    # Account for Gate.io 0.1% spot fee on the sell leg
     net_usdt_proceeds = float(resp_data.get("_filled_usdt") or (sold_sh * price)) * 0.999
     time.sleep(0.9)
     bals, _ = fetch_live_exchange_balances()
 
-    # Target a -0.42% pullback so after 0.1% sell fee + 0.1% buy fee, there is guaranteed net positive spread
-    rebuy_target_px = round(price * 0.9958, 8)
+    # Set a tighter -0.28% initial target (plus Dynamic Step-Up if price hangs!)
+    rebuy_target_px = round(price * 0.9972, 8)
     with state_lock:
         if bals:
             STATE["exchange_bridge"]["available_usdt"] = round(bals.get("USDT", {}).get("available", 0.0), 4)
@@ -1253,31 +1124,27 @@ def execute_stage1_harvest_to_escrow(sym, price, gain_pct=0.65):
         card["escrow_sold_shares"] = round(sold_sh, 6)
         card["escrow_sell_price"] = price
         card["escrow_rebuy_target_price"] = rebuy_target_px
+        card["escrow_post_sell_low"] = price
+        card["escrow_started_ts"] = time.time()
         card["status"] = "ESCROW_HOLDING"
         card["ratchet_armed"] = False
 
     add_log(
         f"🔒 STAGE 1 REAL GATE.IO HARVEST ({sym}) @ ${price:.4f} (+{gain_pct:.2f}%): "
-        f"Sold {sold_sh:.6f} {sym} -> Received ${net_usdt_proceeds:.2f} real USDT into Gate.io Spot! "
-        f"Waiting for pullback @ <= ${rebuy_target_px:.4f} to buy back MORE {sym} shares + keep USDT profit!"
-    )
-    dispatch_phone_alert(
-        f"Stage 1 Gate.io Harvest ({sym})",
-        f"Sold {sold_sh:.6f} {sym} @ ${price:.4f} for ${net_usdt_proceeds:.2f} USDT.\nRe-buy target: ${rebuy_target_px:.4f}",
-        category="skim"
+        f"Sold {sold_sh:.6f} {sym} -> Received ${net_usdt_proceeds:.2f} USDT! "
+        f"Dynamic Re-Buy Target <= ${rebuy_target_px:.4f} (or auto-stepup after 2.5m)"
     )
     save_persistent_state(sync_db=True)
 
 
 def execute_stage2_escrow_rebuy_and_skim(sym, current_price, force_manual=False):
     """
-    STAGE 2 OF REAL GATE.IO USDT & SHARE-GROWTH ENGINE:
-    1. Calculates exact cost to restore 100% of `escrow_sold_shares` at `current_price`.
-    2. Splits the real USDT surplus (`escrow_usdt - cost_to_restore`):
-       - 50% is ADDED to the Gate.io BUY order so you receive `escrow_sold_shares + bonus_shares`
-         (your real share count on Gate.io grows bit by bit!).
-       - 50% is KEPT UNSPENT in your Gate.io Spot USDT wallet (so your Gate.io Spot USDT
-         balance visibly grows with real withdrawable USDT profit!).
+    STAGE 2 SHARE-DRIVEN RE-BUY & BALANCED SHARE GROWTH:
+    1. Calculates the exact shares needed (`deficit_to_protected`) to restore your wallet
+       all the way back to `protected_shares` (e.g. 0.949628 QNT) so previous rounding
+       shaves are 100% healed!
+    2. Splits any remaining USDT spread 65% to Pure USDT Profit and 35% to extra Bonus
+       Shares so your share count slowly grows on every wave while banking real USDT!
     """
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -1285,66 +1152,71 @@ def execute_stage2_escrow_rebuy_and_skim(sym, current_price, force_manual=False)
             return
         escrow_usdt = float(card.get("escrow_usdt_reserved") or 0.0)
         sold_sh = float(card.get("escrow_sold_shares") or 0.0)
-        sell_px = float(card.get("escrow_sell_price") or current_price)
+        current_sh = float(card.get("shares") or 0.0)
+        protected_sh = float(card.get("protected_shares") or (current_sh + sold_sh))
         strategy = card.get("strategy") or "50/50 Hybrid Moonbag"
         is_live = bool(card.get("live_enabled")) and bool(STATE["exchange_bridge"].get("live_armed"))
 
     if escrow_usdt <= 0 or sold_sh <= 0 or current_price <= 0:
         return
 
-    # Cost to buy back the exact `sold_sh` at `current_price` (including 0.12% fee cushion)
-    cost_to_restore_exact_shares = (sold_sh * current_price) * 1.0012
-    raw_usdt_surplus = max(0.0, escrow_usdt - cost_to_restore_exact_shares)
+    # Ensure we buy back AT LEAST enough shares to restore `protected_shares` (0.949628 QNT)!
+    needed_for_baseline = max(sold_sh, protected_sh - current_sh)
+    cost_for_baseline = (needed_for_baseline / 0.9988) * current_price
+    raw_surplus_usd = max(0.0, escrow_usdt - cost_for_baseline)
 
-    if "100% Share" in strategy or raw_usdt_surplus <= 0.005:
-        # Spend 100% of Escrow USDT to maximize bonus shares
-        usdt_to_spend_on_shares = escrow_usdt
-        pure_usdt_profit = 0.0
-        compounded_topup_usd = raw_usdt_surplus
+    if "100% Share" in strategy:
+        bonus_usd_to_spend = raw_surplus_usd
     elif "100% Pure Cash" in strategy:
-        # Spend just enough to restore exact `sold_sh` + tiny buffer, keep 100% of surplus in Gate.io USDT!
-        usdt_to_spend_on_shares = min(escrow_usdt, max(GATEIO_MIN_ORDER_USD, cost_to_restore_exact_shares * 1.0005))
-        pure_usdt_profit = max(0.0, escrow_usdt - usdt_to_spend_on_shares)
-        compounded_topup_usd = 0.0
+        bonus_usd_to_spend = 0.0
     else:
-        # 50/50 Hybrid Moonbag: 50% buys extra bonus shares, 50% stays in Gate.io Spot USDT!
-        compounded_topup_usd = raw_usdt_surplus * 0.50
-        usdt_to_spend_on_shares = min(
-            escrow_usdt,
-            max(GATEIO_MIN_ORDER_USD, cost_to_restore_exact_shares + compounded_topup_usd)
-        )
-        pure_usdt_profit = max(0.0, escrow_usdt - usdt_to_spend_on_shares)
+        # Balanced Growth: 35% of surplus buys extra bonus shares, 65% stays in Spot USDT!
+        bonus_usd_to_spend = raw_surplus_usd * 0.35
+
+    extra_bonus_sh = (bonus_usd_to_spend / current_price) if current_price > 0 else 0.0
+    # Add at least +0.000100 bonus shares whenever raw_surplus_usd > $0.05 so shares steadily tick up!
+    if raw_surplus_usd >= 0.05 and extra_bonus_sh < 0.0001:
+        extra_bonus_sh = 0.0001
+
+    target_net_shares_to_buy = needed_for_baseline + extra_bonus_sh
 
     now_ts = time.time()
     order_cooldowns[sym] = now_ts
 
     if is_live:
-        ok, msg, resp_data = execute_live_exchange_order(sym, "buy", usd_amount=usdt_to_spend_on_shares)
+        ok, msg, resp_data = execute_live_exchange_order(
+            sym,
+            "buy",
+            target_share_amount=target_net_shares_to_buy
+        )
         if not ok:
             return
-        rebought_sh = float((resp_data or {}).get("_filled_shares") or (usdt_to_spend_on_shares / current_price))
-        actual_spent_usdt = float((resp_data or {}).get("_filled_usdt") or usdt_to_spend_on_shares)
+        rebought_sh = float((resp_data or {}).get("_filled_shares") or target_net_shares_to_buy)
+        actual_spent_usdt = float((resp_data or {}).get("_filled_usdt") or (rebought_sh * current_price))
         pure_usdt_profit = max(0.0, round(escrow_usdt - actual_spent_usdt, 4))
         time.sleep(1.0)
         bals, _ = fetch_live_exchange_balances()
         with state_lock:
             if bals:
                 STATE["exchange_bridge"]["available_usdt"] = round(bals.get("USDT", {}).get("available", 0.0), 4)
-                card["shares"] = bals.get(sym, {}).get("available", float(card.get("shares") or 0.0) + rebought_sh)
+                card["shares"] = bals.get(sym, {}).get("available", current_sh + rebought_sh)
             else:
-                card["shares"] = float(card.get("shares") or 0.0) + rebought_sh
+                card["shares"] = current_sh + rebought_sh
     else:
-        rebought_sh = (usdt_to_spend_on_shares / current_price) * 0.999
+        rebought_sh = target_net_shares_to_buy
+        pure_usdt_profit = max(0.0, round(raw_surplus_usd - bonus_usd_to_spend, 4))
         with state_lock:
-            card["shares"] = float(card.get("shares") or 0.0) + rebought_sh
-
-    bonus_sh = max(0.0, rebought_sh - sold_sh)
-    bonus_sh_usd_val = round(bonus_sh * current_price, 4)
-    total_real_skim = round(pure_usdt_profit + bonus_sh_usd_val, 4)
-    ts_now = now_hms()
+            card["shares"] = current_sh + rebought_sh
 
     with state_lock:
-        card["protected_shares"] = max(float(card.get("protected_shares") or 0.0), float(card["shares"]))
+        new_total_shares = float(card["shares"])
+        net_share_gain_vs_baseline = max(0.0, new_total_shares - protected_sh)
+        bonus_sh = max(net_share_gain_vs_baseline, max(0.0, rebought_sh - sold_sh))
+        bonus_sh_usd_val = round(bonus_sh * current_price, 4)
+        total_real_skim = round(pure_usdt_profit + bonus_sh_usd_val, 4)
+        ts_now = now_hms()
+
+        card["protected_shares"] = max(protected_sh, new_total_shares)
         card["bonus_shares_added"] = round(float(card.get("bonus_shares_added") or 0.0) + bonus_sh, 6)
         card["escrow_usdt_reserved"] = 0.0
         card["escrow_sold_shares"] = 0.0
@@ -1355,7 +1227,7 @@ def execute_stage2_escrow_rebuy_and_skim(sym, current_price, force_manual=False)
         card["vaulted_usd"] = round(float(card.get("vaulted_usd") or 0.0) + pure_usdt_profit, 4)
         card["skim_count"] = int(card.get("skim_count", 0)) + 1
 
-        card["anchor_usd"] = round(float(card["shares"]) * current_price, 2)
+        card["anchor_usd"] = round(new_total_shares * current_price, 2)
         card["entry_price"] = current_price
         card["sliding_low"] = current_price
         card["highest_price"] = current_price
@@ -1381,33 +1253,33 @@ def execute_stage2_escrow_rebuy_and_skim(sym, current_price, force_manual=False)
             "id": str(uuid.uuid4())[:8],
             "symbol": sym,
             "mode": "LIVE" if is_live else "PAPER",
-            "stage": f"Real Wave Skim (+{bonus_sh:.5f} {sym})",
+            "stage": f"Share-Driven Re-Buy (+{bonus_sh:.5f} {sym})",
             "price": f"{current_price:.4f}",
             "time": ts_now,
             "profit": total_real_skim,
             "vault_cut": pure_usdt_profit,
             "topup_cut": bonus_sh_usd_val,
-            "shares": f"{card['shares']:.6f}"
+            "shares": f"{new_total_shares:.6f}"
         })
         if len(STATE["skim_ledger"]) > 60:
             STATE["skim_ledger"] = STATE["skim_ledger"][:60]
 
     add_log(
-        f"💰 [LIVE GATE.IO SKIM COMPLETED] ({sym}) @ ${current_price:.4f}: "
-        f"Re-bought {rebought_sh:.6f} {sym} (+{bonus_sh:.6f} Bonus {sym} added to wallet!) • "
-        f"Left +${pure_usdt_profit:.4f} Pure USDT Cash in your Gate.io Spot USDT balance!"
+        f"💰 [SHARE-DRIVEN RE-BUY COMPLETED] ({sym}) @ ${current_price:.4f}: "
+        f"Restored & grew shares to {new_total_shares:.6f} {sym} (+{bonus_sh:.6f} bonus) • "
+        f"Net USDT Profit kept in Gate.io: +${pure_usdt_profit:.4f}!"
     )
     dispatch_phone_alert(
-        f"Real Gate.io Skim Completed ({sym})",
-        f"Added +{bonus_sh:.6f} Bonus {sym} (Total: {card['shares']:.6f} {sym})\n"
-        f"Real USDT Profit Added to Gate.io Wallet: +${pure_usdt_profit:.4f}",
+        f"Share-Driven Skim Completed ({sym})",
+        f"Shares Now: {new_total_shares:.6f} {sym} (+{bonus_sh:.6f} bonus)\n"
+        f"USDT Profit Kept: +${pure_usdt_profit:.4f}",
         category="skim"
     )
     save_persistent_state(sync_db=True)
 
 
 # ==============================================================================
-# 8. SELF-HEALING WORKER ENGINE (SURVIVES GUNICORN FORKS & RENDER RELOADS)
+# 8. SELF-HEALING WORKER ENGINE
 # ==============================================================================
 def run_single_engine_cycle():
     global _last_engine_tick_ts, _last_wallet_sync_ts
@@ -1460,7 +1332,6 @@ def ensure_worker_threads_running():
         _engine_thread.start()
         _keepalive_thread = threading.Thread(target=keep_alive_self_ping_loop, daemon=True)
         _keepalive_thread.start()
-        logger.info(f"Started live market ticker thread in worker PID {curr_pid}.")
 
     if (time.time() - _last_engine_tick_ts) >= 2.4:
         threading.Thread(target=run_single_engine_cycle, daemon=True).start()
@@ -1473,8 +1344,8 @@ def before_any_request():
 # ==============================================================================
 # END OF PART 1 OF 2 — PASTE PART 2 DIRECTLY BELOW THIS LINE
 # ==============================================================================# ==============================================================================
-# VAULTSKIM COMMAND CENTER — v5.7 REAL GATE.IO WAVE-COMPOUNDER & USDT SKIMMER
-# PART 2 OF 2: FLASK API ROUTES, LIVE ANCHOR BUY & FULL COMMAND CENTER UI
+# VAULTSKIM COMMAND CENTER — v5.8 SHARE-DRIVEN RE-BUY & DYNAMIC ESCROW ENGINE
+# PART 2 OF 2: FLASK API ROUTES, 1-TAP ESCROW UNLOCK & FULL COMMAND CENTER UI
 # ==============================================================================
 @app.route("/ping")
 @app.route("/health")
@@ -1493,7 +1364,7 @@ def route_heartbeat():
     return jsonify({
         "ok": True,
         "status": "ALIVE",
-        "version": "v5.7 - Real Gate.io Wave-Compounder",
+        "version": "v5.8 - Share-Driven Dynamic Wave",
         "live_bridge_armed": armed,
         "active_coins": count,
         "last_price_tick_utc": last_tick,
@@ -1517,7 +1388,7 @@ def route_manifest():
     manifest = {
         "name": "VaultSkim Command Center",
         "short_name": "VaultSkim",
-        "description": "Real Gate.io Wave-Compounder & USDT Profit Skimmer",
+        "description": "Share-Driven Dynamic Wave-Compounder & USDT Profit Skimmer",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#050914",
@@ -1583,7 +1454,7 @@ def route_api_state():
         harvest_esc = sum(float(c.get("escrow_usdt_reserved") or 0.0) for c in STATE.get("coins", {}).values())
 
         payload = {
-            "version": STATE.get("version", "v5.7 - Real Gate.io Wave-Compounder"),
+            "version": STATE.get("version", "v5.8 - Share-Driven Dynamic Wave"),
             "vault_cash": vc,
             "added_to_anchors": aa,
             "total_escrow_reserved": round(harvest_esc, 4),
@@ -1707,6 +1578,8 @@ def route_coin_launch():
             "escrow_sold_shares": 0.0,
             "escrow_sell_price": 0.0,
             "escrow_rebuy_target_price": 0.0,
+            "escrow_post_sell_low": price,
+            "escrow_started_ts": time.time(),
             "bonus_shares_added": 0.0,
             "share_topup_usd": 0.0,
             "vaulted_usd": 0.0,
@@ -1774,6 +1647,29 @@ def route_coin_cycle_strategy():
     return jsonify({"ok": True, "strategy": card["strategy"]})
 
 
+@app.route("/api/coin/force_rebuy", methods=["POST"])
+def route_coin_force_rebuy():
+    """
+    1-Tap Instant Escrow Re-Buy & Share Restore:
+    Immediately executes Stage 2 using the active Escrow USDT so the user never
+    has to wait if a coin is hovering near the target price!
+    """
+    data = request.json or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    with state_lock:
+        card = STATE["coins"].get(sym)
+        if not card:
+            return jsonify({"ok": False, "error": "Coin not found."}), 404
+        px = float(card.get("current_price") or 0.0)
+        esc = float(card.get("escrow_usdt_reserved") or 0.0)
+    if esc <= 0 or px <= 0:
+        return jsonify({"ok": False, "error": f"No active Escrow waiting on {sym}."}), 400
+
+    order_cooldowns[sym] = 0
+    execute_stage2_escrow_rebuy_and_skim(sym, px, force_manual=True)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/coin/force_buy", methods=["POST"])
 def route_coin_force_buy():
     """
@@ -1823,13 +1719,6 @@ def route_coin_force_buy():
 
 @app.route("/api/coin/edit_anchor", methods=["POST"])
 def route_coin_edit_anchor():
-    """
-    Compares `new_anchor` against your ACTUAL current token value (`shares * current_price`).
-    - If `new_anchor > current_token_value`: Immediately fires a live Gate.io BUY order for
-      the difference (`delta_usd = new_anchor - current_token_value`), automatically bumping
-      to Gate.io's $3.15 minimum if funded.
-    - If the Gate.io BUY fails, it never sets a fake anchor label.
-    """
     data = request.json or {}
     sym = (data.get("symbol") or "").upper().strip()
     try:
@@ -1963,7 +1852,7 @@ def route_alerts_save():
 
     if data.get("send_test"):
         dispatch_phone_alert(
-            "VaultSkim v5.7 Alert Connected",
+            "VaultSkim v5.8 Alert Connected",
             "Your phone push notification bridge is active and verified!",
             category="skim"
         )
@@ -2009,10 +1898,6 @@ def route_control_freeze():
 
 @app.route("/api/control/reset", methods=["POST"])
 def route_control_reset():
-    """
-    Resets profit counters to $0.0000, aligns all Anchors & Sliding Lows to the
-    exact live market price right now, and locks your current shares as the Protected Floor.
-    """
     with state_lock:
         STATE["vault_cash"] = 0.0
         STATE["added_to_anchors"] = 0.0
@@ -2038,12 +1923,12 @@ def route_control_reset():
             px = float(c.get("current_price") or 0.0)
             if sh > 0 and px > 0:
                 c["anchor_usd"] = round(sh * px, 2)
-                c["protected_shares"] = sh
+                c["protected_shares"] = max(float(c.get("protected_shares") or 0.0), sh)
                 c["entry_price"] = px
                 c["sliding_low"] = px
                 c["highest_price"] = px
                 c["status"] = "HOLDING_ANCHOR"
-        add_log("♻️ Reset Counters to $0.0000 • Aligned Sliding Lows to Current Live Price & Locked Share Floor.")
+        add_log("♻️ Reset Counters to $0.0000 • Aligned Sliding Lows & Preserved Protected Share Floor.")
     save_persistent_state(sync_db=True)
     return jsonify({"ok": True})
 
@@ -2080,7 +1965,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/svg+xml" href="/icon.svg">
     <link rel="apple-touch-icon" href="/icon.svg">
-    <title>VaultSkim Command Center • v5.7 Real Gate.io Wave-Compounder</title>
+    <title>VaultSkim Command Center • v5.8 Share-Driven Dynamic Wave</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root {
@@ -2134,11 +2019,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="flex items-center justify-between gap-2 mb-1">
             <h1 class="text-lg sm:text-xl font-extrabold text-white tracking-tight">VaultSkim Command Center</h1>
             <span id="versionBadge" class="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-950/90 text-emerald-400 border border-emerald-600/60 mono whitespace-nowrap">
-                v5.7 - Real Wave-Compounder
+                v5.8 - Share-Driven Dynamic Wave
             </span>
         </div>
         <div class="flex items-center justify-between text-[11px] text-slate-400 mb-3">
-            <span>Zero Air-Skims • Real Share Growth & Spot USDT Profit</span>
+            <span>Exact Share Recovery (ROUND_UP) • Smart Dynamic Re-Buy</span>
             <span id="liveTickClock" class="text-emerald-400 mono font-bold">● Tick: --:--:--</span>
         </div>
 
@@ -2299,7 +2184,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </span>
         </div>
         <p class="text-[11px] text-slate-400 mb-2">
-            Only records completed real Gate.io Wave cycles (Bonus Shares added + Real USDT left in Spot wallet)
+            Share-Driven Re-Buy guarantees 100% share restoration + bonus shares + real Spot USDT profit
         </p>
         <div class="w-full h-40 bg-slate-950/70 rounded-lg border border-slate-800/80 p-2 relative">
             <svg id="profitChartSvg" viewBox="0 0 500 150" class="w-full h-full overflow-visible"></svg>
@@ -2313,7 +2198,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="text-xs font-extrabold uppercase tracking-wider text-slate-200">
                     📋 VERIFIED GATE.IO SKIM LEDGER
                 </div>
-                <div class="text-[11px] text-slate-400">Every completed 2-Stage Wave Re-Buy & USDT Profit Fill</div>
+                <div class="text-[11px] text-slate-400">Every completed Share-Driven Re-Buy & USDT Profit Fill</div>
             </div>
             <button onclick="window.location='/api/export_csv'" class="btn-press px-2.5 py-1 rounded-md bg-emerald-950/90 text-emerald-300 border border-emerald-700/70 text-xs font-bold mono">
                 📥 CSV
@@ -2467,7 +2352,6 @@ function updateUI(data) {
     const coins = data.coins || {};
     const syms = Object.keys(coins);
 
-    // Frontend Anti-Flicker Guard: Ignore transient empty response if we already had active coins
     if (syms.length === 0 && _lastKnownCoinCount > 0 && !data.exchange_bridge?.masked_key) {
         return;
     }
@@ -2564,28 +2448,35 @@ function updateUI(data) {
             const tokenVal = sh * price;
             const totalBucketVal = tokenVal + harvestEsc;
             const gainPct = low > 0 ? (((price - low) / low) * 100) : 0;
-            const harvestTargetPrice = low * 1.0065;
+            const harvestTargetPrice = low * 1.0062;
             const pctBar = c.status === 'ESCROW_HOLDING'
                 ? 100
-                : Math.max(0, Math.min(100, (gainPct / 0.65) * 100));
+                : Math.max(0, Math.min(100, (gainPct / 0.62) * 100));
 
             const modePill = isLive
                 ? `<button onclick="switchCoinMode('${sym}', true)" class="btn-press px-2 py-0.5 rounded bg-rose-950/90 text-rose-400 border border-rose-700/70 text-[10px] font-extrabold mono">⚡ LIVE ORDER</button>`
                 : `<button onclick="switchCoinMode('${sym}', false)" class="btn-press px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-bold mono">📄 PAPER</button>`;
 
             const statusPill = c.status === 'ESCROW_HOLDING'
-                ? `<span class="px-2 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-600/80 text-[10px] font-extrabold mono">🔒 ESCROW RE-BUY ARMED</span>`
+                ? `<span class="px-2 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-600/80 text-[10px] font-extrabold mono">🔒 DYNAMIC ESCROW ARMED</span>`
                 : `<span class="px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-400 border border-emerald-700/70 text-[10px] font-extrabold mono">${c.status}</span>`;
 
+            const neededSh = Math.max(soldSh, protSh - sh);
             const escrowDetailHtml = harvestEsc > 0
                 ? `<div class="flex items-center justify-between text-amber-300 bg-amber-950/40 px-2 py-1.5 rounded border border-amber-700/60">
-                       <span>🔒 Active Escrow USDT:</span>
-                       <span class="font-bold">$${harvestEsc.toFixed(2)} -> Re-Buy >${soldSh.toFixed(5)} ${sym} @ <= $${formatPrice(rebuyPx)}</span>
+                       <span>🔒 Active Escrow ($${harvestEsc.toFixed(2)}):</span>
+                       <span class="font-bold">Re-Buy >=${neededSh.toFixed(5)} ${sym} @ <=$${formatPrice(rebuyPx)}</span>
                    </div>`
                 : `<div class="flex items-center justify-between">
-                       <span class="text-slate-400">Next Real Gate.io Harvest (+0.65%):</span>
+                       <span class="text-slate-400">Next Real Gate.io Harvest (+0.62%):</span>
                        <span class="text-amber-300 font-bold">$${formatPrice(harvestTargetPrice)} (+$${Number(c.share_topup_usd || 0).toFixed(4)} Share Growth)</span>
                    </div>`;
+
+            const forceRebuyBtnHtml = (isLive && harvestEsc > 0)
+                ? `<button onclick="forceInstantEscrowRebuy('${sym}')" class="btn-press w-full mt-2 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs flex items-center justify-center gap-1.5 shadow">
+                       <span>⚡</span> <span>Re-Buy & Restore >=${protSh.toFixed(6)} ${sym} Shares Right Now</span>
+                   </button>`
+                : '';
 
             const topupBtnHtml = (isLive && usdtAvail >= 3.15 && harvestEsc <= 0)
                 ? `<button onclick="deployUsdtToShares('${sym}', ${usdtAvail})" class="btn-press w-full mt-2 py-2 rounded-lg bg-sky-950/90 hover:bg-sky-900 text-sky-300 border border-sky-600/80 font-extrabold text-xs flex items-center justify-center gap-1.5">
@@ -2595,8 +2486,9 @@ function updateUI(data) {
 
             const bottomBar = isLive
                 ? `<button onclick="manualSyncLive()" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-700/70 font-bold text-xs flex items-center justify-center gap-1.5">
-                       <span>🟢</span> <span>Live Gate.io Wave-Compounder Active — Zero Air Skims</span>
+                       <span>🟢</span> <span>Share-Driven Dynamic Wave Active — Zero Share Shaving</span>
                    </button>
+                   ${forceRebuyBtnHtml}
                    ${topupBtnHtml}`
                 : `<button onclick="triggerPracticeSpike('${sym}')" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-amber-950/70 hover:bg-amber-900/70 text-amber-300 border border-amber-600/70 font-extrabold text-xs">
                        ⚡ Practice Spike (+1.5% Simulator)
@@ -2666,8 +2558,8 @@ function updateUI(data) {
                     </div>
 
                     <div class="flex items-center justify-between">
-                        <span class="text-slate-400">Zero-Loss / +0.65% Bar:</span>
-                        <span class="text-emerald-300 font-bold">${c.status === 'ESCROW_HOLDING' ? 'Waiting Pullback <= $' + formatPrice(rebuyPx) + ' (Sold @ $' + formatPrice(sellPx) + ')' : (c.zero_loss_stop > 0 ? 'LOCKED Stop @ $' + formatPrice(c.zero_loss_stop) : 'Shield @ +0.35% | Harvest @ $' + formatPrice(harvestTargetPrice))}</span>
+                        <span class="text-slate-400">Zero-Loss / +0.62% Bar:</span>
+                        <span class="text-emerald-300 font-bold">${c.status === 'ESCROW_HOLDING' ? 'Dynamic Re-Buy <= $' + formatPrice(rebuyPx) + ' (Sold @ $' + formatPrice(sellPx) + ')' : (c.zero_loss_stop > 0 ? 'LOCKED Stop @ $' + formatPrice(c.zero_loss_stop) : 'Shield @ +0.35% | Harvest @ $' + formatPrice(harvestTargetPrice))}</span>
                     </div>
 
                     <div class="w-full bg-slate-900 h-2 rounded-full overflow-hidden border border-slate-800">
@@ -2728,6 +2620,19 @@ async function manualSyncLive() {
     btn.innerText = "⏳ Syncing...";
     await fetch('/api/sync_live', {method: 'POST'});
     btn.innerText = "🔄 Sync Live";
+    pollState();
+}
+
+async function forceInstantEscrowRebuy(symbol) {
+    const r = await fetch('/api/coin/force_rebuy', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol})
+    });
+    const res = await r.json();
+    if (!r.ok || !res.ok) {
+        alert(res.error || "Could not trigger instant Escrow re-buy.");
+    }
     pollState();
 }
 
