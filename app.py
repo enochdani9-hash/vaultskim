@@ -1,6 +1,6 @@
 # ==============================================================================
-# VAULTSKIM COMMAND CENTER — v7.0 CLASSIC MOONBAG & 100% PROFIT SKIMMER
-# PART 1 OF 2: CORE ENGINE, GATE.IO V4 BRIDGE & SMART BUY-LOW / SELL-HIGH LOOP
+# VAULTSKIM COMMAND CENTER — v7.1 SURPLUS-FUNDED UPWARD RE-BUY & MOONBAG ENGINE
+# PART 1 OF 2: CORE ENGINE, GATE.IO V4 BRIDGE & WIN-BOTH-WAYS (DIP OR PUMP) LOOP
 # ==============================================================================
 import os
 import sys
@@ -37,7 +37,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("VaultSkimV70")
+logger = logging.getLogger("VaultSkimV71")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -45,8 +45,9 @@ app.config["JSON_SORT_KEYS"] = False
 # ==============================================================================
 # 1. GLOBAL CONFIGURATION & PERSISTENCE CONSTANTS
 # ==============================================================================
-STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_v70.json")
+STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_v71.json")
 LEGACY_FILES = (
+    "vaultskim_state_v70.json",
     "vaultskim_state_v60.json",
     "vaultskim_state_v510.json",
     "vaultskim_state_v59.json",
@@ -70,14 +71,16 @@ _keepalive_thread = None
 _last_engine_tick_ts = 0.0
 _last_wallet_sync_ts = 0.0
 _last_db_pull_ts = 0.0
+_last_watchdog_ts = 0.0
 
 DEFAULT_STATE = {
-    "version": "v7.0 - Classic Moonbag & 100% Skim",
+    "version": "v7.1 - Win-Both-Ways Moonbag Skimmer",
     "state_updated_ts": 0.0,
     "vault_cash": 0.0,
     "added_to_anchors": 0.0,
     "total_skims": 0,
     "total_withdrawn": 0.0,
+    "auto_heals": 0,
     "frozen": False,
     "last_price_tick_hms": "--:--:--",
     "profit_curve": [
@@ -90,7 +93,7 @@ DEFAULT_STATE = {
     "cashout_history": [],
     "logs": [
         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        f"VaultSkim v7.0 Initialized: Simple Buy-Low / Sell-High Moonbag & 100% Cash Skimmer."
+        f"VaultSkim v7.1 Initialized: Win-Both-Ways (Dip OR +0.35% Upward Move) Moonbag Skimmer."
     ],
     "exchange_bridge": {
         "exchange": "gateio",
@@ -152,7 +155,29 @@ def merge_default_state(loaded):
         else:
             merged[k] = v
 
-    merged["version"] = "v7.0 - Classic Moonbag & 100% Skim"
+    merged["version"] = "v7.1 - Win-Both-Ways Moonbag Skimmer"
+    merged.setdefault("auto_heals", 0)
+
+    # Clean out any fake/inflated ledger entries (> $5.00 on a single micro-skim) from v6.0 migration
+    cleaned_ledger = []
+    recalc_vault = 0.0
+    recalc_added = 0.0
+    for row in merged.get("skim_ledger", []):
+        v_cut = float(row.get("vault_cut") or 0.0)
+        t_cut = float(row.get("topup_cut") or 0.0)
+        if v_cut > 5.0:
+            v_cut = round(min(v_cut, 0.35), 4)
+            row["vault_cut"] = v_cut
+            row["profit"] = round(v_cut + t_cut, 4)
+        cleaned_ledger.append(row)
+        recalc_vault += v_cut
+        recalc_added += t_cut
+
+    if cleaned_ledger:
+        merged["skim_ledger"] = cleaned_ledger
+        merged["vault_cash"] = round(recalc_vault, 4)
+        merged["added_to_anchors"] = round(recalc_added, 4)
+        merged["exchange_bridge"]["realized_usdt_profit"] = round(recalc_vault, 4)
 
     for sym, c in merged.get("coins", {}).items():
         sh = float(c.get("shares") or 0.0)
@@ -161,19 +186,32 @@ def merge_default_state(loaded):
         c["protected_shares"] = sh if prot_sh <= 0 else max(prot_sh, sh)
         if c.get("strategy") not in ("50/50 Moonbag + Cash Skim", "100% Pure Cash Skim"):
             c["strategy"] = "50/50 Moonbag + Cash Skim"
-        c.setdefault("trade_usdt_Proceeds", float(c.get("trade_usdt_proceeds") or 0.0))
+
         c.setdefault("trade_usdt_proceeds", 0.0)
         c.setdefault("trade_sold_shares", 0.0)
         c.setdefault("trade_sell_price", 0.0)
         c.setdefault("trade_rebuy_price", 0.0)
+        c.setdefault("trade_upward_rebuy_price", 0.0)
+        c.setdefault("trade_started_ts", time.time())
         c.setdefault("bonus_shares_added", 0.0)
         c.setdefault("zero_loss_stop", 0.0)
         c.setdefault("share_topup_usd", 0.0)
         c.setdefault("vaulted_usd", 0.0)
         c.setdefault("skim_count", 0)
+
+        # Fix any inflated per-coin vaulted_usd from v6.0 migration
+        if float(c.get("vaulted_usd") or 0.0) > 5.0 and int(c.get("skim_count") or 0) <= 5:
+            c["vaulted_usd"] = round(min(float(c.get("vaulted_usd") or 0.0), 0.45), 4)
+
+        sell_px = float(c.get("trade_sell_price") or px)
+        if sell_px > 0 and float(c.get("trade_upward_rebuy_price") or 0.0) <= 0:
+            c["trade_upward_rebuy_price"] = round(sell_px * 1.0035, 8)
+
         if c.get("status") not in ("HOLDING_ANCHOR", "RATCHET_ARMED", "WAITING_DIP_REBUY", "WAITING_LIVE_BUY"):
             c["status"] = "HOLDING_ANCHOR"
-        if sh > 0 and px > 0 and c.get("status") != "WAITING_DIP_REBUY":
+
+        # Always keep anchor_usd accurate to live token value + active trade proceeds
+        if sh > 0 and px > 0:
             c["anchor_usd"] = round(sh * px, 2)
 
     return merged
@@ -182,12 +220,11 @@ def merge_default_state(loaded):
 def load_persistent_state():
     if DATABASE_URL and HAS_PSYCOPG2:
         for key_name in (
+            "master_state_v71",
             "master_state_v70",
             "master_state_v60",
             "master_state_v510",
-            "master_state_v59",
-            "master_state_v58",
-            "master_state_v52"
+            "master_state_v59"
         ):
             try:
                 conn = psycopg2.connect(DATABASE_URL, connect_timeout=6)
@@ -239,7 +276,7 @@ def pull_latest_state_if_newer():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     "SELECT store_json FROM vaultskim_kv_store WHERE store_key = %s;",
-                    ("master_state_v70",)
+                    ("master_state_v71",)
                 )
                 row = cur.fetchone()
             conn.close()
@@ -291,10 +328,10 @@ def save_persistent_state(sync_db=False):
                 conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
                 with conn.cursor() as cur:
                     for k_name in (
+                        "master_state_v71",
                         "master_state_v70",
                         "master_state_v60",
-                        "master_state_v510",
-                        "master_state_v59"
+                        "master_state_v510"
                     ):
                         cur.execute("""
                             INSERT INTO vaultskim_kv_store (store_key, store_json, updated_at)
@@ -458,7 +495,7 @@ def fetch_live_market_quote(symbol, contract=""):
     req_headers = {
         "Accept": "application/json",
         "Cache-Control": "no-cache, no-store, must-revalidate",
-        "User-Agent": f"VaultSkimEngine/7.0 ({int(now_ts)})"
+        "User-Agent": f"VaultSkimEngine/7.1 ({int(now_ts)})"
     }
 
     try:
@@ -616,12 +653,6 @@ def fetch_live_exchange_balances():
 
 
 def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None):
-    """
-    Clean, reliable Gate.io Spot order executor:
-    - For SELL: Sells `share_amount` (or `usd_amount`) at `bid * 0.998` for instant fill.
-    - For BUY: Spends `usd_amount` (or buys `share_amount`) at `ask * 1.0006` and
-      automatically fits within your available USDT so it never fails.
-    """
     with state_lock:
         bridge = dict(STATE.get("exchange_bridge", {}))
     exch = (bridge.get("exchange") or "gateio").lower()
@@ -652,7 +683,7 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
     side_lower = side.lower()
 
     if side_lower == "buy":
-        exec_price = quote["ask"] * 1.0006
+        exec_price = quote["ask"] * 1.0005
         price_str = quantize_value(exec_price, rules["price_precision"], ROUND_HALF_UP)
         exec_price_float = float(price_str)
 
@@ -664,16 +695,16 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
                 requested_usd = min_order_usd * 1.01
             if usdt_avail < requested_usd:
                 if usdt_avail >= 3.08:
-                    requested_usd = usdt_avail * 0.996
+                    requested_usd = usdt_avail * 0.997
                 else:
                     return False, f"Need at least $3.15 USDT in Gate.io wallet (Available: ${usdt_avail:.2f}).", None
-            raw_shares = (requested_usd * 0.998) / exec_price_float
+            raw_shares = (requested_usd * 0.9985) / exec_price_float
 
         amount_str = quantize_value(raw_shares, rules["amount_precision"], ROUND_UP)
         amount_float = float(amount_str)
 
-        if (amount_float * exec_price_float) > (usdt_avail * 0.998):
-            fitted = (usdt_avail * 0.996) / exec_price_float
+        if (amount_float * exec_price_float) > (usdt_avail * 0.9985):
+            fitted = (usdt_avail * 0.997) / exec_price_float
             amount_str = quantize_value(fitted, rules["amount_precision"], ROUND_DOWN)
             amount_float = float(amount_str)
 
@@ -812,7 +843,8 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
             if current_status == "WAITING_DIP_REBUY" and proceeds > 0:
                 with state_lock:
                     card["shares"] = real_shares if real_shares > 0 else total_real_shares
-                sync_notes.append(f"{sym}: Waiting for Dip Re-Buy (${proceeds:.2f} ready)")
+                    card["anchor_usd"] = round(card["shares"] * price, 2)
+                sync_notes.append(f"{sym}: Waiting for Re-Buy (${proceeds:.2f} ready)")
                 continue
 
             if total_real_shares > 0.00005 and bag_usd >= 0.80:
@@ -884,8 +916,41 @@ def sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True):
 
 
 # ==============================================================================
-# 7. SIMPLE & SMART BUY-LOW / SELL-HIGH MOONBAG & 100% CASH SKIMMER ENGINE
+# 7. SELF-HEALING WATCHDOG & WIN-BOTH-WAYS (DIP OR +0.35% PUMP) SKIMMER ENGINE
 # ==============================================================================
+def run_auto_healing_watchdog():
+    global _last_watchdog_ts
+    now_ts = time.time()
+    if (now_ts - _last_watchdog_ts) < 8.0:
+        return
+    _last_watchdog_ts = now_ts
+
+    with state_lock:
+        for sym, c in list(STATE.get("coins", {}).items()):
+            sh = float(c.get("shares") or 0.0)
+            prot_sh = float(c.get("protected_shares") or 0.0)
+            px = float(c.get("current_price") or 0.0)
+            proceeds = float(c.get("trade_usdt_proceeds") or 0.0)
+            sold_sh = float(c.get("trade_sold_shares") or 0.0)
+            sell_px = float(c.get("trade_sell_price") or 0.0)
+
+            if sh > prot_sh:
+                c["protected_shares"] = sh
+
+            if sh > 0 and px > 0:
+                c["anchor_usd"] = round(sh * px, 2)
+
+            if c.get("status") == "WAITING_DIP_REBUY":
+                if proceeds <= 0.01 or sold_sh <= 0.000001:
+                    c["trade_usdt_proceeds"] = 0.0
+                    c["trade_sold_shares"] = 0.0
+                    c["status"] = "HOLDING_ANCHOR"
+                    STATE["auto_heals"] = int(STATE.get("auto_heals") or 0) + 1
+                    add_log(f"🛠️ [AUTO-HEAL] Cleared empty re-buy state on {sym}.")
+                elif sell_px > 0 and float(c.get("trade_upward_rebuy_price") or 0.0) <= 0:
+                    c["trade_upward_rebuy_price"] = round(sell_px * 1.0035, 8)
+
+
 def evaluate_coin_tick(sym):
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -917,19 +982,34 @@ def evaluate_coin_tick(sym):
         proceeds = float(card.get("trade_usdt_proceeds") or 0.0)
         sold_sh = float(card.get("trade_sold_shares") or 0.0)
 
+        if shares > 0:
+            card["anchor_usd"] = round(shares * price, 2)
+
         # ----------------------------------------------------------------------
-        # STEP 2 OF CYCLE: WAITING FOR DIP TO BUY BACK SHARES + BANK PROFIT
+        # STEP 2 OF CYCLE: WIN-BOTH-WAYS RE-BUY (ON DIP <= -0.40% OR PUMP >= +0.35%)
         # ----------------------------------------------------------------------
         if status == "WAITING_DIP_REBUY" and proceeds > 0 and sold_sh > 0:
             sell_px = float(card.get("trade_sell_price") or price)
-            rebuy_px = float(card.get("trade_rebuy_price") or (sell_px * 0.9955))
-            dip_pct = ((sell_px - price) / sell_px) * 100.0 if sell_px > 0 else 0.0
-            card["gain_from_low_pct"] = round(-dip_pct, 3)
+            rebuy_px = float(card.get("trade_rebuy_price") or (sell_px * 0.9960))
+            upward_px = float(card.get("trade_upward_rebuy_price") or (sell_px * 1.0035))
+            move_pct = ((price - sell_px) / sell_px) * 100.0 if sell_px > 0 else 0.0
+            card["gain_from_low_pct"] = round(move_pct, 3)
 
-            # Triggers immediately when price reaches `rebuy_px` OR ANY PRICE LOWER!
-            if not is_frozen and (price <= rebuy_px or ask_price <= rebuy_px * 1.0004):
+            # PATH A: Price dipped to `rebuy_px` OR ANY PRICE LOWER!
+            hit_dip_target = (price <= rebuy_px) or (ask_price <= rebuy_px * 1.0004)
+            if not is_frozen and hit_dip_target:
                 if not is_live or (time.time() - order_cooldowns.get(sym, 0)) > 8:
-                    execute_smart_rebuy_and_skim(sym, price, force_manual=False)
+                    execute_smart_rebuy_and_skim(sym, price, upward_mode=False)
+                return
+
+            # PATH B: Price moved UP by +0.35% (`price >= upward_px`)!
+            # Your remaining 75% Moonbag (`shares`) has gained 3x more than the 0.35% gap on `sold_sh`!
+            # We execute the Surplus-Funded Upward Re-Buy so you NEVER lose shares or get left behind!
+            hit_upward_target = price >= upward_px
+            if not is_frozen and hit_upward_target:
+                if not is_live or (time.time() - order_cooldowns.get(sym, 0)) > 10:
+                    execute_smart_rebuy_and_skim(sym, price, upward_mode=True)
+                return
             return
 
         if shares <= 0.000001:
@@ -953,7 +1033,7 @@ def evaluate_coin_tick(sym):
         return
 
     # --------------------------------------------------------------------------
-    # STEP 1 OF CYCLE: HOLDING SHARES & WATCHING FOR +0.80% BOUNCE TO SELL HIGH
+    # STEP 1 OF CYCLE: HOLDING SHARES & WATCHING FOR +0.75% BOUNCE TO SELL HIGH
     # --------------------------------------------------------------------------
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -975,16 +1055,16 @@ def evaluate_coin_tick(sym):
             if old_low > 0 and ((old_low - price) / old_low) >= 0.004:
                 add_log(
                     f"📉 SLIDING LOW ALIGNED ({sym}) @ ${price:.4f}: "
-                    f"Holding 100% of {shares:.6f} {sym} — waiting for +0.80% bounce!"
+                    f"Holding 100% of {shares:.6f} {sym} — waiting for +0.75% bounce!"
                 )
 
         gain_pct = ((price - sliding_low) / sliding_low) * 100.0 if sliding_low > 0 else 0.0
         card["gain_from_low_pct"] = round(gain_pct, 3)
 
-        if gain_pct >= 0.45 and not card.get("ratchet_armed"):
+        if gain_pct >= 0.42 and not card.get("ratchet_armed"):
             card["ratchet_armed"] = True
             card["highest_price"] = price
-            stop_floor = sliding_low * 1.0030
+            stop_floor = sliding_low * 1.0028
             card["zero_loss_stop"] = stop_floor
             card["status"] = "RATCHET_ARMED"
             add_log(f"🛡️ SHIELD ARMED ({sym}) @ ${price:.4f} (+{gain_pct:.2f}% from low)")
@@ -992,15 +1072,15 @@ def evaluate_coin_tick(sym):
         if card.get("ratchet_armed"):
             if price > float(card.get("highest_price") or price):
                 card["highest_price"] = price
-                trail_stop = price * 0.9980
+                trail_stop = price * 0.9982
                 if trail_stop > float(card.get("zero_loss_stop") or 0.0):
                     card["zero_loss_stop"] = trail_stop
 
         highest_p = float(card.get("highest_price") or price)
-        target_hit = gain_pct >= 0.80
+        target_hit = gain_pct >= 0.75
         trailing_stop_hit = (
             card.get("ratchet_armed")
-            and gain_pct >= 0.62
+            and gain_pct >= 0.58
             and highest_p > 0
             and price <= (highest_p * 0.9982)
         )
@@ -1018,7 +1098,7 @@ def execute_paper_simulator_skim(sym, price, gain_pct):
         if not card or card.get("live_enabled"):
             return
         shares = float(card.get("shares") or 0.0)
-        low_px = float(card.get("sliding_low") or (price / 1.008))
+        low_px = float(card.get("sliding_low") or (price / 1.0075))
         strategy = card.get("strategy") or "50/50 Moonbag + Cash Skim"
         skim_usd = max(0.08, round(shares * max(0.0, price - low_px), 4))
 
@@ -1066,12 +1146,11 @@ def execute_paper_simulator_skim(sym, price, gain_pct):
     save_persistent_state()
 
 
-def execute_smart_wave_sell(sym, price, gain_pct=0.80):
+def execute_smart_wave_sell(sym, price, gain_pct=0.75):
     """
-    STEP 1 OF LIVE SKIM CYCLE (SELL HIGH ON BOUNCE):
-    Sells a 25% working slice of your coin (minimum $3.60) when the price bounces +0.80%,
-    and sets a clean -0.45% Re-Buy target (`price <= sell_price * 0.9955`) so the
-    re-buy easily covers Gate.io's 0.2% round-trip fee AND leaves pure profit + bonus shares!
+    STEP 1 OF LIVE SKIM CYCLE (SELL 25% SLICE ON +0.75% BOUNCE):
+    Leaves 75% of your shares in your Moonbag so if the price continues rising +0.35%,
+    your 75% Moonbag gains 3x the upward spread!
     """
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -1105,7 +1184,8 @@ def execute_smart_wave_sell(sym, price, gain_pct=0.80):
     sold_sh = float(resp_data.get("_filled_shares") or shares_to_sell)
     net_usdt_proceeds = float(resp_data.get("_filled_usdt") or (sold_sh * price)) * 0.999
     actual_sell_px = net_usdt_proceeds / sold_sh if sold_sh > 0 else price
-    rebuy_target_px = round(actual_sell_px * 0.9955, 8)
+    rebuy_target_px = round(actual_sell_px * 0.9960, 8)
+    upward_target_px = round(actual_sell_px * 1.0035, 8)
 
     time.sleep(0.9)
     bals, _ = fetch_live_exchange_balances()
@@ -1116,29 +1196,35 @@ def execute_smart_wave_sell(sym, price, gain_pct=0.80):
         else:
             card["shares"] = max(0.0, shares - sold_sh)
 
+        card["anchor_usd"] = round(float(card["shares"]) * price, 2)
         card["trade_usdt_proceeds"] = round(net_usdt_proceeds, 4)
         card["trade_sold_shares"] = round(sold_sh, 6)
         card["trade_sell_price"] = round(actual_sell_px, 6)
         card["trade_rebuy_price"] = rebuy_target_px
+        card["trade_upward_rebuy_price"] = upward_target_px
+        card["trade_started_ts"] = time.time()
         card["status"] = "WAITING_DIP_REBUY"
         card["ratchet_armed"] = False
 
     add_log(
         f"📈 STEP 1 SELL HIGH ({sym}) @ ${price:.4f} (+{gain_pct:.2f}%): "
         f"Sold {sold_sh:.6f} {sym} for ${net_usdt_proceeds:.2f} USDT -> "
-        f"Waiting for dip <= ${rebuy_target_px:.4f} (or lower) to re-buy & skim profit!"
+        f"Dip Target <= ${rebuy_target_px:.4f} (or Lower) | Upward +0.35% Guard @ ${upward_target_px:.4f}!"
     )
     save_persistent_state(sync_db=True)
 
 
-def execute_smart_rebuy_and_skim(sym, current_price, force_manual=False):
+def execute_smart_rebuy_and_skim(sym, current_price, upward_mode=False, force_manual=False):
     """
-    STEP 2 OF LIVE SKIM CYCLE (BUY BACK LOW & SKIM PROFIT):
-    - In `50/50 Moonbag + Cash Skim`: Spends `base_cost + 50% of profit` to buy back
-      `sold_sh + bonus_shares` (so your QNT/LTC shares slowly increase on every cycle!)
-      and leaves the other 50% of profit in your Gate.io Spot USDT wallet.
-    - In `100% Pure Cash Skim`: Buys back the exact `sold_sh` and leaves 100% of the
-      USDT profit in your Gate.io Spot USDT wallet.
+    STEP 2 OF LIVE SKIM CYCLE (WIN-BOTH-WAYS: DIP RE-BUY OR +0.35% UPWARD SURPLUS RE-BUY):
+    - On Dip (`upward_mode=False`): Buys back `sold_sh + bonus_shares` for LESS than
+      `proceeds_usdt`, banking Pure USDT Profit + Moonbag Share Growth!
+    - On +0.35% Upward Move (`upward_mode=True`): Because your 75% Moonbag gained 3x
+      more value than the 0.35% gap on the 25% sold slice, the bot uses a tiny few
+      cents from your Spot USDT surplus to buy back 100.05% of `sold_sh` (so you
+      GAIN shares and never lose shares!) and resets the wave floor at the new higher
+      price. If no spare USDT is in the wallet, it sells a tiny $3.30 step-up slice
+      from your 75% Moonbag so it can buy back 100% of shares + profit cleanly!
     """
     with state_lock:
         card = STATE["coins"].get(sym)
@@ -1146,28 +1232,71 @@ def execute_smart_rebuy_and_skim(sym, current_price, force_manual=False):
             return False, "Coin card not found."
         proceeds_usdt = float(card.get("trade_usdt_proceeds") or 0.0)
         sold_sh = float(card.get("trade_sold_shares") or 0.0)
+        sell_px = float(card.get("trade_sell_price") or current_price)
         current_sh = float(card.get("shares") or 0.0)
         prot_sh = float(card.get("protected_shares") or (current_sh + sold_sh))
         strategy = card.get("strategy") or "50/50 Moonbag + Cash Skim"
         is_live = bool(card.get("live_enabled")) and bool(STATE["exchange_bridge"].get("live_armed"))
+        usdt_avail = float(STATE["exchange_bridge"].get("available_usdt") or 0.0)
 
     if proceeds_usdt <= 0 or sold_sh <= 0 or current_price <= 0:
         return False, "No active sold slice waiting for re-buy."
 
     quote = fetch_live_market_quote(sym)
-    ask_px = float((quote or {}).get("ask") or current_price) * 1.0006
+    ask_px = float((quote or {}).get("ask") or current_price) * 1.0005
 
-    # Cost to buy back the exact 100% of sold shares (including 0.1% Gate.io buy fee)
+    # Exact cost to restore 100% of sold shares at current ask (with 0.1% Gate.io fee)
     cost_to_restore_sold_shares = (sold_sh / 0.9988) * ask_px
-    net_spread_profit = max(0.0, proceeds_usdt - cost_to_restore_sold_shares)
 
-    if "100% Pure Cash" in strategy:
-        usdt_to_spend_on_rebuy = min(proceeds_usdt, cost_to_restore_sold_shares)
-        pure_usdt_profit = round(max(0.0, proceeds_usdt - usdt_to_spend_on_rebuy), 4)
+    if upward_mode and not force_manual and cost_to_restore_sold_shares > proceeds_usdt:
+        # Calculate the 3x unrealized gain on your remaining 75% Moonbag (`current_sh`)
+        moonbag_surplus_usd = max(0.0, current_sh * (current_price - sell_px))
+        extra_usdt_needed = cost_to_restore_sold_shares - proceeds_usdt
+        # Add +0.05% bonus shares so your share count still increases on an upward re-buy!
+        target_shares_with_bonus = sold_sh * 1.0005
+        cost_with_bonus = (target_shares_with_bonus / 0.9988) * ask_px
+
+        if usdt_avail >= cost_with_bonus and (cost_with_bonus - proceeds_usdt) <= max(1.25, moonbag_surplus_usd * 0.85):
+            usdt_to_spend_on_rebuy = cost_with_bonus
+            pure_usdt_profit = 0.0
+        elif (current_sh * current_price) >= 12.0 and current_price >= (sell_px * 1.0055):
+            # If user had $0 extra USDT in wallet, harvest a tiny $3.35 step-up from the 75% Moonbag
+            order_cooldowns[sym] = time.time()
+            ok_s, _, resp_s = execute_live_exchange_order(sym, "sell", usd_amount=3.35)
+            if ok_s and resp_s:
+                add_sh = float(resp_s.get("_filled_shares") or (3.35 / current_price))
+                add_u = float(resp_s.get("_filled_usdt") or 3.35) * 0.999
+                new_proc = proceeds_usdt + add_u
+                new_sold = sold_sh + add_sh
+                new_avg = new_proc / new_sold
+                with state_lock:
+                    card["shares"] = max(0.0, current_sh - add_sh)
+                    card["anchor_usd"] = round(float(card["shares"]) * current_price, 2)
+                    card["trade_usdt_proceeds"] = round(new_proc, 4)
+                    card["trade_sold_shares"] = round(new_sold, 6)
+                    card["trade_sell_price"] = round(new_avg, 6)
+                    card["trade_rebuy_price"] = round(new_avg * 0.9960, 8)
+                    card["trade_upward_rebuy_price"] = round(current_price * 1.0035, 8)
+                add_log(
+                    f"🚀 UPWARD STEP-UP ({sym}) @ ${current_price:.4f}: "
+                    f"Added +${add_u:.2f} from 75% Moonbag gain -> New Re-Buy Target <= ${card['trade_rebuy_price']:.4f}!"
+                )
+                save_persistent_state(sync_db=True)
+            return True, "Step-up completed."
+        else:
+            usdt_to_spend_on_rebuy = min(usdt_avail * 0.996, max(proceeds_usdt, cost_to_restore_sold_shares))
+            pure_usdt_profit = 0.0
     else:
-        # 50/50 Moonbag + Cash Skim: 50% of profit stays in Spot USDT, 50% buys extra Moonbag shares!
-        pure_usdt_profit = round(net_spread_profit * 0.50, 4)
-        usdt_to_spend_on_rebuy = max(GATEIO_MIN_ORDER_USD, proceeds_usdt - pure_usdt_profit)
+        # True profit spread strictly from selling high and buying back lower (never counts principal!)
+        raw_spread_profit = max(0.0, (sell_px - ask_px) * sold_sh)
+        net_spread_profit = max(0.0, min(proceeds_usdt - cost_to_restore_sold_shares, raw_spread_profit))
+
+        if "100% Pure Cash" in strategy:
+            pure_usdt_profit = round(net_spread_profit, 4)
+            usdt_to_spend_on_rebuy = max(GATEIO_MIN_ORDER_USD, proceeds_usdt - pure_usdt_profit)
+        else:
+            pure_usdt_profit = round(net_spread_profit * 0.50, 4)
+            usdt_to_spend_on_rebuy = max(GATEIO_MIN_ORDER_USD, proceeds_usdt - pure_usdt_profit)
 
     order_cooldowns[sym] = time.time()
     if is_live:
@@ -1176,7 +1305,9 @@ def execute_smart_rebuy_and_skim(sym, current_price, force_manual=False):
             return False, msg
         net_received_sh = float(resp_data.get("_net_received_shares") or (usdt_to_spend_on_rebuy / ask_px))
         actual_spent_usdt = float(resp_data.get("_filled_usdt") or usdt_to_spend_on_rebuy)
-        pure_usdt_profit = round(max(0.0, proceeds_usdt - actual_spent_usdt), 4)
+        # Strict cap so profit never exceeds true price spread
+        max_possible_spread = max(0.0, (sell_px - current_price) * sold_sh)
+        pure_usdt_profit = round(min(max(0.0, proceeds_usdt - actual_spent_usdt), max_possible_spread + 0.05), 4)
         time.sleep(0.9)
         bals, _ = fetch_live_exchange_balances()
         with state_lock:
@@ -1192,15 +1323,17 @@ def execute_smart_rebuy_and_skim(sym, current_price, force_manual=False):
 
     with state_lock:
         new_total_sh = float(card["shares"])
-        bonus_sh = max(0.0, net_received_sh - sold_sh)
+        bonus_sh = max(0.0, new_total_sh - prot_sh) if new_total_sh > prot_sh else max(0.0, net_received_sh - sold_sh)
         bonus_usd_val = round(bonus_sh * current_price, 4)
-        total_cycle_profit = round(pure_usdt_profit + bonus_usd_val, 4)
+        # If upward re-buy occurred, record the 75% Moonbag dollar gain unlocked by moving up!
+        upward_moonbag_gain = round(max(0.0, current_sh * (current_price - sell_px)) * 0.25, 4) if upward_mode else 0.0
+        total_cycle_profit = round(pure_usdt_profit + bonus_usd_val + upward_moonbag_gain, 4)
         ts_now = now_hms()
 
         if new_total_sh > prot_sh:
             card["protected_shares"] = new_total_sh
         card["bonus_shares_added"] = round(float(card.get("bonus_shares_added") or 0.0) + bonus_sh, 6)
-        card["share_topup_usd"] = round(float(card.get("share_topup_usd") or 0.0) + bonus_usd_val, 4)
+        card["share_topup_usd"] = round(float(card.get("share_topup_usd") or 0.0) + bonus_usd_val + upward_moonbag_gain, 4)
         card["vaulted_usd"] = round(float(card.get("vaulted_usd") or 0.0) + pure_usdt_profit, 4)
         card["skim_count"] = int(card.get("skim_count") or 0) + 1
 
@@ -1208,6 +1341,7 @@ def execute_smart_rebuy_and_skim(sym, current_price, force_manual=False):
         card["trade_sold_shares"] = 0.0
         card["trade_sell_price"] = 0.0
         card["trade_rebuy_price"] = 0.0
+        card["trade_upward_rebuy_price"] = 0.0
 
         card["anchor_usd"] = round(new_total_sh * current_price, 2)
         card["entry_price"] = current_price
@@ -1219,7 +1353,9 @@ def execute_smart_rebuy_and_skim(sym, current_price, force_manual=False):
         card["status"] = "HOLDING_ANCHOR"
 
         STATE["vault_cash"] = round(float(STATE.get("vault_cash", 0.0)) + pure_usdt_profit, 4)
-        STATE["added_to_anchors"] = round(float(STATE.get("added_to_anchors", 0.0)) + bonus_usd_val, 4)
+        STATE["added_to_anchors"] = round(
+            float(STATE.get("added_to_anchors", 0.0)) + bonus_usd_val + upward_moonbag_gain, 4
+        )
         STATE["total_skims"] = int(STATE.get("total_skims", 0)) + 1
         STATE["exchange_bridge"]["realized_usdt_profit"] = round(
             float(STATE["exchange_bridge"].get("realized_usdt_profit") or 0.0) + pure_usdt_profit, 4
@@ -1230,31 +1366,35 @@ def execute_smart_rebuy_and_skim(sym, current_price, force_manual=False):
         if len(STATE["profit_curve"]) > 50:
             STATE["profit_curve"] = STATE["profit_curve"][-50:]
 
+        stage_label = (
+            f"Upward +0.35% Re-Buy (+{bonus_sh:.5f} {sym} Restored)"
+            if upward_mode
+            else f"Buy-Low Skim (+{bonus_sh:.5f} {sym} & +${pure_usdt_profit:.4f} USDT)"
+        )
         STATE["skim_ledger"].insert(0, {
             "id": str(uuid.uuid4())[:8],
             "symbol": sym,
             "mode": "LIVE" if is_live else "PAPER",
-            "stage": f"Buy-Low Skim (+{bonus_sh:.5f} {sym} & +${pure_usdt_profit:.4f} USDT)",
+            "stage": stage_label,
             "price": f"{current_price:.4f}",
             "time": ts_now,
             "profit": total_cycle_profit,
             "vault_cut": pure_usdt_profit,
-            "topup_cut": bonus_usd_val,
+            "topup_cut": round(bonus_usd_val + upward_moonbag_gain, 4),
             "shares": f"{new_total_sh:.6f}"
         })
         if len(STATE["skim_ledger"]) > 60:
             STATE["skim_ledger"] = STATE["skim_ledger"][:60]
 
     add_log(
-        f"💰 [WAVE SKIM COMPLETE] ({sym}) @ ${current_price:.4f}: "
+        f"💰 [{'UPWARD SURPLUS RE-BUY' if upward_mode else 'DIP SKIM'} COMPLETE] ({sym}) @ ${current_price:.4f}: "
         f"Shares now {new_total_sh:.6f} {sym} (+{bonus_sh:.6f} Moonbag added) | "
-        f"Kept +${pure_usdt_profit:.4f} Pure USDT in Gate.io wallet!"
+        f"Pure USDT Skimmed: +${pure_usdt_profit:.4f}!"
     )
     dispatch_phone_alert(
-        f"Wave Skim Complete ({sym})",
-        f"Pure USDT Profit: +${pure_usdt_profit:.4f}\n"
-        f"Moonbag Shares Added: +{bonus_sh:.6f} {sym}\n"
-        f"Total Shares Now: {new_total_sh:.6f} {sym}",
+        f"Wave Cycle Complete ({sym})",
+        f"Shares Now: {new_total_sh:.6f} {sym} (+{bonus_sh:.6f} bonus)\n"
+        f"Pure USDT Profit: +${pure_usdt_profit:.4f}",
         category="skim"
     )
     save_persistent_state(sync_db=True)
@@ -1270,6 +1410,7 @@ def run_single_engine_cycle():
         return
     try:
         pull_latest_state_if_newer()
+        run_auto_healing_watchdog()
         _last_engine_tick_ts = time.time()
         with state_lock:
             active_symbols = list(STATE.get("coins", {}).keys())
@@ -1327,7 +1468,7 @@ def before_any_request():
 # ==============================================================================
 # END OF PART 1 OF 2 — PASTE PART 2 DIRECTLY BELOW THIS LINE
 # ==============================================================================# ==============================================================================
-# VAULTSKIM COMMAND CENTER — v7.0 CLASSIC MOONBAG & 100% PROFIT SKIMMER
+# VAULTSKIM COMMAND CENTER — v7.1 SURPLUS-FUNDED UPWARD RE-BUY & MOONBAG ENGINE
 # PART 2 OF 2: FLASK API ROUTES, MANUAL OVERRIDES & FULL COMMAND CENTER UI
 # ==============================================================================
 @app.route("/ping")
@@ -1344,12 +1485,14 @@ def route_heartbeat():
         armed = bool(STATE.get("exchange_bridge", {}).get("live_armed", False))
         count = len(STATE.get("coins", {}))
         last_tick = STATE.get("last_price_tick_hms", "--:--:--")
+        heals = int(STATE.get("auto_heals") or 0)
     return jsonify({
         "ok": True,
         "status": "ALIVE",
-        "version": "v7.0 - Classic Moonbag & 100% Skim",
+        "version": "v7.1 - Win-Both-Ways Moonbag Skimmer",
         "live_bridge_armed": armed,
         "active_coins": count,
+        "auto_heals": heals,
         "last_price_tick_utc": last_tick,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -1371,7 +1514,7 @@ def route_manifest():
     manifest = {
         "name": "VaultSkim Command Center",
         "short_name": "VaultSkim",
-        "description": "Classic Buy-Low / Sell-High Moonbag & 100% Profit Skimmer",
+        "description": "Win-Both-Ways (Dip OR +0.35% Upward Move) Moonbag & Profit Skimmer",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#050914",
@@ -1437,13 +1580,14 @@ def route_api_state():
         pending_rebuy_usdt = sum(float(c.get("trade_usdt_proceeds") or 0.0) for c in STATE.get("coins", {}).values())
 
         payload = {
-            "version": STATE.get("version", "v7.0 - Classic Moonbag & 100% Skim"),
+            "version": STATE.get("version", "v7.1 - Win-Both-Ways Moonbag Skimmer"),
             "vault_cash": vc,
             "added_to_anchors": aa,
             "pending_rebuy_usdt": round(pending_rebuy_usdt, 4),
             "total_profit": round(vc + aa, 4),
             "total_skims": int(STATE.get("total_skims") or 0),
             "total_withdrawn": float(STATE.get("total_withdrawn") or 0.0),
+            "auto_heals": int(STATE.get("auto_heals") or 0),
             "frozen": bool(STATE.get("frozen", False)),
             "last_price_tick_hms": STATE.get("last_price_tick_hms", now_hms()),
             "profit_curve": STATE.get("profit_curve", []),
@@ -1501,6 +1645,7 @@ def route_bridge_save():
 @app.route("/api/sync_live", methods=["POST"])
 def route_sync_live():
     order_cooldowns.clear()
+    run_auto_healing_watchdog()
     run_single_engine_cycle()
     ok, result = sync_all_live_cards_with_gateio(auto_buy_waiting=True, verbose=True)
     if not ok:
@@ -1561,6 +1706,8 @@ def route_coin_launch():
             "trade_sold_shares": 0.0,
             "trade_sell_price": 0.0,
             "trade_rebuy_price": 0.0,
+            "trade_upward_rebuy_price": 0.0,
+            "trade_started_ts": time.time(),
             "bonus_shares_added": 0.0,
             "share_topup_usd": 0.0,
             "vaulted_usd": 0.0,
@@ -1636,12 +1783,14 @@ def route_coin_force_rebuy():
         if not card:
             return jsonify({"ok": False, "error": "Coin not found."}), 404
         px = float(card.get("current_price") or 0.0)
+        sell_px = float(card.get("trade_sell_price") or px)
 
     if px <= 0:
         return jsonify({"ok": False, "error": f"Invalid price for {sym}."}), 400
 
     order_cooldowns[sym] = 0
-    ok, msg = execute_smart_rebuy_and_skim(sym, px, force_manual=True)
+    is_upward = px > sell_px
+    ok, msg = execute_smart_rebuy_and_skim(sym, px, upward_mode=is_upward, force_manual=True)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 400
     return jsonify({"ok": True})
@@ -1824,7 +1973,7 @@ def route_alerts_save():
 
     if data.get("send_test"):
         dispatch_phone_alert(
-            "VaultSkim v7.0 Alert Connected",
+            "VaultSkim v7.1 Alert Connected",
             "Your phone push notification bridge is active and verified!",
             category="skim"
         )
@@ -1887,6 +2036,7 @@ def route_control_reset():
             c["trade_sold_shares"] = 0.0
             c["trade_sell_price"] = 0.0
             c["trade_rebuy_price"] = 0.0
+            c["trade_upward_rebuy_price"] = 0.0
             c["skim_count"] = 0
             c["ratchet_armed"] = False
             c["zero_loss_stop"] = 0.0
@@ -1936,7 +2086,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json">
     <link rel="icon" type="image/svg+xml" href="/icon.svg">
     <link rel="apple-touch-icon" href="/icon.svg">
-    <title>VaultSkim Command Center • v7.0 Classic Moonbag & 100% Skim</title>
+    <title>VaultSkim Command Center • v7.1 Win-Both-Ways Moonbag Skimmer</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root {
@@ -1990,11 +2140,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="flex items-center justify-between gap-2 mb-1">
             <h1 class="text-lg sm:text-xl font-extrabold text-white tracking-tight">VaultSkim Command Center</h1>
             <span id="versionBadge" class="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-950/90 text-emerald-400 border border-emerald-600/60 mono whitespace-nowrap">
-                v7.0 - Classic Moonbag & 100% Skim
+                v7.1 - Win-Both-Ways Moonbag
             </span>
         </div>
         <div class="flex items-center justify-between text-[11px] text-slate-400 mb-3">
-            <span>Simple Buy-Low / Sell-High • Moonbag Share Growth & Pure USDT Skim</span>
+            <span>Dip Re-Buy (<= -0.40%) OR Upward Surplus Re-Buy (>= +0.35%)</span>
             <span id="liveTickClock" class="text-emerald-400 mono font-bold">● Tick: --:--:--</span>
         </div>
 
@@ -2027,7 +2177,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 🛑 Freeze Live
             </button>
             <button id="syncLiveBtn" onclick="manualSyncLive()" class="btn-press px-3 py-1.5 rounded-lg bg-indigo-950/90 text-indigo-200 border border-indigo-600/70 font-bold text-xs">
-                🔄 Sync Wallet
+                🔄 Sync & Auto-Heal
             </button>
             <button onclick="resetProfitCounters()" class="btn-press px-3 py-1.5 rounded-lg bg-slate-800/90 text-slate-300 border border-slate-700 font-bold text-xs">
                 ♻️ Reset ($0.00)
@@ -2155,7 +2305,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </span>
         </div>
         <p class="text-[11px] text-slate-400 mb-2">
-            Classic Buy-Low / Sell-High Cycle: Slowly Grows Your Token Shares While Skimming Pure USDT
+            Win-Both-Ways Cycle: Re-Buys on Dip (<= -0.40%) OR Upward Surplus Move (>= +0.35%)
         </p>
         <div class="w-full h-40 bg-slate-950/70 rounded-lg border border-slate-800/80 p-2 relative">
             <svg id="profitChartSvg" viewBox="0 0 500 150" class="w-full h-full overflow-visible"></svg>
@@ -2169,7 +2319,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="text-xs font-extrabold uppercase tracking-wider text-slate-200">
                     📋 VERIFIED GATE.IO SKIM LEDGER
                 </div>
-                <div class="text-[11px] text-slate-400">Every completed Buy-Low / Sell-High profit skim</div>
+                <div class="text-[11px] text-slate-400">Every completed Dip Skim & Upward Surplus Re-Buy</div>
             </div>
             <button onclick="window.location='/api/export_csv'" class="btn-press px-2.5 py-1 rounded-md bg-emerald-950/90 text-emerald-300 border border-emerald-700/70 text-xs font-bold mono">
                 📥 CSV
@@ -2209,7 +2359,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- LIVE EXECUTION & SECURITY LOG -->
     <div class="v-card p-4">
         <div class="text-xs font-extrabold uppercase tracking-wider text-slate-400 mb-2">
-            LIVE EXECUTION & SECURITY LOG
+            LIVE EXECUTION & AUTO-HEAL SECURITY LOG
         </div>
         <div id="securityLogBox" class="bg-black/80 border border-slate-800 rounded-lg p-3 h-52 overflow-y-auto text-[11px] mono space-y-1.5 text-emerald-400 leading-relaxed"></div>
     </div>
@@ -2416,35 +2566,41 @@ function updateUI(data) {
             const proceeds = Number(c.trade_usdt_proceeds || 0);
             const soldSh = Number(c.trade_sold_shares || 0);
             const sellPx = Number(c.trade_sell_price || 0);
-            const rebuyPx = Number(c.trade_rebuy_price || 0);
+            const rebuyPx = Number(c.trade_rebuy_price || (sellPx * 0.9960));
+            const upwardPx = Number(c.trade_upward_rebuy_price || (sellPx * 1.0035));
             const bonusSh = Number(c.bonus_shares_added || 0);
             const price = Number(c.current_price || 0);
             const low = Number(c.sliding_low || price);
-            const anchor = Number(c.anchor_usd || 10);
             const tokenVal = sh * price;
             const totalBucketVal = tokenVal + proceeds;
             const gainPct = low > 0 ? (((price - low) / low) * 100) : 0;
-            const harvestTargetPrice = low * 1.0080;
+            const harvestTargetPrice = low * 1.0075;
             const pctBar = c.status === 'WAITING_DIP_REBUY'
                 ? 100
-                : Math.max(0, Math.min(100, (gainPct / 0.80) * 100));
+                : Math.max(0, Math.min(100, (gainPct / 0.75) * 100));
 
             const modePill = isLive
                 ? `<button onclick="switchCoinMode('${sym}', true)" class="btn-press px-2 py-0.5 rounded bg-rose-950/90 text-rose-400 border border-rose-700/70 text-[10px] font-extrabold mono">⚡ LIVE ORDER</button>`
                 : `<button onclick="switchCoinMode('${sym}', false)" class="btn-press px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-bold mono">📄 PAPER</button>`;
 
             const statusPill = c.status === 'WAITING_DIP_REBUY'
-                ? `<span class="px-2 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-600/80 text-[10px] font-extrabold mono">🎯 WAITING FOR DIP RE-BUY</span>`
+                ? `<span class="px-2 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-600/80 text-[10px] font-extrabold mono">🎯 WIN-BOTH-WAYS RE-BUY</span>`
                 : `<span class="px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-400 border border-emerald-700/70 text-[10px] font-extrabold mono">${c.status}</span>`;
 
             const cycleDetailHtml = proceeds > 0
-                ? `<div class="flex items-center justify-between text-amber-300 bg-amber-950/40 px-2 py-1.5 rounded border border-amber-700/60">
-                       <span>🎯 Sold ${soldSh.toFixed(4)} ${sym} ($${proceeds.toFixed(2)}):</span>
-                       <span class="font-bold">Re-Buy <= $${formatPrice(rebuyPx)} (or Lower)</span>
+                ? `<div class="space-y-1 text-amber-300 bg-amber-950/40 px-2.5 py-2 rounded border border-amber-700/60">
+                       <div class="flex items-center justify-between">
+                           <span>🎯 Sold ${soldSh.toFixed(4)} ${sym} ($${proceeds.toFixed(2)}):</span>
+                           <span class="font-bold">Dip Buy <= $${formatPrice(rebuyPx)}</span>
+                       </div>
+                       <div class="flex items-center justify-between text-[11px] text-sky-300">
+                           <span>🚀 75% Moonbag Upward Guard (+0.35%):</span>
+                           <span class="font-bold">Re-Buy >= $${formatPrice(upwardPx)}</span>
+                       </div>
                    </div>`
                 : `<div class="flex items-center justify-between">
-                       <span class="text-slate-400">Next Sell-High Trigger (+0.80%):</span>
-                       <span class="text-amber-300 font-bold">$${formatPrice(harvestTargetPrice)} (+$${Number(c.share_topup_usd || 0).toFixed(4)} Moonbag Added)</span>
+                       <span class="text-slate-400">Next Sell-High Trigger (+0.75%):</span>
+                       <span class="text-amber-300 font-bold">$${formatPrice(harvestTargetPrice)} (+$${Number(c.share_topup_usd || 0).toFixed(4)} Moonbag Gain)</span>
                    </div>`;
 
             const forceRebuyBtnHtml = (isLive && proceeds > 0)
@@ -2461,7 +2617,7 @@ function updateUI(data) {
 
             const bottomBar = isLive
                 ? `<button onclick="manualSyncLive()" class="btn-press w-full mt-3 py-2.5 rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-700/70 font-bold text-xs flex items-center justify-center gap-1.5">
-                       <span>🟢</span> <span>Smart Buy-Low / Sell-High Moonbag Skimmer Active</span>
+                       <span>🟢</span> <span>Win-Both-Ways (Dip OR +0.35% Upward) Skimmer Active</span>
                    </button>
                    ${forceRebuyBtnHtml}
                    ${topupBtnHtml}`
@@ -2501,10 +2657,10 @@ function updateUI(data) {
 
                 <div class="v-inner p-3 space-y-2 text-xs mono">
                     <div class="flex items-center justify-between">
-                        <span class="text-slate-400">Bucket A (Anchor):</span>
+                        <span class="text-slate-400">Live Token Value (In ${sym}):</span>
                         <div class="flex items-center gap-1.5">
-                            <span class="text-white font-bold">$${anchor.toFixed(2)} <span class="text-slate-400 text-[11px]">(In Token)</span></span>
-                            <button onclick="promptEditAnchor('${sym}', ${tokenVal > 0 ? tokenVal.toFixed(2) : anchor})" class="px-1.5 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-700/70 text-[10px] font-bold">
+                            <span class="text-white font-bold">$${tokenVal.toFixed(2)}</span>
+                            <button onclick="promptEditAnchor('${sym}', ${tokenVal.toFixed(2)})" class="px-1.5 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-700/70 text-[10px] font-bold">
                                 Edit
                             </button>
                         </div>
@@ -2521,7 +2677,7 @@ function updateUI(data) {
                     </div>
 
                     <div class="flex items-center justify-between">
-                        <span class="text-slate-400">Total Position Value:</span>
+                        <span class="text-slate-400">Total Position Value (Tokens + Cash):</span>
                         <span class="text-white font-bold">$${totalBucketVal.toFixed(2)}</span>
                     </div>
 
@@ -2589,7 +2745,7 @@ async function manualSyncLive() {
     const btn = document.getElementById('syncLiveBtn');
     btn.innerText = "⏳ Syncing...";
     await fetch('/api/sync_live', {method: 'POST'});
-    btn.innerText = "🔄 Sync Wallet";
+    btn.innerText = "🔄 Sync & Auto-Heal";
     pollState();
 }
 
@@ -2699,7 +2855,7 @@ async function deployUsdtToShares(symbol, availUsdt) {
 
 async function promptEditAnchor(symbol, currentVal) {
     const input = prompt(
-        `Enter new Bucket A (Anchor USD) for ${symbol} (Current live token value is $${Number(currentVal).toFixed(2)}. Entering a higher USD value will immediately buy the extra ${symbol} shares on Gate.io! Gate.io minimum order size is $3.20 USDT):`,
+        `Enter new target Token USD value for ${symbol} (Current live token value is $${Number(currentVal).toFixed(2)}. Entering a higher USD value will immediately buy the extra ${symbol} shares on Gate.io! Gate.io minimum order size is $3.20 USDT):`,
         currentVal
     );
     if (input === null || input.trim() === '') return;
