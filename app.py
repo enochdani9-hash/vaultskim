@@ -28,9 +28,6 @@ logger = logging.getLogger("VaultSkimSafe")
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
-# --------------------------------------------------------------
-# Global config
-# --------------------------------------------------------------
 STATE_FILE = os.environ.get("VAULTSKIM_STATE_FILE", "vaultskim_state_safe.json")
 ALLOW_LIVE_TRADING = os.environ.get("ALLOW_LIVE_TRADING", "0").lower() in {"1", "true", "yes"}
 GATEIO_MIN_ORDER_USD = 3.15
@@ -86,9 +83,7 @@ DEFAULT_STATE = {
     "coins": {}
 }
 
-# --------------------------------------------------------------
 # Helpers
-# --------------------------------------------------------------
 def now_hms():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
@@ -117,9 +112,7 @@ def sanitize_state_for_persistence(state_obj):
         )
     return safe
 
-# --------------------------------------------------------------
 # State persistence
-# --------------------------------------------------------------
 def merge_default_state(loaded):
     merged = json.loads(json.dumps(DEFAULT_STATE))
     if not isinstance(loaded, dict):
@@ -191,9 +184,7 @@ def save_state():
 app_state = load_state()
 save_state()
 
-# --------------------------------------------------------------
 # Alert dispatch
-# --------------------------------------------------------------
 def dispatch_phone_alert(title, message, category="skim"):
     with state_lock:
         alerts = dict(app_state.get("alerts", {}))
@@ -234,9 +225,7 @@ def dispatch_phone_alert(title, message, category="skim"):
 
     threading.Thread(target=_send, daemon=True).start()
 
-# --------------------------------------------------------------
 # Logging
-# --------------------------------------------------------------
 def add_log(message):
     with state_lock:
         entry = f"[{now_hms()}] {message}"
@@ -244,9 +233,7 @@ def add_log(message):
         if len(app_state["logs"]) > 120:
             app_state["logs"] = app_state["logs"][:120]
 
-# --------------------------------------------------------------
 # Exchange signing
-# --------------------------------------------------------------
 def gateio_v4_sign(api_key, api_secret, method, url_path, query_string="", body_str=""):
     ts = str(int(time.time()))
     m = hashlib.sha512()
@@ -267,9 +254,7 @@ def binance_v3_sign(api_secret, query_params):
     signature = hmac.new(api_secret.strip().encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{query_string}&signature={signature}"
 
-# --------------------------------------------------------------
 # Market data
-# --------------------------------------------------------------
 def get_pair_rules(symbol):
     sym = symbol.upper().strip()
     pair = f"{sym}_USDT"
@@ -318,7 +303,6 @@ def fetch_live_market_quote(symbol, contract=""):
         "User-Agent": f"VaultSkimSafe/{int(now_ts)}"
     }
 
-    # Gate.io primary
     try:
         r = requests.get(
             "https://api.gateio.ws/api/v4/spot/tickers",
@@ -360,7 +344,6 @@ def fetch_live_market_quote(symbol, contract=""):
     except Exception:
         pass
 
-    # Binance secondary
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/ticker/bookTicker",
@@ -391,7 +374,6 @@ def fetch_live_market_quote(symbol, contract=""):
     except Exception:
         pass
 
-    # DEX fallback
     lookup = contract.strip() if contract and len(contract.strip()) > 15 else sym
     if lookup and len(lookup) > 8:
         try:
@@ -424,9 +406,7 @@ def fetch_live_market_quote(symbol, contract=""):
 
     return price_cache.get(sym)
 
-# --------------------------------------------------------------
 # Wallet balance + order execution
-# --------------------------------------------------------------
 def fetch_live_exchange_balances():
     with state_lock:
         bridge = dict(app_state.get("exchange_bridge", {}))
@@ -612,9 +592,7 @@ def execute_live_exchange_order(symbol, side, usd_amount=None, share_amount=None
 
     return False, "Only Gate.io execution is enabled in this safe build.", None
 
-# --------------------------------------------------------------
 # Conservative strategy
-# --------------------------------------------------------------
 def _sync_bridge_balance():
     bals, err = fetch_live_exchange_balances()
     if bals is not None:
@@ -767,9 +745,7 @@ def _rebuy_from_escrow(sym, current_price):
     )
     save_state()
 
-# --------------------------------------------------------------
 # Engine loop
-# --------------------------------------------------------------
 def evaluate_coin_tick(sym):
     with state_lock:
         card = app_state["coins"].get(sym)
@@ -836,7 +812,8 @@ def evaluate_coin_tick(sym):
                 _rebuy_from_escrow(sym, price)
 
 def run_single_engine_cycle():
-    global _last_engine_tick_ts
+    global _last_engine_tick_ts, _last_wallet_sync_ts
+
     if not tick_lock.acquire(blocking=False):
         return
     try:
@@ -848,7 +825,6 @@ def run_single_engine_cycle():
             evaluate_coin_tick(sym)
 
         if bool(app_state.get("exchange_bridge", {}).get("live_armed")) and (time.time() - _last_wallet_sync_ts) >= 30:
-            global _last_wallet_sync_ts
             _last_wallet_sync_ts = time.time()
             _sync_bridge_balance()
     except Exception as exc:
@@ -874,10 +850,7 @@ def ensure_worker_threads_running():
 def before_any_request():
     ensure_worker_threads_running()
 
-# --------------------------------------------------------------
 # Flask routes
-# --------------------------------------------------------------
-
 @app.route("/ping")
 @app.route("/health")
 @app.route("/heartbeat")
@@ -1249,9 +1222,7 @@ def route_cashout_record():
     save_state()
     return jsonify({"ok": True})
 
-# ==========================================================
 # Minimal dashboard
-# ==========================================================
 DASHBOARD_HTML = """
 <!doctype html>
 <html>
