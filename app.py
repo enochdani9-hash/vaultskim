@@ -6,7 +6,7 @@ import ccxt
 
 app = Flask(__name__)
 
-STATE_FILE = "/tmp/vaultskim_state_v8.json"
+STATE_FILE = "/tmp/vaultskim_state_v9.json"
 
 DEFAULT_STATE = {
     "api_key": (os.environ.get("GATE_API_KEY") or "").strip(),
@@ -27,22 +27,22 @@ TRIGGER_UP_PCT = 1.50 / 100.0
 TRAIL_PULLBACK_PCT = 0.35 / 100.0
 REBUY_DIP_PCT = 1.20 / 100.0
 
-# Global cached exchange instance so we NEVER waste 8 seconds reloading markets!
 CACHED_EXCHANGE = None
 CACHED_KEY = None
 
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                saved = json.load(f)
-                for k, v in DEFAULT_STATE.items():
-                    if k not in saved:
-                        saved[k] = v
-                return saved
-        except Exception:
-            pass
+    for path in [STATE_FILE, "/tmp/vaultskim_state_v8.json"]:
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    saved = json.load(f)
+                    for k, v in DEFAULT_STATE.items():
+                        if k not in saved:
+                            saved[k] = v
+                    return saved
+            except Exception:
+                pass
     return dict(DEFAULT_STATE)
 
 
@@ -58,7 +58,6 @@ BOT_STATE = load_state()
 
 
 def get_public_state():
-    """Safe state payload to embed directly into HTML on page load (Zero-Blink!)."""
     s = load_state()
     BOT_STATE.update(s)
     return {
@@ -106,6 +105,55 @@ def get_exchange():
     return CACHED_EXCHANGE
 
 
+def place_safe_rebuy(exchange, symbol, card, sold_price, sold_shares, free_usdt, dust_shares):
+    """
+    Places a Limit Buy 1.20% below sold_price without ever exceeding available free_usdt
+    due to Gate.io's decimal step rounding!
+    """
+    base = card["base"]
+    rebuy_price = float(exchange.price_to_precision(symbol, sold_price * (1 - REBUY_DIP_PCT)))
+
+    # How many shares we want to buy back to restore protected floor (accounting for any dust left over)
+    needed_shares = max(sold_shares, card["protected_shares"] - dust_shares) * 1.001
+    desired_amt = float(exchange.amount_to_precision(symbol, needed_shares))
+
+    # Check if Gate.io decimal rounding pushed cost slightly above free_usdt; if so, cap to affordable precision
+    if desired_amt * rebuy_price > free_usdt * 0.998:
+        max_affordable = (free_usdt * 0.996) / rebuy_price
+        rebuy_amt = float(exchange.amount_to_precision(symbol, max_affordable))
+    else:
+        rebuy_amt = desired_amt
+
+    exchange.create_limit_buy_order(symbol, rebuy_amt, rebuy_price)
+
+    usdt_from_sell = (sold_shares * sold_price) * 0.999
+    usdt_for_rebuy = rebuy_amt * rebuy_price
+    net_skim = max(0.01, usdt_from_sell - usdt_for_rebuy)
+
+    card["realized_profit"] = card.get("realized_profit", 0.0) + net_skim
+    card["skims"] = card.get("skims", 0) + 1
+    BOT_STATE["realized_usdt_profit"] = BOT_STATE.get("realized_usdt_profit", 0.0) + net_skim
+    BOT_STATE["completed_skims"] = BOT_STATE.get("completed_skims", 0) + 1
+
+    card["trailing_active"] = False
+    card["status"] = f"REBUY @ ${rebuy_price:.4f}"
+    card["active_order_price"] = rebuy_price
+    card["ai_note"] = f"Peak sold @ ${sold_price:.4f}! Waiting for dip to ${rebuy_price:.4f} to restore {rebuy_amt} {base}."
+
+    ts = time.strftime("%H:%M:%S")
+    BOT_STATE["ledger"].insert(0, {
+        "base": base,
+        "sell_price": sold_price,
+        "rebuy_price": rebuy_price,
+        "profit": net_skim,
+        "shares": rebuy_amt + dust_shares,
+        "time": ts
+    })
+    BOT_STATE["ledger"] = BOT_STATE["ledger"][:20]
+
+    add_log(f"💰 {base} PEAK SOLD @ ${sold_price:.4f}! Skimmed +${net_skim:.4f} USDT | Limit Rebuy: {rebuy_amt} {base} @ ${rebuy_price:.4f}")
+
+
 def sync_existing_wallet(exchange, balance):
     ignored = {"USDT", "USDC", "USD", "POINT", "GT"}
     for asset, total_amt in balance.get("total", {}).items():
@@ -138,7 +186,7 @@ def sync_existing_wallet(exchange, balance):
 
 
 # =====================================================================
-# FAST ENGINE TICK (< 0.4s Execution)
+# CORE ENGINE TICK (Handles Holding, Trailing, AND Sold-USDT Recovery!)
 # =====================================================================
 def execute_engine_tick():
     exchange = get_exchange()
@@ -148,8 +196,10 @@ def execute_engine_tick():
 
     balance = exchange.fetch_balance()
     BOT_STATE["keys_connected"] = True
-    BOT_STATE["usdt_free"] = float(balance.get("free", {}).get("USDT", 0.0))
-    BOT_STATE["usdt_total"] = float(balance.get("total", {}).get("USDT", 0.0))
+    free_usdt = float(balance.get("free", {}).get("USDT", 0.0))
+    total_usdt = float(balance.get("total", {}).get("USDT", 0.0))
+    BOT_STATE["usdt_free"] = free_usdt
+    BOT_STATE["usdt_total"] = total_usdt
 
     if not BOT_STATE["coins"]:
         sync_existing_wallet(exchange, balance)
@@ -174,17 +224,22 @@ def execute_engine_tick():
 
         open_orders = exchange.fetch_open_orders(symbol)
 
-        # STATE 1: WAITING FOR PROTECTED RE-BUY ORDER
+        # -----------------------------------------------------------------
+        # STATE 1: OPEN RE-BUY ORDER WAITING ON GATE.IO
+        # -----------------------------------------------------------------
         if len(open_orders) > 0:
             order = open_orders[0]
             rebuy_px = float(order["price"])
             dist_pct = ((live_price - rebuy_px) / live_price) * 100.0
             card["status"] = f"REBUY @ ${rebuy_px:.4f}"
             card["active_order_price"] = rebuy_px
-            card["ai_note"] = f"Waiting for -{dist_pct:.2f}% dip to ${rebuy_px:.4f} to restore {order['amount']} {base}."
+            card["trailing_active"] = False
+            card["ai_note"] = f"Order live on Gate.io! Waiting for -{dist_pct:.2f}% dip to ${rebuy_px:.4f} to rebuy {order['amount']} {base}."
             continue
 
-        # STATE 2: HOLDING TOKEN -> FOLLOW EVERY NEW LOW & HARVEST +1.50% BOUNCE
+        # -----------------------------------------------------------------
+        # STATE 2: HOLDING TOKEN (>= $3.00) -> SLIDE LOW & TRAIL PEAK
+        # -----------------------------------------------------------------
         if free_shares * live_price >= 3.0:
             if real_shares > card["protected_shares"]:
                 card["protected_shares"] = real_shares
@@ -226,42 +281,36 @@ def execute_engine_tick():
                 if live_price <= stop_price and live_price > low_anchor * 1.006:
                     sell_amt = float(exchange.amount_to_precision(symbol, free_shares))
                     exchange.create_market_sell_order(symbol, sell_amt)
+                    dust_left = max(0.0, real_shares - sell_amt)
 
-                    rebuy_price = float(exchange.price_to_precision(symbol, live_price * (1 - REBUY_DIP_PCT)))
-                    target_rebuy_shares = max(card["protected_shares"], sell_amt) * 1.002
-                    rebuy_amt = float(exchange.amount_to_precision(symbol, target_rebuy_shares))
+                    # Refresh balance after market sell so we know exact free USDT
+                    post_bal = exchange.fetch_balance()
+                    free_usdt = float(post_bal.get("free", {}).get("USDT", 0.0))
+                    BOT_STATE["usdt_free"] = free_usdt
 
-                    exchange.create_limit_buy_order(symbol, rebuy_amt, rebuy_price)
-
-                    usdt_from_sell = (sell_amt * live_price) * 0.999
-                    usdt_for_rebuy = rebuy_amt * rebuy_price
-                    net_skim = max(0.0, usdt_from_sell - usdt_for_rebuy)
-
-                    card["realized_profit"] += net_skim
-                    card["skims"] += 1
-                    BOT_STATE["realized_usdt_profit"] += net_skim
-                    BOT_STATE["completed_skims"] += 1
-
-                    card["trailing_active"] = False
-                    card["status"] = f"REBUY @ ${rebuy_price:.4f}"
-                    card["active_order_price"] = rebuy_price
-
-                    ts = time.strftime("%H:%M:%S")
-                    BOT_STATE["ledger"].insert(0, {
-                        "base": base,
-                        "sell_price": live_price,
-                        "rebuy_price": rebuy_price,
-                        "profit": net_skim,
-                        "shares": rebuy_amt,
-                        "time": ts
-                    })
-                    BOT_STATE["ledger"] = BOT_STATE["ledger"][:20]
-
-                    add_log(f"💰 {base} HARVESTED @ ${live_price:.4f}! Bagged +${net_skim:.4f} USDT | Rebuy @ ${rebuy_price:.4f}")
+                    place_safe_rebuy(exchange, symbol, card, live_price, sell_amt, free_usdt, dust_left)
             else:
                 card["status"] = "SLIDING_LOW_ARMED"
                 need_pct = max(0.0, 1.50 - bounce_pct)
                 card["ai_note"] = f"Low locked @ ${low_anchor:.4f} • Needs +{need_pct:.2f}% bounce to trigger harvest."
+
+        # -----------------------------------------------------------------
+        # STATE 3: AUTO-HEAL SOLD POSITION (Shares < $3, Sitting in USDT!)
+        # Fixes your exact screenshot state where 0.037 QNT already sold into $7.47 USDT!
+        # -----------------------------------------------------------------
+        elif free_usdt >= 3.0:
+            my_trades = exchange.fetch_my_trades(symbol, limit=5)
+            last_sell_px = card.get("highest_peak", live_price)
+            last_sell_amt = max(0.0, card.get("protected_shares", 0.037) - real_shares)
+
+            for t in reversed(my_trades):
+                if t.get("side") == "sell":
+                    last_sell_px = float(t["price"])
+                    last_sell_amt = float(t["amount"])
+                    break
+
+            add_log(f"⚡ Auto-Healed Sold {base} Position! Detected ${free_usdt:.4f} USDT from sell @ ${last_sell_px:.4f}. Placing Rebuy now...")
+            place_safe_rebuy(exchange, symbol, card, last_sell_px, last_sell_amt, free_usdt, real_shares)
 
     save_state(BOT_STATE)
     return get_public_state()
@@ -320,6 +369,7 @@ def tick():
         data = execute_engine_tick()
         return jsonify({"status": "ok", "data": data}), 200
     except Exception as e:
+        add_log(f"⚠️ Engine Alert: {str(e)}")
         return jsonify({"status": "error", "message": str(e), "data": get_public_state()}), 200
 
 
@@ -363,7 +413,7 @@ def launch_coin():
                 return jsonify({
                     "error": f"Spot USDT is ${free_usdt:.4f}. Need ${usdt_budget:.2f} USDT (or existing {base} in wallet)."
                 }), 400
-            buy_amt = float(exchange.amount_to_precision(symbol, (usdt_budget / live_price) * 0.998))
+            buy_amt = float(exchange.amount_to_precision(symbol, (usdt_budget / live_price) * 0.996))
             exchange.create_market_buy_order(symbol, buy_amt)
             shares = buy_amt * 0.999
             add_log(f"✅ Bought {shares:.6f} {base} @ ${live_price:.4f} (${usdt_budget:.2f})")
@@ -414,7 +464,7 @@ def toggle_freeze():
 
 
 # =====================================================================
-# ULTRA-SLEEK FINTECH UI (INSTANT PRE-RENDER — NEVER DISAPPEARS ON REFRESH!)
+# ULTRA-SLEEK FINTECH UI (INSTANT PRE-RENDER)
 # =====================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -568,7 +618,6 @@ HTML_UI = """
 </head>
 <body>
 
-  <!-- COMPACT TOP BAR -->
   <div class="glass">
     <div class="top-bar">
       <div class="brand">
@@ -588,7 +637,6 @@ HTML_UI = """
       <span id="tick-clock">Live</span>
     </div>
 
-    <!-- HIDDEN BY DEFAULT ONCE CONNECTED -->
     <div id="key-drawer">
       <div style="font-size:12px;font-weight:700;color:var(--gold);margin-bottom:8px;">Gate.io Spot API v4 Credentials</div>
       <input class="input-modern" id="gate-key-input" placeholder="API Key" style="margin-bottom:8px;" />
@@ -598,7 +646,6 @@ HTML_UI = """
     </div>
   </div>
 
-  <!-- HERO PROFIT + MINI CHART -->
   <div class="glass">
     <div class="hero-grid">
       <div>
@@ -621,7 +668,6 @@ HTML_UI = """
     </div>
   </div>
 
-  <!-- SLEEK 1-LINE LAUNCH BAR -->
   <div class="glass" style="padding:12px;">
     <div class="launch-bar">
       <input class="input-modern" id="coin-input" placeholder="Token (QNT, LTC, SOL...)" style="flex:2;" />
@@ -631,23 +677,19 @@ HTML_UI = """
     <div id="err-msg" style="color:#ff5252;font-size:12px;margin-top:6px;display:none;"></div>
   </div>
 
-  <!-- ACTIVE POSITION CARDS -->
   <div id="coins-container"></div>
 
-  <!-- TERMINAL LOGS -->
   <div class="glass">
     <div style="font-size:11.5px;font-weight:800;color:var(--muted);margin-bottom:8px;letter-spacing:0.4px;">⚡ EXECUTION STREAM</div>
     <div class="terminal" id="logs"></div>
   </div>
 
 <script>
-// 1. SERVER-INJECTED STATE + LOCALSTORAGE BACKUP = ZERO DISAPPEARING ON REFRESH!
 const SERVER_INITIAL_STATE = {{ initial_state_json | safe }};
 let isRefreshing = false;
 
 function renderState(d) {
   if (!d) return;
-  // Save snapshot locally so refresh is ALWAYS instant
   localStorage.setItem('VAULTSKIM_LAST_STATE', JSON.stringify(d));
 
   document.getElementById('usdt-bal').innerText = '$' + Number(d.usdt_free || 0).toFixed(4);
@@ -722,7 +764,6 @@ function renderState(d) {
   }
 }
 
-// Render IMMEDIATELY on page load before network fetch even starts!
 window.addEventListener('DOMContentLoaded', () => {
   const savedKey = localStorage.getItem('VAULTSKIM_GATE_KEY') || '';
   const savedSec = localStorage.getItem('VAULTSKIM_GATE_SECRET') || '';
