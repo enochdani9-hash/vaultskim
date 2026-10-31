@@ -5,8 +5,8 @@ import ccxt
 
 app = Flask(__name__)
 
-# Connect to Gate.io using ONLY your 2 Render Env Vars
-exchange = ccxt.gateio({
+# Connect to Gate.io using ccxt.gate and your 2 Render Env Vars
+exchange = ccxt.gate({
     'apiKey': os.environ.get('GATE_API_KEY'),
     'secret': os.environ.get('GATE_SECRET'),
     'enableRateLimit': True,
@@ -25,9 +25,9 @@ BOT_STATE = {
 }
 
 # Fixed, Profitable Percentages (Clears Gate.io 0.2% round-trip fee + spread!)
-TRIGGER_UP_PCT = 1.5 / 100.0     # Activate Trailing Peak Chaser at +1.50%
+TRIGGER_UP_PCT = 1.5 / 100.0      # Activate Trailing Peak Chaser at +1.50%
 TRAIL_PULLBACK_PCT = 0.35 / 100.0 # Sell only when peak pulls back by 0.35%
-REBUY_DIP_PCT = 1.2 / 100.0      # Rebuy 1.20% below sell price (100% Share Protection)
+REBUY_DIP_PCT = 1.2 / 100.0       # Rebuy 1.20% below sell price (100% Share Protection)
 
 
 def add_log(msg):
@@ -55,14 +55,18 @@ def sync_existing_wallet():
                             "symbol": symbol,
                             "base": asset,
                             "protected_shares": float(total_amt),
+                            "real_shares": float(total_amt),
                             "entry_price": price,
+                            "live_price": price,
+                            "position_value": val_usdt,
+                            "harvest_target": price * (1 + TRIGGER_UP_PCT),
                             "highest_peak": price,
                             "trailing_active": False,
                             "realized_profit": 0.0,
                             "skims": 0,
-                            "status": "HOLDING_WATCHING_PEAK"
+                            "status": "RATCHET_ARMED (Watching Pump)"
                         }
-                        add_log(f"Synced existing Gate.io position: {total_amt:.6f} {asset} (${val_usdt:.2f})")
+                        add_log(f"Synced existing Gate.io position: {float(total_amt):.6f} {asset} (${val_usdt:.2f})")
     except Exception as e:
         add_log(f"Startup sync check: {str(e)}")
 
