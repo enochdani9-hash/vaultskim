@@ -6,7 +6,7 @@ import ccxt
 
 app = Flask(__name__)
 
-STATE_FILE = "/tmp/vaultskim_state_v9.json"
+STATE_FILE = "/tmp/vaultskim_state_v10.json"
 
 DEFAULT_STATE = {
     "api_key": (os.environ.get("GATE_API_KEY") or "").strip(),
@@ -32,7 +32,7 @@ CACHED_KEY = None
 
 
 def load_state():
-    for path in [STATE_FILE, "/tmp/vaultskim_state_v8.json"]:
+    for path in [STATE_FILE, "/tmp/vaultskim_state_v9.json", "/tmp/vaultskim_state_v8.json"]:
         if os.path.exists(path):
             try:
                 with open(path, "r") as f:
@@ -96,7 +96,10 @@ def get_exchange():
             "apiKey": key,
             "secret": secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"}
+            "options": {
+                "defaultType": "spot",
+                "createMarketBuyOrderRequiresPrice": True
+            }
         })
         ex.load_markets()
         CACHED_EXCHANGE = ex
@@ -107,20 +110,19 @@ def get_exchange():
 
 def place_safe_rebuy(exchange, symbol, card, sold_price, sold_shares, free_usdt, dust_shares):
     """
-    Places a Limit Buy 1.20% below sold_price without ever exceeding available free_usdt
-    due to Gate.io's decimal step rounding!
+    Places a Limit Buy 1.20% below sold_price while guaranteeing we never exceed
+    available free_usdt due to Gate.io's step rounding.
     """
     base = card["base"]
     rebuy_price = float(exchange.price_to_precision(symbol, sold_price * (1 - REBUY_DIP_PCT)))
 
-    # How many shares we want to buy back to restore protected floor (accounting for any dust left over)
     needed_shares = max(sold_shares, card["protected_shares"] - dust_shares) * 1.001
     desired_amt = float(exchange.amount_to_precision(symbol, needed_shares))
 
-    # Check if Gate.io decimal rounding pushed cost slightly above free_usdt; if so, cap to affordable precision
-    if desired_amt * rebuy_price > free_usdt * 0.998:
-        max_affordable = (free_usdt * 0.996) / rebuy_price
-        rebuy_amt = float(exchange.amount_to_precision(symbol, max_affordable))
+    # Ensure cost fits inside free_usdt while leaving profit skimmed in USDT
+    max_spendable_usdt = min(free_usdt * 0.995, (sold_shares * sold_price) * 0.992)
+    if desired_amt * rebuy_price > max_spendable_usdt:
+        rebuy_amt = float(exchange.amount_to_precision(symbol, max_spendable_usdt / rebuy_price))
     else:
         rebuy_amt = desired_amt
 
@@ -138,7 +140,7 @@ def place_safe_rebuy(exchange, symbol, card, sold_price, sold_shares, free_usdt,
     card["trailing_active"] = False
     card["status"] = f"REBUY @ ${rebuy_price:.4f}"
     card["active_order_price"] = rebuy_price
-    card["ai_note"] = f"Peak sold @ ${sold_price:.4f}! Waiting for dip to ${rebuy_price:.4f} to restore {rebuy_amt} {base}."
+    card["ai_note"] = f"Peak sold @ ${sold_price:.4f}! Limit Buy live @ ${rebuy_price:.4f} for {rebuy_amt} {base}."
 
     ts = time.strftime("%H:%M:%S")
     BOT_STATE["ledger"].insert(0, {
@@ -156,6 +158,8 @@ def place_safe_rebuy(exchange, symbol, card, sold_price, sold_shares, free_usdt,
 
 def sync_existing_wallet(exchange, balance):
     ignored = {"USDT", "USDC", "USD", "POINT", "GT"}
+    free_usdt = float(balance.get("free", {}).get("USDT", 0.0))
+
     for asset, total_amt in balance.get("total", {}).items():
         if asset not in ignored and float(total_amt or 0) > 0:
             symbol = f"{asset}/USDT"
@@ -164,6 +168,8 @@ def sync_existing_wallet(exchange, balance):
                 price = float(ticker["last"])
                 shares = float(total_amt)
                 val_usdt = shares * price
+
+                # Case A: Holding full coin position (>= $3)
                 if val_usdt >= 3.0:
                     BOT_STATE["coins"][symbol] = {
                         "symbol": symbol,
@@ -182,11 +188,62 @@ def sync_existing_wallet(exchange, balance):
                         "ai_note": f"Sliding Low locked @ ${price:.4f}. Target +1.50% bounce."
                     }
                     add_log(f"🛡️ Auto-Synced {shares:.6f} {asset} (${val_usdt:.2f}) | Low: ${price:.4f}")
+
+                # Case B: Holding tiny dust (e.g. 0.000962 QNT) + $7.47 USDT from a recent Peak Sell!
+                elif shares > 0 and free_usdt >= 3.0:
+                    open_orders = exchange.fetch_open_orders(symbol)
+                    my_trades = exchange.fetch_my_trades(symbol, limit=5)
+                    last_trade = my_trades[-1] if my_trades else None
+
+                    if open_orders:
+                        order = open_orders[0]
+                        rebuy_px = float(order["price"])
+                        rebuy_amt = float(order["amount"])
+                        BOT_STATE["coins"][symbol] = {
+                            "symbol": symbol,
+                            "base": asset,
+                            "protected_shares": shares + rebuy_amt,
+                            "real_shares": shares,
+                            "lowest_low": rebuy_px,
+                            "live_price": price,
+                            "position_value": val_usdt,
+                            "harvest_target": price * (1 + TRIGGER_UP_PCT),
+                            "highest_peak": price,
+                            "trailing_active": False,
+                            "realized_profit": 0.0,
+                            "skims": 1,
+                            "status": f"REBUY @ ${rebuy_px:.4f}",
+                            "active_order_price": rebuy_px,
+                            "ai_note": f"Waiting for dip to ${rebuy_px:.4f} to restore {rebuy_amt} {asset}."
+                        }
+                        add_log(f"🔄 Restored open Limit Rebuy for {asset} @ ${rebuy_px:.4f}")
+
+                    elif last_trade and last_trade.get("side") == "sell":
+                        sold_px = float(last_trade["price"])
+                        sold_amt = float(last_trade["amount"])
+                        card = {
+                            "symbol": symbol,
+                            "base": asset,
+                            "protected_shares": shares + sold_amt,
+                            "real_shares": shares,
+                            "lowest_low": price,
+                            "live_price": price,
+                            "position_value": val_usdt,
+                            "harvest_target": sold_px * (1 + TRIGGER_UP_PCT),
+                            "highest_peak": sold_px,
+                            "trailing_active": False,
+                            "realized_profit": 0.0,
+                            "skims": 0,
+                            "status": "RECOVERING_REBUY",
+                            "ai_note": "Recovering Limit Rebuy from recent peak sale..."
+                        }
+                        BOT_STATE["coins"][symbol] = card
+                        place_safe_rebuy(exchange, symbol, card, sold_px, sold_amt, free_usdt, shares)
     save_state(BOT_STATE)
 
 
 # =====================================================================
-# CORE ENGINE TICK (Handles Holding, Trailing, AND Sold-USDT Recovery!)
+# CORE ENGINE TICK
 # =====================================================================
 def execute_engine_tick():
     exchange = get_exchange()
@@ -224,9 +281,7 @@ def execute_engine_tick():
 
         open_orders = exchange.fetch_open_orders(symbol)
 
-        # -----------------------------------------------------------------
         # STATE 1: OPEN RE-BUY ORDER WAITING ON GATE.IO
-        # -----------------------------------------------------------------
         if len(open_orders) > 0:
             order = open_orders[0]
             rebuy_px = float(order["price"])
@@ -234,12 +289,10 @@ def execute_engine_tick():
             card["status"] = f"REBUY @ ${rebuy_px:.4f}"
             card["active_order_price"] = rebuy_px
             card["trailing_active"] = False
-            card["ai_note"] = f"Order live on Gate.io! Waiting for -{dist_pct:.2f}% dip to ${rebuy_px:.4f} to rebuy {order['amount']} {base}."
+            card["ai_note"] = f"Limit Buy live on Gate.io! Needs -{dist_pct:.2f}% dip to ${rebuy_px:.4f} to rebuy {order['amount']} {base}."
             continue
 
-        # -----------------------------------------------------------------
         # STATE 2: HOLDING TOKEN (>= $3.00) -> SLIDE LOW & TRAIL PEAK
-        # -----------------------------------------------------------------
         if free_shares * live_price >= 3.0:
             if real_shares > card["protected_shares"]:
                 card["protected_shares"] = real_shares
@@ -251,7 +304,6 @@ def execute_engine_tick():
                 card["trailing_active"] = False
                 add_log(f"✅ {base} REBUY FILLED! Restored {real_shares:.6f} {base}. New Low: ${card['lowest_low']:.4f}")
 
-            # Slide anchor down on EVERY new low
             if not card["trailing_active"] and live_price < card["lowest_low"]:
                 old_low = card["lowest_low"]
                 card["lowest_low"] = live_price
@@ -283,7 +335,6 @@ def execute_engine_tick():
                     exchange.create_market_sell_order(symbol, sell_amt)
                     dust_left = max(0.0, real_shares - sell_amt)
 
-                    # Refresh balance after market sell so we know exact free USDT
                     post_bal = exchange.fetch_balance()
                     free_usdt = float(post_bal.get("free", {}).get("USDT", 0.0))
                     BOT_STATE["usdt_free"] = free_usdt
@@ -294,10 +345,7 @@ def execute_engine_tick():
                 need_pct = max(0.0, 1.50 - bounce_pct)
                 card["ai_note"] = f"Low locked @ ${low_anchor:.4f} • Needs +{need_pct:.2f}% bounce to trigger harvest."
 
-        # -----------------------------------------------------------------
-        # STATE 3: AUTO-HEAL SOLD POSITION (Shares < $3, Sitting in USDT!)
-        # Fixes your exact screenshot state where 0.037 QNT already sold into $7.47 USDT!
-        # -----------------------------------------------------------------
+        # STATE 3: SOLD INTO USDT -> AUTO-PLACE PROTECTED RE-BUY
         elif free_usdt >= 3.0:
             my_trades = exchange.fetch_my_trades(symbol, limit=5)
             last_sell_px = card.get("highest_peak", live_price)
@@ -309,7 +357,6 @@ def execute_engine_tick():
                     last_sell_amt = float(t["amount"])
                     break
 
-            add_log(f"⚡ Auto-Healed Sold {base} Position! Detected ${free_usdt:.4f} USDT from sell @ ${last_sell_px:.4f}. Placing Rebuy now...")
             place_safe_rebuy(exchange, symbol, card, last_sell_px, last_sell_amt, free_usdt, real_shares)
 
     save_state(BOT_STATE)
@@ -334,7 +381,10 @@ def connect_keys():
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"}
+            "options": {
+                "defaultType": "spot",
+                "createMarketBuyOrderRequiresPrice": True
+            }
         })
         test_ex.load_markets()
         bal = test_ex.fetch_balance()
@@ -405,18 +455,67 @@ def launch_coin():
         ticker = exchange.fetch_ticker(symbol)
         live_price = float(ticker["last"])
 
+        # 1. If we already hold the shares (>= $3) -> Lock onto them!
         if existing_shares * live_price >= 3.0:
             shares = existing_shares
+            BOT_STATE["coins"][symbol] = {
+                "symbol": symbol,
+                "base": base,
+                "protected_shares": shares,
+                "real_shares": shares,
+                "lowest_low": live_price,
+                "live_price": live_price,
+                "position_value": shares * live_price,
+                "harvest_target": live_price * (1 + TRIGGER_UP_PCT),
+                "highest_peak": live_price,
+                "trailing_active": False,
+                "realized_profit": 0.0,
+                "skims": 0,
+                "status": "SLIDING_LOW_ARMED",
+                "ai_note": f"Sliding Low locked @ ${live_price:.4f}."
+            }
             add_log(f"🎯 Locked onto {shares:.6f} {base} (${shares*live_price:.2f}) @ Low ${live_price:.4f}")
-        else:
-            if free_usdt < usdt_budget or usdt_budget < 3.0:
-                return jsonify({
-                    "error": f"Spot USDT is ${free_usdt:.4f}. Need ${usdt_budget:.2f} USDT (or existing {base} in wallet)."
-                }), 400
-            buy_amt = float(exchange.amount_to_precision(symbol, (usdt_budget / live_price) * 0.996))
-            exchange.create_market_buy_order(symbol, buy_amt)
-            shares = buy_amt * 0.999
-            add_log(f"✅ Bought {shares:.6f} {base} @ ${live_price:.4f} (${usdt_budget:.2f})")
+            save_state(BOT_STATE)
+            return jsonify({"status": "launched", "data": get_public_state()}), 200
+
+        # 2. Check if our last trade on this coin was a Peak SELL! If so, place the Limit Rebuy instead of market buying high!
+        my_trades = exchange.fetch_my_trades(symbol, limit=5)
+        if my_trades and my_trades[-1].get("side") == "sell" and free_usdt >= 3.0:
+            last_sell = my_trades[-1]
+            sold_px = float(last_sell["price"])
+            sold_amt = float(last_sell["amount"])
+            card = {
+                "symbol": symbol,
+                "base": base,
+                "protected_shares": existing_shares + sold_amt,
+                "real_shares": existing_shares,
+                "lowest_low": live_price,
+                "live_price": live_price,
+                "position_value": existing_shares * live_price,
+                "harvest_target": sold_px * (1 + TRIGGER_UP_PCT),
+                "highest_peak": sold_px,
+                "trailing_active": False,
+                "realized_profit": 0.0,
+                "skims": 0,
+                "status": "RECOVERING_REBUY",
+                "ai_note": "Restoring Limit Rebuy from recent peak sale..."
+            }
+            BOT_STATE["coins"][symbol] = card
+            place_safe_rebuy(exchange, symbol, card, sold_px, sold_amt, free_usdt, existing_shares)
+            save_state(BOT_STATE)
+            return jsonify({"status": "launched", "data": get_public_state()}), 200
+
+        # 3. Otherwise, this is a brand-new coin launch -> Market Buy with price argument passed for Gate.io!
+        if free_usdt < usdt_budget or usdt_budget < 3.0:
+            return jsonify({
+                "error": f"Spot USDT is ${free_usdt:.4f}. Need ${usdt_budget:.2f} USDT (or existing {base} in wallet)."
+            }), 400
+
+        buy_amt = float(exchange.amount_to_precision(symbol, (usdt_budget / live_price) * 0.995))
+        # Pass live_price as 3rd argument so Gate.io knows the total USDT cost to spend!
+        exchange.create_market_buy_order(symbol, buy_amt, live_price)
+        shares = buy_amt * 0.999
+        add_log(f"✅ Bought {shares:.6f} {base} @ ${live_price:.4f} (${usdt_budget:.2f})")
 
         BOT_STATE["coins"][symbol] = {
             "symbol": symbol,
@@ -464,7 +563,7 @@ def toggle_freeze():
 
 
 # =====================================================================
-# ULTRA-SLEEK FINTECH UI (INSTANT PRE-RENDER)
+# ULTRA-SLEEK FINTECH UI
 # =====================================================================
 HTML_UI = """
 <!DOCTYPE html>
