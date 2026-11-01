@@ -29,7 +29,7 @@ DEFAULT_STATE = {
 # =====================================================================
 TRIGGER_UP_PCT = 1.00 / 100.0       # +1.00% bounce from Sliding Low arms Trailing Peak Chaser
 TRAIL_PULLBACK_PCT = 0.20 / 100.0   # 0.20% pullback from highest peak triggers Market Sell
-REBUY_DIP_PCT = 0.75 / 100.0        # -0.75% below sell price places Protected Limit Rebuy (Clears 0.2% fees!)
+REBUY_DIP_PCT = 0.75 / 100.0        # -0.75% below sell price places Protected Limit Rebuy
 RUNAWAY_DRIFT_PCT = 2.00 / 100.0    # Option 1: If price runs +2.0% above rebuy, check Profit Vault top-up
 
 CACHED_EXCHANGE = None
@@ -114,7 +114,7 @@ def get_exchange():
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
-                "createMarketBuyOrderRequiresPrice": True
+                "createMarketBuyOrderRequiresPrice": False
             }
         })
         ex.load_markets()
@@ -122,6 +122,30 @@ def get_exchange():
         CACHED_KEY = key
 
     return CACHED_EXCHANGE
+
+
+def execute_spot_buy(exchange, symbol, usdt_to_spend, live_price):
+    """
+    Bulletproof Gate.io Spot Buy:
+    1. Uses Gate.io's native quote-USDT market buy (createMarketBuyOrderRequiresPrice=False).
+    2. If Gate.io ever rejects market buy, falls back to an instant-fill Limit Buy (+0.3% above ask).
+    """
+    try:
+        exchange.options["createMarketBuyOrderRequiresPrice"] = False
+        cost_usdt = float(exchange.cost_to_precision(symbol, usdt_to_spend))
+        return exchange.create_order(
+            symbol,
+            "market",
+            "buy",
+            cost_usdt,
+            None,
+            {"createMarketBuyOrderRequiresPrice": False}
+        )
+    except Exception:
+        # Fallback: Instant-fill Limit Buy
+        limit_px = float(exchange.price_to_precision(symbol, live_price * 1.003))
+        token_amt = float(exchange.amount_to_precision(symbol, (usdt_to_spend * 0.995) / limit_px))
+        return exchange.create_limit_buy_order(symbol, token_amt, limit_px)
 
 
 def sync_existing_wallet(exchange, balance):
@@ -246,7 +270,7 @@ def place_protected_rebuy(exchange, symbol, card, sold_price, sold_shares, free_
 
 
 # =====================================================================
-# CORE ENGINE TICK (Fast 1.00% Bounce + Option 1 Profit-Vault Top-Up)
+# CORE ENGINE TICK
 # =====================================================================
 def execute_engine_tick():
     exchange = get_exchange()
@@ -342,7 +366,6 @@ def execute_engine_tick():
                 card["trailing_active"] = False
                 add_log(f"✅ {base} REBUY FILLED! Restored {real_shares:.6f} {base}. New Sliding Low: ${card['lowest_low']:.4f}")
 
-            # Slide anchor down on EVERY new low
             if not card["trailing_active"] and live_price < card["lowest_low"]:
                 old_low = card["lowest_low"]
                 card["lowest_low"] = live_price
@@ -366,10 +389,9 @@ def execute_engine_tick():
 
             if card["trailing_active"]:
                 stop_price = card["highest_peak"] * (1 - TRAIL_PULLBACK_PCT)
-                card["status"] = f"TRAILING (Stop ${stop_price:.2f})"
+                card["status"] = f"TRAILING (Stop ${stop_price:.4f})"
                 card["ai_note"] = f"Riding pump! Peak ${card['highest_peak']:.4f} • Sells on 0.20% pullback to ${stop_price:.4f}"
 
-                # Ensure we are at least +0.55% above low_anchor before firing pullback sell
                 if live_price <= stop_price and live_price > low_anchor * 1.0055:
                     sell_amt = float(exchange.amount_to_precision(symbol, free_shares))
                     sell_order = exchange.create_market_sell_order(symbol, sell_amt)
@@ -390,7 +412,7 @@ def execute_engine_tick():
                 need_pct = max(0.0, 1.00 - bounce_pct)
                 card["ai_note"] = f"Low locked @ ${low_anchor:.4f} • Needs +{need_pct:.2f}% bounce to trigger +1.0% harvest."
 
-        # STATE 3: USER CANCELED THE ORDER ON GATE.IO (IDLE)
+        # STATE 3: CANCELED / IDLE
         else:
             card["mode"] = "CANCELED_IDLE"
             card["status"] = "ORDER_CANCELED (IDLE)"
@@ -461,8 +483,8 @@ def rebuy_now():
             return jsonify({"error": f"Need at least $3.00 Free USDT to rebuy (Have ${free_usdt:.2f})."}), 400
 
         spend_usdt = min(free_usdt * 0.994, max(7.0, card.get("locked_order_usdt", free_usdt * 0.994)))
-        buy_amt = float(exchange.amount_to_precision(symbol, spend_usdt / live_price))
-        exchange.create_market_buy_order(symbol, buy_amt, live_price)
+        execute_spot_buy(exchange, symbol, spend_usdt, live_price)
+        time.sleep(0.4)
 
         post_bal = exchange.fetch_balance()
         new_shares = float(post_bal.get("total", {}).get(base, 0.0))
@@ -504,7 +526,7 @@ def launch_coin():
         raw_coin = (body.get("symbol") or "").strip().upper()
         usdt_budget = float(body.get("budget") or 7.0)
         if not raw_coin:
-            return jsonify({"error": "Type a coin symbol first (e.g. QNT, LTC, SOL)."}), 400
+            return jsonify({"error": "Type a coin symbol first (e.g. SUI, DOGE, SOL)."}), 400
 
         symbol = raw_coin if "/" in raw_coin else f"{raw_coin}/USDT"
         base = symbol.split("/")[0]
@@ -582,12 +604,15 @@ def launch_coin():
                 "error": f"Free Spot USDT is ${free_usdt:.2f}. Cancel any open Gate.io order first or deposit USDT."
             }), 400
 
+        # Spend requested budget (capped safely at 99.4% of free USDT)
         spend_amount = min(usdt_budget, free_usdt * 0.994)
-        buy_amt = float(exchange.amount_to_precision(symbol, spend_amount / live_price))
-        exchange.create_market_buy_order(symbol, buy_amt, live_price)
+        execute_spot_buy(exchange, symbol, spend_amount, live_price)
+        time.sleep(0.4)
 
         post_bal = exchange.fetch_balance()
-        shares = float(post_bal.get("total", {}).get(base, buy_amt * 0.999))
+        shares = float(post_bal.get("total", {}).get(base, 0.0))
+        if shares <= 0:
+            shares = (spend_amount / live_price) * 0.998
         BOT_STATE["usdt_free"] = float(post_bal.get("free", {}).get("USDT", 0.0))
         BOT_STATE["usdt_total"] = float(post_bal.get("total", {}).get("USDT", 0.0))
 
@@ -634,7 +659,7 @@ def connect_keys():
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
-                "createMarketBuyOrderRequiresPrice": True
+                "createMarketBuyOrderRequiresPrice": False
             }
         })
         test_ex.load_markets()
@@ -711,7 +736,7 @@ def toggle_freeze():
 
 
 # =====================================================================
-# v12.1 FAST-SKIM (+1.0%) UI
+# v12.2 FAST-SKIM (+1.0%) UI
 # =====================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -935,8 +960,8 @@ HTML_UI = """
       🚀 Fast-Skim (+1.0% Bounce / 0.20% Pullback / -0.75% Rebuy):
     </div>
     <div class="launch-bar">
-      <input class="input-modern" id="coin-input" placeholder="Token (e.g. QNT, LTC, SOL)" style="flex:2;" />
-      <input class="input-modern" id="budget-input" type="number" value="7.5" placeholder="$" style="flex:0.8;" />
+      <input class="input-modern" id="coin-input" placeholder="Token (e.g. SUI, DOGE, SOL)" style="flex:2;" />
+      <input class="input-modern" id="budget-input" type="number" value="7.3" placeholder="$" style="flex:0.8;" />
       <button class="btn-primary" onclick="launchCoin()">+ Launch</button>
     </div>
     <div id="err-msg" style="color:#ff5252;font-size:12px;margin-top:6px;display:none;"></div>
@@ -985,7 +1010,7 @@ function renderState(d) {
       <div class="glass" style="text-align:center;color:var(--muted);font-size:13px;padding:22px;">
         No active coin positions running.<br>
         <span style="color:var(--text);font-weight:700;">Your $${freeUsdt.toFixed(2)} USDT is 100% free in Gate.io!</span><br>
-        Type any token above (like <strong>QNT</strong>, <strong>LTC</strong>, or <strong>SOL</strong>) and tap <strong>+ Launch</strong>.
+        Type any token above (like <strong>SUI</strong>, <strong>DOGE</strong>, or <strong>SOL</strong>) and tap <strong>+ Launch</strong>.
       </div>`;
   } else {
     container.innerHTML = coinsList.map(c => {
