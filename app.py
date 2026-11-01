@@ -13,7 +13,7 @@ DEFAULT_STATE = {
     "api_secret": (os.environ.get("GATE_SECRET") or "").strip(),
     "keys_connected": False,
     "frozen": False,
-    "usdt_free": 0.0,
+    "usdt_free": 0.0,  
     "usdt_total": 0.0,
     "realized_usdt_profit": 0.0,
     "completed_skims": 0,
