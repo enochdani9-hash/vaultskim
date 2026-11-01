@@ -1222,7 +1222,7 @@ async function launchCoin() {
 async function toggleFreeze() {
   const res = await fetch('/toggle_freeze', {method: 'POST'});
   const json = await res.json();
-  if (json.data) renderState(json.data);
+  if (json.data) renderState(json.data); 
 }
 </script>
 </body>
